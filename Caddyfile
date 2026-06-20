@@ -9,6 +9,9 @@ claudecommunity.com {
 www.claudecommunity.com {
   encode zstd gzip
 
+  @stats_dashboard path /stats /stats/
+  redir @stats_dashboard https://stats.claudecommunity.com/ permanent
+
   handle_path /stats/* {
     reverse_proxy umami:3000
   }
@@ -16,6 +19,19 @@ www.claudecommunity.com {
   handle {
     reverse_proxy app:3000
   }
+
+  header {
+    -Server
+    X-Content-Type-Options nosniff
+    X-Frame-Options SAMEORIGIN
+    Referrer-Policy strict-origin-when-cross-origin
+    Permissions-Policy "camera=(), microphone=(), geolocation=()"
+  }
+}
+
+stats.claudecommunity.com {
+  encode zstd gzip
+  reverse_proxy umami:3000
 
   header {
     -Server
