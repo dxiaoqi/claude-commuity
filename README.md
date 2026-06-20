@@ -72,3 +72,17 @@ Production PostgreSQL:
 ```bash
 DATABASE_URL="postgresql://..." npm run subscribers
 ```
+
+Production also includes a password-protected dashboard at:
+
+```text
+https://admin.claudecommunity.com/admin/subscribers
+```
+
+The dashboard supports email/source search, status and source filters, summary metrics, and UTF-8 CSV export. Access is protected by Caddy HTTP Basic Authentication. Generate a password hash with:
+
+```bash
+docker run --rm caddy:2-alpine caddy hash-password --plaintext 'your-password'
+```
+
+Store the result in `.env` as `ADMIN_PASSWORD_HASH`. If the bcrypt value contains `$`, wrap the value in single quotes so Docker Compose treats it literally.

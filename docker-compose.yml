@@ -4,6 +4,7 @@ services:
     restart: unless-stopped
     environment:
       ACME_EMAIL: ${ACME_EMAIL:?set ACME_EMAIL}
+      ADMIN_PASSWORD_HASH: ${ADMIN_PASSWORD_HASH:?set ADMIN_PASSWORD_HASH}
     ports:
       - "80:80"
       - "443:443"

@@ -41,3 +41,25 @@ stats.claudecommunity.com {
     Permissions-Policy "camera=(), microphone=(), geolocation=()"
   }
 }
+
+admin.claudecommunity.com {
+  encode zstd gzip
+
+  basic_auth {
+    admin {$ADMIN_PASSWORD_HASH}
+  }
+
+  @root path /
+  redir @root /admin/subscribers permanent
+  reverse_proxy app:3000
+
+  header {
+    -Server
+    X-Content-Type-Options nosniff
+    X-Frame-Options DENY
+    Referrer-Policy no-referrer
+    Permissions-Policy "camera=(), microphone=(), geolocation=()"
+    X-Robots-Tag "noindex, nofollow, noarchive"
+    Cache-Control "no-store"
+  }
+}
