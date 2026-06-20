@@ -1,0 +1,9 @@
+# Claude Community
+
+Independent field notes, practical workflows, and tools for Claude and Claude Code users.
+
+## Primary guides
+- /claude: Practical Claude field guide
+- /claude-code: Claude Code field manual
+
+Claude Community is an independent brand and is not affiliated with Anthropic.

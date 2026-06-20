@@ -1,0 +1,27 @@
+{
+  email {$ACME_EMAIL}
+}
+
+claudecommunity.com {
+  redir https://www.claudecommunity.com{uri} permanent
+}
+
+www.claudecommunity.com {
+  encode zstd gzip
+
+  handle_path /stats/* {
+    reverse_proxy umami:3000
+  }
+
+  handle {
+    reverse_proxy app:3000
+  }
+
+  header {
+    -Server
+    X-Content-Type-Options nosniff
+    X-Frame-Options SAMEORIGIN
+    Referrer-Policy strict-origin-when-cross-origin
+    Permissions-Policy "camera=(), microphone=(), geolocation=()"
+  }
+}
