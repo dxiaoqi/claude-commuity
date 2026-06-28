@@ -1,0 +1,21 @@
+name: Mirror images to ACR
+
+on:
+  schedule:
+    - cron: "0 2 * * 1"   # Every Monday 02:00 UTC
+  workflow_dispatch:        # Manual trigger
+
+jobs:
+  mirror:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Mirror images to Alibaba Cloud Container Registry
+        env:
+          ALIYUN_NAMESPACE:          ${{ secrets.ALIYUN_NAMESPACE }}
+          ALIYUN_REGISTRY_USER:      ${{ secrets.ALIYUN_REGISTRY_USER }}
+          ALIYUN_REGISTRY_PASSWORD:  ${{ secrets.ALIYUN_REGISTRY_PASSWORD }}
+        run: |
+          chmod +x scripts/mirror-images.sh
+          bash scripts/mirror-images.sh

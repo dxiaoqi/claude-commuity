@@ -1,0 +1,23 @@
+{
+  "name": "@claude-community/mcp-ssh-ecs",
+  "version": "0.1.0",
+  "description": "MCP server for SSH access to Claude Community ECS server",
+  "type": "module",
+  "bin": {
+    "mcp-ssh-ecs": "./dist/index.js"
+  },
+  "scripts": {
+    "build": "tsc",
+    "dev":   "node --loader ts-node/esm src/index.ts",
+    "start": "node dist/index.js"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.0.0",
+    "ssh2": "^1.16.0"
+  },
+  "devDependencies": {
+    "@types/node":  "^20.0.0",
+    "@types/ssh2":  "^1.15.0",
+    "typescript":   "^5.0.0"
+  }
+}
