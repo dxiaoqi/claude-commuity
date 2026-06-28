@@ -14,7 +14,9 @@
     "stack:logs": "docker compose logs -f --tail=100"
   },
   "dependencies": {
+    "gray-matter": "^4.0.3",
     "next": "^16.2.9",
+    "next-mdx-remote": "^6.0.0",
     "pg": "^8.22.0",
     "react": "^19.2.7",
     "react-dom": "^19.2.7",

@@ -1,0 +1,308 @@
+---
+title: "Claude Code Hooks: Complete Setup Guide with Real Examples"
+description: "Learn how to use Claude Code hooks to automate quality checks, trigger tests, and extend Claude Code's behavior with shell scripts. Includes working examples."
+date: "2026-06-26"
+tags: ["claude-code", "hooks", "automation"]
+readTime: "9 min"
+---
+
+Claude Code hooks let you run shell scripts in response to events in the agent loop. They're one of the most underused features—and one of the most powerful once you understand the model. This guide covers how hooks work, how to configure them, and concrete examples you can copy directly.
+
+## What Hooks Do
+
+The Claude Code agent loop looks like this:
+
+1. Claude decides to use a tool (read a file, run a command, write code)
+2. Claude Code executes the tool
+3. The result comes back into context
+4. Claude decides what to do next
+
+Hooks let you inject shell scripts at two points: **before** a tool runs (PreToolUse) and **after** it runs (PostToolUse). You can also hook into notifications, session start, and session stop.
+
+This sounds simple, but the applications are significant:
+
+- Block a tool call if a precondition fails (e.g., prevent edits to protected files)
+- Run tests automatically after every file edit
+- Log every command Claude executes for auditing
+- Send a notification when a long-running task completes
+- Validate API keys or environment state before starting a session
+
+## Configuration
+
+Hooks are configured in Claude Code's settings file. This lives at:
+
+- **Mac/Linux:** `~/.claude/settings.json`
+- **Windows:** `%APPDATA%\Claude\settings.json`
+
+Or you can use `.claude/settings.json` in a project directory to apply hooks only to that project.
+
+The structure is:
+
+```json
+{
+  "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "Bash",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "~/scripts/pre-bash.sh"
+          }
+        ]
+      }
+    ],
+    "PostToolUse": [
+      {
+        "matcher": "Edit|Write",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "~/scripts/post-edit.sh"
+          }
+        ]
+      }
+    ],
+    "Notification": [
+      {
+        "matcher": ".*",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "~/scripts/notify.sh"
+          }
+        ]
+      }
+    ]
+  }
+}
+```
+
+The `matcher` is a regex matched against the tool name. `"Bash"` matches only Bash tool calls; `"Edit|Write"` matches both Edit and Write; `".*"` matches everything.
+
+## Hook Input and Output
+
+When a hook script runs, Claude Code passes context via stdin as a JSON object. For a PreToolUse hook, this includes:
+
+```json
+{
+  "session_id": "abc123",
+  "tool_name": "Bash",
+  "tool_input": {
+    "command": "rm -rf ./dist"
+  }
+}
+```
+
+For PostToolUse, you also get the tool output:
+
+```json
+{
+  "session_id": "abc123",
+  "tool_name": "Edit",
+  "tool_input": { "file_path": "/src/api.ts", "..." : "..." },
+  "tool_response": { "success": true }
+}
+```
+
+Your script can control what happens next via its exit code:
+
+- **Exit 0:** Continue normally
+- **Exit 1:** Block the action, show the script's stderr output to Claude as feedback
+- **Exit 2:** Block the action silently
+
+You can also write JSON to stdout to pass additional context or modify behavior (advanced usage—check the Claude Code docs for the current API).
+
+## Working Examples
+
+### 1. Block Edits to Protected Files
+
+This prevents Claude from editing certain files without explicit confirmation:
+
+```bash
+#!/usr/bin/env bash
+# ~/.claude/hooks/protect-files.sh
+
+INPUT=$(cat)
+FILE=$(echo "$INPUT" | python3 -c "import sys,json; d=json.load(sys.stdin); print(d.get('tool_input', {}).get('file_path', ''))")
+
+PROTECTED=(
+  "package.json"
+  "Dockerfile"
+  ".env"
+  "Caddyfile"
+)
+
+for pattern in "${PROTECTED[@]}"; do
+  if [[ "$FILE" == *"$pattern"* ]]; then
+    echo "Protected file: $FILE. Confirm this edit is intentional before proceeding." >&2
+    exit 1
+  fi
+done
+
+exit 0
+```
+
+Configure it:
+
+```json
+{
+  "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "Edit|Write|MultiEdit",
+        "hooks": [{ "type": "command", "command": "~/.claude/hooks/protect-files.sh" }]
+      }
+    ]
+  }
+}
+```
+
+Now if Claude tries to edit `package.json`, the session will pause and Claude will receive the error message, prompting it to ask you before continuing.
+
+### 2. Run Tests After Every Edit
+
+Auto-verify that changes don't break tests:
+
+```bash
+#!/usr/bin/env bash
+# ~/.claude/hooks/run-tests.sh
+# Runs the test suite after any file edit in src/
+
+INPUT=$(cat)
+FILE=$(echo "$INPUT" | python3 -c "import sys,json; d=json.load(sys.stdin); print(d.get('tool_input', {}).get('file_path', ''))")
+
+# Only run tests for changes to source files
+if [[ "$FILE" != *"/src/"* ]]; then
+  exit 0
+fi
+
+# Run tests (non-interactively)
+cd "$(git rev-parse --show-toplevel 2>/dev/null || echo .)" || exit 0
+if ! npm test --watchAll=false --passWithNoTests 2>&1; then
+  echo "Tests failed after editing $FILE. Review the failures before continuing." >&2
+  exit 1
+fi
+
+exit 0
+```
+
+This runs `npm test` after every edit to a file in `/src/`. If tests fail, Claude is notified and can decide how to proceed. Since the message goes to Claude (not just to you), Claude can attempt to fix the failures automatically.
+
+### 3. Log Every Command
+
+For auditing or debugging, log what Claude executes:
+
+```bash
+#!/usr/bin/env bash
+# ~/.claude/hooks/audit-log.sh
+
+INPUT=$(cat)
+TIMESTAMP=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
+LOG_FILE="$HOME/.claude/audit.log"
+
+TOOL=$(echo "$INPUT" | python3 -c "import sys,json; print(json.load(sys.stdin).get('tool_name',''))")
+CMD=$(echo "$INPUT" | python3 -c "import sys,json; d=json.load(sys.stdin).get('tool_input',{}); print(d.get('command', d.get('file_path', str(d)[:80])))")
+
+echo "$TIMESTAMP | $TOOL | $CMD" >> "$LOG_FILE"
+exit 0
+```
+
+Configure as a PreToolUse hook matching `".*"`. This creates a running log at `~/.claude/audit.log` with every tool call and the key argument.
+
+### 4. Desktop Notification on Session Complete
+
+Long tasks can run for minutes. A completion notification lets you walk away without babysitting the terminal:
+
+```bash
+#!/usr/bin/env bash
+# ~/.claude/hooks/notify-done.sh
+
+INPUT=$(cat)
+MSG=$(echo "$INPUT" | python3 -c "import sys,json; print(json.load(sys.stdin).get('message','Task complete'))" 2>/dev/null || echo "Claude Code task complete")
+
+# macOS
+if command -v osascript &>/dev/null; then
+  osascript -e "display notification \"$MSG\" with title \"Claude Code\""
+fi
+
+# Linux (notify-send)
+if command -v notify-send &>/dev/null; then
+  notify-send "Claude Code" "$MSG"
+fi
+
+exit 0
+```
+
+Configure under the `Notification` event type.
+
+### 5. Type-Check Before Committing Git
+
+Ensure TypeScript is clean before any git commit:
+
+```bash
+#!/usr/bin/env bash
+# ~/.claude/hooks/pre-git.sh
+
+INPUT=$(cat)
+CMD=$(echo "$INPUT" | python3 -c "import sys,json; print(json.load(sys.stdin).get('tool_input',{}).get('command',''))")
+
+# Only check git commit commands
+if [[ "$CMD" != *"git commit"* ]]; then
+  exit 0
+fi
+
+cd "$(git rev-parse --show-toplevel 2>/dev/null || echo .)" || exit 0
+
+if ! npm run typecheck 2>&1; then
+  echo "TypeScript errors found. Fix type errors before committing." >&2
+  exit 1
+fi
+
+exit 0
+```
+
+This intercepts `git commit` commands from Claude and requires a clean type-check first.
+
+## Security Considerations
+
+Hooks run with your user permissions. A few things to be aware of:
+
+**Hook scripts run for all matched tool calls.** If your hook has a bug, it can accidentally block legitimate operations. Test hooks on a non-critical project first.
+
+**Validate input before using it.** Hook input comes from Claude Code's internal tool calls, but treat it like any external input—don't `eval` it, be careful with paths passed to shell commands.
+
+**Keep hooks fast.** PreToolUse hooks block the agent loop while they run. A slow hook adds latency to every tool call. Expensive operations (running a full test suite) are better placed in PostToolUse or gated on specific file patterns.
+
+**Don't put credentials in hook scripts.** If a hook needs API access, load credentials from environment variables or a secrets manager, not hardcoded in the script.
+
+## Project vs. Global Hooks
+
+You can put hooks in two places:
+
+| Location | Scope |
+|----------|-------|
+| `~/.claude/settings.json` | All Claude Code sessions |
+| `.claude/settings.json` (project root) | Only sessions in that project |
+
+Project-level hooks are useful for project-specific quality gates (run this project's tests, block edits to this project's generated files). Global hooks are better for cross-project utilities (audit logging, desktop notifications, protecting `.env` files everywhere).
+
+Both files are merged when Claude Code starts—project settings take precedence over global settings for the same hook type.
+
+## Debugging Hooks
+
+If a hook isn't working as expected:
+
+1. **Run the script manually.** Pass a sample JSON payload via stdin: `echo '{"tool_name":"Edit","tool_input":{"file_path":"/test.ts"}}' | bash ~/.claude/hooks/protect-files.sh`
+
+2. **Check exit codes.** `echo $?` after running the script should be 0 for pass, 1 for block.
+
+3. **Check stderr.** Messages written to stderr appear in the Claude Code session as feedback to Claude. Make sure your error messages are actually going to stderr (`>&2`).
+
+4. **Add logging.** If a hook fires but doesn't behave right, write debug info to a temp file: `echo "debug: $FILE" >> /tmp/hook-debug.log`
+
+## What's Coming
+
+The hooks system is still evolving. Planned additions include richer tool context in the input payload, the ability to modify tool inputs (not just block them), and hook chaining. Check the [Claude Code changelog](https://docs.anthropic.com/en/docs/claude-code/changelog) for updates.
+
+The current system is already powerful enough for most quality-gate and notification use cases. Start with a simple audit log to see what Claude Code is doing, then build from there.

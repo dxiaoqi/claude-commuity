@@ -2,9 +2,9 @@ import Link from "next/link";
 import { Icon } from "./icon";
 
 const nav = [
-  ["/claude", "Claude"],
+  ["/blog", "Blog"],
   ["/claude-code", "Claude Code"],
-  ["/#field-notes", "Field notes"],
+  ["/claude", "Claude"],
 ] as const;
 
 export function SiteHeader() {

@@ -1,0 +1,106 @@
+---
+title: "Claude Code vs Cursor: An Honest Comparison for 2025"
+description: "A detailed, no-hype comparison of Claude Code and Cursor. Different philosophies, different strengths. Here's how to choose—and when to use both."
+date: "2026-06-27"
+tags: ["claude-code", "comparison", "cursor"]
+readTime: "10 min"
+---
+
+Both Claude Code and Cursor get called "AI coding assistants," but they solve different problems. Using them interchangeably leads to frustration. Understanding what each one actually does—and doesn't do—makes both tools more useful.
+
+## The Core Difference
+
+**Cursor** is an editor. It puts AI capabilities inside a VS Code fork: inline completions, a chat panel, `@`-references to files, and the ability to apply suggested changes with a click. You stay in your normal editing workflow; the AI is woven into it.
+
+**Claude Code** is an agent. It runs in your terminal and takes actions on your behalf: reading files, editing code, running shell commands, executing tests. You describe what you want done; Claude Code does the work and reports back. The IDE is optional.
+
+This is not a subtle difference. Cursor assists your editing. Claude Code does the editing. Each model implies a different relationship with your codebase and a different workflow for the engineer.
+
+## At a Glance
+
+| | Claude Code | Cursor |
+|---|---|---|
+| **Interface** | Terminal | VS Code fork |
+| **Model** | Claude (Anthropic) | GPT-4o / Claude / Gemini |
+| **Autonomy** | High — acts on files directly | Lower — suggests, you apply |
+| **Context window** | Large (via CLAUDE.md + tools) | Good (via `@` references) |
+| **Best at** | Multi-file refactors, agentic tasks | Fast inline completions, chat |
+| **Shell access** | Yes, with permission model | Limited |
+| **Price** | $100/mo (Pro) or API usage | $20/mo (Pro) |
+
+## Codebase Navigation
+
+Claude Code can explore a codebase autonomously. Ask "map this repo and tell me what matters" and it'll read directory structures, trace imports, and synthesize an understanding without you manually pointing it to files. This is powerful when you're entering an unfamiliar codebase or handing off context to a new session.
+
+Cursor's context model is more manual. You use `@`-symbols to pull in specific files, `@codebase` to do semantic search, or the chat panel to ask questions. The experience is faster when you know what you're looking for; slower when you don't.
+
+For open-ended exploration and discovery, Claude Code wins. For targeted edits when you know the file, Cursor is faster.
+
+## Code Editing
+
+Cursor's tab completion is genuinely impressive. The "Tab Tab Tab" workflow for accepting multi-line completions is fluid, and Cursor often predicts the next edit you need before you ask. This is the best-in-class experience for line-by-line work.
+
+Claude Code doesn't do inline completion. It reads a task, makes a plan, and executes a set of edits. The output is less instant but usually more complete—it'll update the types, the tests, and the implementation together rather than suggesting a line at a time.
+
+For flow-state coding on a problem you understand well: Cursor.
+For tasks that span multiple files and require coherent changes across a system: Claude Code.
+
+## Autonomy and the Trust Model
+
+Claude Code asks for permission before using certain tools (running shell commands, making edits beyond a threshold), and you can configure this in settings. The permission model is explicit—you can see what it's about to do before it does it.
+
+Cursor applies edits with a review step (you see a diff), but it doesn't run commands in your terminal or manage files outside the editor without explicit setup. The autonomy ceiling is lower by design.
+
+This matters for risk tolerance. Claude Code can provision infrastructure, update CI config, and run tests as part of a single task. Cursor keeps the human more in the loop for most operations. Neither approach is wrong—they reflect different trust levels for different workflows.
+
+## Context and Memory
+
+Claude Code's context system is based on `CLAUDE.md` files (project-specific instructions that get injected at session start) and in-session tool use (reading files, running commands to get current state). Context is dynamic—Claude Code can go get what it needs.
+
+Cursor's context is mostly what you explicitly add via `@`-references plus its codebase index. It doesn't execute commands to gather context; it relies on what you point it to.
+
+For projects where the relevant context is spread across many files or depends on runtime state, Claude Code's tool-based approach is more reliable. For targeted conversations about specific files, Cursor's `@`-references are ergonomically fast.
+
+## Shell and Environment Access
+
+Claude Code has first-class shell access. It can run `npm test`, `docker compose up`, `git log`, and arbitrary shell commands. You can hook into this with custom scripts (pre-tool-use, post-tool-use hooks) to add validation or notification steps.
+
+Cursor has a terminal panel, but AI-driven command execution isn't its core use case. It can suggest commands; you run them.
+
+If your workflow involves running builds, tests, or infrastructure commands as part of a task, Claude Code is the right tool.
+
+## Pricing
+
+**Cursor** is $20/month for Pro (unlimited GPT-4o and Claude Sonnet, limited Opus/advanced models). The pricing is predictable.
+
+**Claude Code** costs $100/month for the Pro plan with Claude Opus access, or you can use it with your own Anthropic API key (usage-based). Heavy agentic sessions with many tool calls can get expensive on API pricing; the Pro plan is more cost-effective for daily use.
+
+If you're primarily doing inline completions and chat, Cursor is significantly cheaper. If you're running long agentic tasks, Claude Code's flat rate becomes more attractive.
+
+## When Each Tool Wins
+
+**Use Claude Code when:**
+- You're refactoring across many files and need coherent, consistent changes
+- You want to automate a task that involves shell commands, file I/O, and tests together
+- You're doing exploratory work in an unfamiliar codebase
+- You want to define a task in plain English and verify the result, not guide each edit
+- You're building with AI (writing MCP servers, setting up CI/CD, scripting infrastructure)
+
+**Use Cursor when:**
+- You're in flow on a problem you understand well and want fast completions
+- You want to iterate quickly on a specific file with inline suggestions
+- You prefer to stay in a VS Code environment without switching to a terminal
+- You need multi-model flexibility (switching between GPT-4o and Claude depending on the task)
+- You want predictable, lower monthly costs
+
+## Can You Use Both?
+
+Yes, and many engineers do. A common pattern: use Cursor for daily coding and fast completions, Claude Code for longer autonomous tasks (refactors, infrastructure changes, writing tests for legacy code). They don't conflict—Claude Code works in your existing repo regardless of which editor you use.
+
+If you have to pick one: Claude Code has a higher ceiling for complex, multi-step work. Cursor has better ergonomics for frequent, smaller interactions.
+
+## The Bottom Line
+
+Cursor is the AI-enhanced editor. It makes the editing experience faster and more intelligent while keeping you in control of every change. Claude Code is the AI agent. It takes a task and does the work, operating your codebase as a tool.
+
+The question isn't which is better. The question is: are you trying to move faster through work you're directing, or are you trying to hand off a task and verify the result? Your answer determines which tool fits.
