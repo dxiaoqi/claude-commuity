@@ -1,0 +1,87 @@
+name: Deploy
+
+on:
+  push:
+    branches: [main]
+
+concurrency:
+  group: deploy-production
+  cancel-in-progress: false   # never cancel an in-flight deploy
+
+jobs:
+  # ── 1. Build & verify ─────────────────────────────────────────
+  build:
+    runs-on: ubuntu-latest
+    outputs:
+      image: ${{ steps.meta.outputs.image }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - run: npm ci
+      - run: npm run typecheck
+      - run: npm run lint
+
+      # Login to Alibaba Cloud Container Registry
+      - name: Login to ACR
+        uses: docker/login-action@v3
+        with:
+          registry: registry.cn-hangzhou.aliyuncs.com
+          username: ${{ secrets.ALIYUN_REGISTRY_USER }}
+          password: ${{ secrets.ALIYUN_REGISTRY_PASSWORD }}
+
+      - name: Set image name
+        id: meta
+        run: |
+          IMAGE="registry.cn-hangzhou.aliyuncs.com/${{ secrets.ALIYUN_NAMESPACE }}/claude-commuity:sha-${{ github.sha }}"
+          echo "image=$IMAGE" >> "$GITHUB_OUTPUT"
+
+      - name: Build and push Docker image
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          push: true
+          tags: |
+            ${{ steps.meta.outputs.image }}
+            registry.cn-hangzhou.aliyuncs.com/${{ secrets.ALIYUN_NAMESPACE }}/claude-commuity:latest
+          build-args: |
+            NEXT_PUBLIC_SITE_URL=https://www.claudecommunity.com
+            NEXT_PUBLIC_UMAMI_SCRIPT_URL=https://www.claudecommunity.com/stats/script.js
+
+  # ── 2. Deploy to ECS ──────────────────────────────────────────
+  deploy:
+    runs-on: ubuntu-latest
+    needs: build
+    environment: production
+    steps:
+      - name: Deploy via SSH
+        uses: appleboy/ssh-action@v1.0.3
+        with:
+          host: ${{ secrets.ECS_HOST }}
+          username: ${{ secrets.ECS_USER }}
+          key: ${{ secrets.ECS_SSH_KEY }}
+          port: ${{ secrets.ECS_PORT }}
+          script: |
+            set -e
+            cd /opt/claude-community
+
+            # Update the app image tag
+            sed -i "s|^APP_IMAGE=.*|APP_IMAGE=${{ needs.build.outputs.image }}|" .env
+
+            # Login to ACR on the server (token refreshed each deploy)
+            echo "${{ secrets.ALIYUN_REGISTRY_PASSWORD }}" | \
+              docker login registry.cn-hangzhou.aliyuncs.com \
+              -u "${{ secrets.ALIYUN_REGISTRY_USER }}" \
+              --password-stdin
+
+            # Pull new image then do a rolling restart (no downtime)
+            docker compose pull app
+            docker compose up -d --no-deps --wait app
+
+            # Show final status
+            echo "=== Deploy complete ==="
+            docker ps --format "table {{.Names}}\t{{.Status}}\t{{.Image}}"
