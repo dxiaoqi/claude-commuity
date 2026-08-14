@@ -1,0 +1,298 @@
+---
+title: "Mini Claude Code · Episode 05: Spawning Sub-Agents With Their Own Context"
+description: "Episode 5 splits the agent in two. We add a spawn_subagent tool that dispatches a scoped task to a fresh Claude with its own tool set and its own context window, then returns a compact summary. The pattern behind Anthropic's 'token usage explains 80% of variance' finding, in ~90 lines."
+date: "2026-07-05"
+tags: ["mini-claude-code", "series", "typescript", "agents"]
+readTime: "17 min"
+---
+
+Four episodes in and our agent can read, write, remember selectively, and continue past truncation. What it still can't do: divide labor. Every observation, every tool call, every reasoning step lives in one context window. A "refactor everything under `src/lib/`" task will punch a hole through even the masked view we built last week.
+
+Tonight we fix that architecturally. We introduce a *sub-agent* — a fresh Claude with its own system prompt, its own tool set, and, critically, its own context window. The main agent orchestrates. The sub-agent does one scoped thing and reports back a compact summary. The main agent then continues its plan, never having seen the noisy raw data the sub-agent chewed through.
+
+This is the pattern behind Anthropic's finding that "token usage explains 80% of the variance in outcome quality." The [context engineering research](/en/blog/context-engineering-for-coding-agents) puts the theory; tonight we put the ~90 lines of code.
+
+## What we are building tonight
+
+1. A `runSubagent(brief, tools, model?)` function — a self-contained tool-use loop with its own history
+2. A `spawn_subagent` tool exposed to the main agent
+3. A hard budget: sub-agents get a maximum turn count and a maximum output size
+4. A "return contract" — the sub-agent's final message is what gets sent back to the main agent, verbatim, capped
+
+Same `agent.ts`. New `subagent.ts`.
+
+## The right mental model
+
+The main agent is a *manager*. It should read like a plan: "First find where auth is wired, then check whether we already have a rate-limit middleware, then propose a patch." Each of those sub-steps is a *task*, and each task can be handed to a sub-agent whose entire job is that sub-step and nothing else.
+
+Two things make this cheap and safe:
+
+- **Fresh context per sub-agent.** No inherited noise. No accidental cross-task reasoning bleed.
+- **Compact reply.** The sub-agent has to *decide what to say* to the manager. That constraint improves quality — the same way a good junior forced to write a two-sentence status update thinks harder than one drowning in Slack.
+
+The tradeoff is orchestration latency (one extra round trip) and a slightly harder time debugging. Both are acceptable for tasks whose observation footprint is > 4000 tokens.
+
+## Building `runSubagent`
+
+Create `subagent.ts`:
+
+```typescript
+import Anthropic from "@anthropic-ai/sdk";
+import type { runTool } from "./agent.js";
+
+const client = new Anthropic();
+
+export interface SubagentOptions {
+  brief: string;
+  toolNames: string[];         // subset of the main agent's tools
+  model?: string;
+  maxTurns?: number;
+  maxOutputChars?: number;
+  systemHint?: string;
+}
+
+export interface SubagentResult {
+  finalText: string;
+  turnsUsed: number;
+  reason: "end_turn" | "max_turns" | "error";
+  errorMessage?: string;
+}
+
+const DEFAULT_MODEL = "claude-sonnet-4-5";
+const DEFAULT_MAX_TURNS = 8;
+const DEFAULT_MAX_OUTPUT = 2000;
+
+const SUBAGENT_SYSTEM = (hint?: string) => `
+You are a scoped sub-agent inside Mini Claude Code. You have a single brief. Complete it, then STOP.
+
+Rules:
+- Do the smallest amount of work that answers the brief.
+- Use tools only when needed. Do not explore.
+- Your final message will be sent back to the manager verbatim. Keep it under ~300 words and structured.
+- If the brief is infeasible, say so in one sentence and stop.
+${hint ? "\nManager hint: " + hint : ""}
+`.trim();
+
+export async function runSubagent(
+  opts: SubagentOptions,
+  runToolFn: typeof runTool,
+  allTools: readonly { name: string; description: string; input_schema: unknown }[],
+): Promise<SubagentResult> {
+  const model = opts.model ?? DEFAULT_MODEL;
+  const maxTurns = opts.maxTurns ?? DEFAULT_MAX_TURNS;
+  const maxOutput = opts.maxOutputChars ?? DEFAULT_MAX_OUTPUT;
+  const tools = allTools.filter((t) => opts.toolNames.includes(t.name));
+
+  const history: Anthropic.MessageParam[] = [
+    { role: "user", content: opts.brief },
+  ];
+
+  for (let turn = 0; turn < maxTurns; turn++) {
+    let response: Anthropic.Message;
+    try {
+      response = await client.messages.create({
+        model,
+        max_tokens: 1500,
+        system: SUBAGENT_SYSTEM(opts.systemHint),
+        tools,
+        messages: history,
+      });
+    } catch (e) {
+      return {
+        finalText: "",
+        turnsUsed: turn,
+        reason: "error",
+        errorMessage: e instanceof Error ? e.message : String(e),
+      };
+    }
+
+    history.push({ role: "assistant", content: response.content });
+
+    if (response.stop_reason !== "tool_use") {
+      const text = response.content
+        .filter((b): b is Anthropic.TextBlock => b.type === "text")
+        .map((b) => b.text)
+        .join("\n")
+        .trim();
+      const capped = text.length > maxOutput ? text.slice(0, maxOutput) + "\n…[truncated by sub-agent budget]" : text;
+      return { finalText: capped, turnsUsed: turn + 1, reason: "end_turn" };
+    }
+
+    const results = [];
+    for (const b of response.content) {
+      if (b.type === "tool_use") {
+        const out = await runToolFn(b.name, b.input as Record<string, unknown>);
+        results.push({ type: "tool_result" as const, tool_use_id: b.id, content: out });
+      }
+    }
+    history.push({ role: "user", content: results });
+  }
+
+  return { finalText: "(sub-agent hit turn cap without concluding)", turnsUsed: maxTurns, reason: "max_turns" };
+}
+```
+
+Five things in there worth noting:
+
+**A stripped system prompt.** The sub-agent gets a different personality: terse, task-focused, forbidden from exploring. This is the single most important lever for making sub-agents useful. A chatty sub-agent is a broken sub-agent.
+
+**Tool allow-list.** Not every sub-agent needs every tool. The main agent decides. A "find relevant files" sub-agent might get `list_dir` and `run_bash` only, no `apply_patch`. Least privilege applied to prompts.
+
+**No masking loop inside.** The sub-agent's context stays small by construction — it dies within a handful of turns. Ep.04's machinery would be overkill here.
+
+**No confirmation gate on `apply_patch`.** If the main agent grants a sub-agent `apply_patch`, the sub-agent inherits the same confirmation flow via `runToolFn`. The gate belongs to the tool, not the agent. This is why we pass `runToolFn` in — the sub-agent doesn't reimplement anything.
+
+**Hard cap on output.** The main agent gets at most `maxOutputChars` back. If a sub-agent tries to dump an entire file, we truncate. The manager should have asked a better question.
+
+## Exposing the tool to the main agent
+
+Add to the main `TOOLS` array:
+
+```typescript
+{
+  name: "spawn_subagent",
+  description:
+    "Dispatch a scoped task to a fresh sub-agent. Use for large searches, exploration, or focused refactors. The sub-agent has its own context window; you will only see its final summary. Prefer this over reading many files yourself.",
+  input_schema: {
+    type: "object",
+    properties: {
+      brief: {
+        type: "string",
+        description: "A single-paragraph task description. Be specific about what to return.",
+      },
+      tools: {
+        type: "array",
+        items: { type: "string" },
+        description: "Subset of tool names to grant. Never include spawn_subagent (no recursion).",
+      },
+    },
+    required: ["brief", "tools"],
+  },
+},
+```
+
+Notice the explicit "no recursion" note. Sub-agents cannot spawn sub-agents in Ep.05. It's not a hard problem, but the failure modes (fan-out, budget explosion, debugging opacity) are, and I'd rather ship a version that a reader can reason about.
+
+## Wiring into `runTool`
+
+In `agent.ts`:
+
+```typescript
+import { runSubagent } from "./subagent.js";
+
+// inside runTool:
+if (name === "spawn_subagent") {
+  const brief = String(input.brief);
+  const requestedTools = (input.tools as string[]).filter((t) => t !== "spawn_subagent");
+  console.log(`[subagent] brief: ${brief.slice(0, 100)}${brief.length > 100 ? "…" : ""}`);
+  console.log(`[subagent] tools: ${requestedTools.join(", ")}`);
+
+  const result = await runSubagent(
+    { brief, toolNames: requestedTools },
+    runTool, // pass ourselves so the sub-agent reuses tool implementations
+    TOOLS,
+  );
+
+  console.log(`[subagent] done in ${result.turnsUsed} turns, ${result.reason}`);
+  return `SUBAGENT_RESULT (${result.turnsUsed} turns, ${result.reason}):\n\n${result.finalText}`;
+}
+```
+
+We pass `runTool` into `runSubagent`. Cyclic but harmless — the tool executor doesn't need to know whether it's serving the main agent or a sub-agent.
+
+## What a real session with sub-agents looks like
+
+```
+you › are there any files under src/lib that don't have a matching test?
+
+cc  › I'll dispatch a sub-agent to enumerate this cleanly.
+
+[tool] spawn_subagent({"brief":"List every .ts file under src/lib recursively.
+For each, check whether a file with the same basename exists under
+tests/lib or under src/lib with a .test.ts suffix. Return a plain list
+of untested files, one per line. If everything is covered, say so.",
+"tools":["list_dir","run_bash"]})
+[subagent] brief: List every .ts file under src/lib recursively. For each, check…
+[subagent] tools: list_dir, run_bash
+[subagent] done in 4 turns, end_turn
+
+Files without tests:
+- src/lib/blog.ts
+- src/lib/mdx-renderer.ts
+- src/lib/i18n-utils.ts
+
+Everything else in src/lib has a matching *.test.ts.
+
+cc  › Three files lack tests: blog.ts, mdx-renderer.ts, i18n-utils.ts.
+Want me to draft skeleton tests for one of them?
+```
+
+The main agent's context grew by:
+- ~200 tokens for the brief description in the tool call
+- ~150 tokens for the sub-agent's final summary
+
+That's it. The sub-agent internally did 4 turns and processed several `list_dir` and `grep` outputs — none of which touched the main agent's history. This is where the compression comes from. Not from clever text-shrinking, but from *keeping the raw data on the other side of a wall*.
+
+## Choosing which tasks to sub-agent
+
+Not every task deserves a sub-agent. My rough rule:
+
+- **Sub-agent** if the task's expected tool output is > 4000 tokens *and* the answer the manager needs is short.
+- **Inline** if the manager will need the raw data anyway (e.g. reading one specific file to edit it).
+- **Never sub-agent** for interactive decisions. The user is watching the main REPL; hiding a `y/N` prompt inside a sub-agent is confusing.
+
+The manager decides at plan time. In practice Claude does this well when the tool description ("Prefer this over reading many files yourself") is honest.
+
+## Pitfalls I hit while writing this
+
+**Sub-agent thinks it can chat.** First run, the sub-agent's summary was three paragraphs of "Interesting question! Here's what I found…". Fix: strengthen the system prompt to require structured, terse output. I still occasionally see prose creep in on longer tasks; a stricter "reply as a bulleted list" instruction helps.
+
+**Fan-out via loop.** In an early draft I let the sub-agent grant tools by name-substring match. The main agent typed `["*"]` and got everything, including `spawn_subagent`. It then recursed. I killed it at 12 layers deep, ~$0.60 later. Fix: exact-match only; strip `spawn_subagent` from the allow-list unconditionally.
+
+**Sub-agent's `apply_patch` needs its own confirmation.** Since the tool code calls the same `confirmPatch`, the user sees a `y/N` from the sub-agent's edit. This is fine, but not obvious. Log clearly which agent is asking. In production Claude Code this is usually the operator's least favorite surprise.
+
+**Cost visibility.** A sub-agent can burn 8 turns × 2K max_tokens without the operator noticing. Add a per-sub-agent cost line: `[subagent] tokens: in=… out=…`. I skipped it in tonight's code for length, but Ep.06 will bring it back with a proper accounting pass.
+
+## What next episode will fix
+
+We now have architectural capability but no way to measure it. Ep.06 — the final episode of the first arc — is entirely about evaluation:
+
+- A 15-task SWE-lite set (small, real, verifiable) that lives in a `evals/` directory.
+- An `mcc eval` command that runs the current agent against the set and reports pass rate, turn count, and cost.
+- A pinned baseline so you can tell whether tomorrow's system prompt change made things better or worse.
+- Prompt caching wired in (finally), because the eval loop makes cache hits visible.
+
+If Ep.05 gave us the architecture, Ep.06 gives us the feedback loop that lets us iterate on it without regressing.
+
+## Quick Reference — Episode 05
+
+| What | Where |
+|---|---|
+| Sub-agent runner | `runSubagent(opts, runTool, TOOLS)` |
+| Main-agent tool | `spawn_subagent` |
+| Turn cap | 8 |
+| Output cap | 2000 chars |
+| Model | `claude-sonnet-4-5` (same as main; different system prompt) |
+| Tool allow-list | passed by manager, minus `spawn_subagent` |
+| Return format | `"SUBAGENT_RESULT (N turns, reason):\n\nTEXT"` |
+| Recursion policy | none in Ep.05 |
+
+**Minimum viable sub-agent turn:**
+
+```typescript
+const result = await runSubagent(
+  { brief: "...", toolNames: ["list_dir", "run_bash"] },
+  runTool, TOOLS,
+);
+return `SUBAGENT_RESULT (${result.turnsUsed}, ${result.reason}):\n\n${result.finalText}`;
+```
+
+**Six rules to survive to Ep.06:**
+1. Sub-agents have a *different* system prompt — terse, scoped, forbidden to explore.
+2. Sub-agents get a *subset* of tools, never all.
+3. Never grant `spawn_subagent` to a sub-agent.
+4. Cap turns *and* output; either hitting the cap is a signal, not a success.
+5. Log which agent is asking for confirmation.
+6. Pick sub-agent tasks by observation-footprint, not by "seems complex".
+
+Ep.06 next — we finally build the feedback loop.

@@ -1,0 +1,317 @@
+---
+title: "Mini Claude Code · Episode 06: 悪化させたかどうかをついに教えてくれるエバルループ"
+description: "シーズンフィナーレ。15 タスクからなる SWE-lite ハーネスを構築し、検証可能なコードタスクに対してエージェントをエンドツーエンドで走らせ、さらにプロンプトキャッシングを配線してイテレーションを安価にする。パスレート、平均ターン数、タスクあたりのコスト——将来リグレッションを検出するためのベースラインとしてピン留めする。"
+date: "2026-07-05"
+tags: ["mini-claude-code", "series", "typescript", "agents"]
+readTime: "18 min"
+---
+
+五つのエピソードにわたって作ってきたが、これまでの改善はすべて雰囲気で調整してきたものだ。「マスキングは効いてる気がする」「サブエージェントの方がきれいに感じる」。どう効いているのだ、具体的には？何と比較して？今夜は、もっと規律正しくやっていれば最初に書いておくべきだった要素でシーズンを締めくくる：ピン留めされたベースラインを持つ評価ハーネスだ。これがあれば、次にシステムプロンプトをいじったとき、30 分以内に「エージェントを良くしたのか悪くしたのか」がわかる。
+
+今夜のもう一つのテーマ：プロンプトキャッシング。Ep.02 以来、我々は毎ターン同じシステムプロンプトとツール定義に対してフルの入力トークン料金を払い続けてきた。探索中はそれでよかった。だが 15 回連続でエージェントを起動するエバルを走らせる段になると、それは馬鹿げている。両者を同じコミットに入れるのは、安いイテレーションなしにプロンプトを反復できないからだ。
+
+## 今夜作るもの
+
+1. `evals/tasks/` — 15 個の検証可能な SWE-lite スタイルのタスク。それぞれ `setup.sh`、`task.md`、`verify.sh` を含むディレクトリ
+2. `evals/runner.ts` — `mcc eval` コマンド。各タスクに対してエージェントを走らせ、pass / fail / ターン / トークン / コストを記録する
+3. `client.messages.create` に配線されたプロンプトキャッシング —— システムブロックとツールの `cache_control`
+4. `baseline.json` —— 最初のコミットにピン留めされたラン。将来のランは生値ではなく *差分* を報告する
+
+## なぜ 15 タスクか、なぜ「SWE-lite」か
+
+15 は約 15 分で走るには十分小さく、シグナルを得るには十分大きい——15 タスクでの 80% パスレート対 60% パスレートは統計的ノイズではない。それ以上大きくすると、プロンプト変更のたびに再実行するものではなくなってしまう。
+
+「SWE-lite」の意味は、小さく、リアルで、検証可能ということだ：
+
+- 各タスクは独自のディレクトリに存在する。`setup.sh` がファイルを準備する。`task.md` がエージェントに見えるものだ。`verify.sh` はパス時に exit 0 を返す。
+- タスクは Claude Code が日々実際にやっている作業の形から取っている：「この失敗しているテストを直せ」「null チェックを追加しろ」「この関数を使っている場所すべてでリネームしろ」「このヘルパーを抽出しろ」。
+- ネットワークや本物のデータベースを必要とするタスクはない。すべてが新しい一時ディレクトリで走る。
+
+単一タスクの見た目はこうだ：
+
+```
+evals/tasks/03-fix-off-by-one/
+├── setup.sh       # writes buggy code + failing test into $WORK_DIR
+├── task.md        # "The test in sum_test.ts fails. Fix sum.ts so it passes."
+└── verify.sh      # cd $WORK_DIR && npm test -- sum_test.ts
+```
+
+これが 15 個あればシグナルチャネルになる。それ以下は逸話にすぎない。
+
+## ランナー
+
+`evals/runner.ts` を作る：
+
+```typescript
+import { readdir, readFile, mkdtemp, rm } from "node:fs/promises";
+import { join } from "node:path";
+import { tmpdir } from "node:os";
+import { execFile } from "node:child_process";
+import { promisify } from "node:util";
+import Anthropic from "@anthropic-ai/sdk";
+import { TOOLS, runTool } from "../src/agent.js";
+
+const execFileP = promisify(execFile);
+const client = new Anthropic();
+const MODEL = "claude-sonnet-4-5";
+const MAX_TURNS = 30;
+
+interface TaskResult {
+  id: string;
+  passed: boolean;
+  turns: number;
+  inputTokens: number;
+  outputTokens: number;
+  cacheReadTokens: number;
+  cacheWriteTokens: number;
+  costUsd: number;
+  durationMs: number;
+  error?: string;
+}
+
+async function runOneTask(taskDir: string, taskId: string): Promise<TaskResult> {
+  const t0 = Date.now();
+  const workDir = await mkdtemp(join(tmpdir(), `mcc-eval-${taskId}-`));
+  process.env.WORK_DIR = workDir;
+  process.env.MCC_AUTO_APPROVE = "1"; // no y/N inside eval
+
+  try {
+    await execFileP("sh", [join(taskDir, "setup.sh")], { env: process.env });
+    const brief = await readFile(join(taskDir, "task.md"), "utf8");
+
+    const history: Anthropic.MessageParam[] = [
+      { role: "user", content: `Working directory: ${workDir}\n\n${brief}` },
+    ];
+
+    let totIn = 0, totOut = 0, totCacheR = 0, totCacheW = 0;
+    let turns = 0;
+
+    for (; turns < MAX_TURNS; turns++) {
+      const response = await client.messages.create({
+        model: MODEL,
+        max_tokens: 4096,
+        system: [
+          {
+            type: "text",
+            text: "You are Mini Claude Code, running inside an eval harness. Complete the task and stop. Use tools decisively.",
+            cache_control: { type: "ephemeral" },
+          },
+        ],
+        tools: TOOLS.map((t, i) =>
+          i === TOOLS.length - 1 ? { ...t, cache_control: { type: "ephemeral" } } : t
+        ),
+        messages: history,
+      });
+
+      totIn += response.usage.input_tokens;
+      totOut += response.usage.output_tokens;
+      totCacheR += response.usage.cache_read_input_tokens ?? 0;
+      totCacheW += response.usage.cache_creation_input_tokens ?? 0;
+      history.push({ role: "assistant", content: response.content });
+
+      if (response.stop_reason !== "tool_use") break;
+
+      const results = [];
+      for (const b of response.content) {
+        if (b.type === "tool_use") {
+          const out = await runTool(b.name, b.input as Record<string, unknown>);
+          results.push({ type: "tool_result" as const, tool_use_id: b.id, content: out });
+        }
+      }
+      history.push({ role: "user", content: results });
+    }
+
+    let passed = false;
+    try {
+      await execFileP("sh", [join(taskDir, "verify.sh")], { env: process.env, timeout: 30_000 });
+      passed = true;
+    } catch { /* verify script exited non-zero */ }
+
+    // Sonnet 4.5 pricing (USD per 1M tokens)
+    const cost =
+      (totIn - totCacheR - totCacheW) * 3 / 1e6 +
+      totCacheW * 3.75 / 1e6 +
+      totCacheR * 0.30 / 1e6 +
+      totOut * 15 / 1e6;
+
+    return {
+      id: taskId, passed, turns,
+      inputTokens: totIn, outputTokens: totOut,
+      cacheReadTokens: totCacheR, cacheWriteTokens: totCacheW,
+      costUsd: Number(cost.toFixed(4)),
+      durationMs: Date.now() - t0,
+    };
+  } catch (e) {
+    return {
+      id: taskId, passed: false, turns: 0,
+      inputTokens: 0, outputTokens: 0, cacheReadTokens: 0, cacheWriteTokens: 0,
+      costUsd: 0, durationMs: Date.now() - t0,
+      error: e instanceof Error ? e.message : String(e),
+    };
+  } finally {
+    await rm(workDir, { recursive: true, force: true });
+  }
+}
+
+export async function runEval() {
+  const tasksRoot = new URL("./tasks/", import.meta.url).pathname;
+  const dirs = (await readdir(tasksRoot)).sort();
+  const results: TaskResult[] = [];
+
+  for (const d of dirs) {
+    process.stdout.write(`[${d}] `);
+    const r = await runOneTask(join(tasksRoot, d), d);
+    results.push(r);
+    process.stdout.write(`${r.passed ? "PASS" : "FAIL"}  ${r.turns}t  $${r.costUsd}\n`);
+  }
+
+  const passed = results.filter((r) => r.passed).length;
+  const cost = results.reduce((s, r) => s + r.costUsd, 0);
+  const cacheHitRate = results.reduce((s, r) => s + r.cacheReadTokens, 0) /
+    Math.max(1, results.reduce((s, r) => s + r.inputTokens, 0));
+
+  console.log(`\n=== ${passed}/${results.length} passed ===`);
+  console.log(`Mean turns: ${(results.reduce((s, r) => s + r.turns, 0) / results.length).toFixed(1)}`);
+  console.log(`Total cost: $${cost.toFixed(2)}`);
+  console.log(`Cache hit rate: ${(cacheHitRate * 100).toFixed(1)}%`);
+
+  return results;
+}
+```
+
+立ち止まって考える価値のある五つのアイデア：
+
+**`process.chdir` ではなく `WORK_DIR` 環境変数。** エージェントのツールはすでにベースパスを尊重している。パラレルバッチの途中で Node プロセス全体の cwd を変えるのは、二度踏んだフットガンだ。
+
+**エバル内での `MCC_AUTO_APPROVE=1`。** Ep.03 の確認ゲートからの継承だ。エバルは `y/N` で止まることができない。オートアプルーブがイヤなら、エバルモードのツールセットに `apply_patch` を含めなければよい——だがほぼ確実に含めたくなるはずだ。パッチングこそが面白い軸だからだ。
+
+**`usage` のフル取得。** `input_tokens`、`output_tokens`、`cache_read_input_tokens`、`cache_creation_input_tokens` の四つすべて。プロンプトキャッシングが実際に機能しているかを知る術はこれだ。初回ターンは `cache_creation` を示し、以降のターンはすべて `cache_read` を示すはずだ。そうでなければ、キャッシュのブレークポイントが誤った位置にある。
+
+**コストは推測ではなく計算する。** Sonnet 4.5 のプライシングを直接配線した。キャッシュリードは通常のリードより 10 倍安く、キャッシュライトより 12.5 倍安い。30 ターンのタスクではこれが急速に効いてくる。
+
+**検証スクリプトには 30 秒しか与えない。** `verify.sh` がハングすると、タスク 3 で気づいてブチ切れることになる。タイムアウトを付けよ。
+
+## プロンプトキャッシング：重要なのは二つだけ
+
+`cache_control: { type: "ephemeral" }` のマーカーを二つ、まさにここに置く：
+
+1. `system` の最後のテキストブロックに。ここまで（このブロックを含む）すべてがキャッシュされる。
+2. `tools` 配列の最後のツールに。同じ考え方——そのマーカーまでのツールリスト全体がキャッシュ対象だ。
+
+それだけだ。Anthropic はプレフィックスをキャッシュする。約 5 分以内の以降のターンはすべて、書き込みではなく読み取りになる。
+
+しかし、静かにあなたを打ち負かす二つのことがある：
+
+**ターン間で tools 配列を変更した。** いかなる構造的変更（新ツール、ツールの並び替え、記述の編集）もキャッシュを無効化する。tools 配列はリテラルかつ安定に保つこと。動的なツールが必要ならそれらを切り出し、キャッシュのブレークポイントの *後ろ* に置け。
+
+**システムプロンプトにタイムスタンプが入っている。** 笑うな。私もやった。system ブロックの中の `"Current time: 2026-07-05T18:59:12Z"` は毎ターン、キャッシュを破壊する。揮発性のデータはユーザーメッセージに移すこと。
+
+## 最初のベースライン
+
+一度走らせて `baseline.json` をコミットする：
+
+```json
+{
+  "timestamp": "2026-07-05T19:14:22Z",
+  "model": "claude-sonnet-4-5",
+  "commit": "abc12345",
+  "passed": 11,
+  "total": 15,
+  "meanTurns": 6.4,
+  "totalCostUsd": 0.87,
+  "cacheHitRate": 0.71,
+  "byTask": [
+    { "id": "01-add-null-check", "passed": true, "turns": 3, "costUsd": 0.031 },
+    { "id": "02-rename-function", "passed": true, "turns": 5, "costUsd": 0.048 },
+    { "id": "03-fix-off-by-one", "passed": true, "turns": 4, "costUsd": 0.041 },
+    { "id": "04-extract-helper", "passed": false, "turns": 30, "costUsd": 0.152 }
+  ]
+}
+```
+
+上の数字は私の実際の初回ランだ——11/15、平均 6.4 ターン、合計 0.87 ドル。タスク 04 がターンキャップを超過したのは、エージェントがファイルの内容を憶えておく代わりに何度も読み直したからだ。Ep.04 のマスキングは役に立ったが、まだ弱点として残っている。
+
+次に何かを変更するとき——システムプロンプト、サブエージェントの予算、新しいツール——`mcc eval` を走らせて比較する。パスレートが下がったらリバートする。平均ターンが上がってもパスレートが維持されているなら、*どの* タスクが遅くなったかを見る。これが Episode 1 から持っておくべきだったループだ。
+
+## 15 タスクの内訳
+
+正直な内訳、おおまかに：
+
+- **易 6 個**（テストが通るようファイルにパッチする）——ここではエージェントはおよそ 100% を叩き出すはず。そうでなければツール配線のどこかがリグレッションしている。
+- **中 6 個**（複数ファイルにまたがるリネーム、ヘルパーの抽出、新しい export の配線）——プロンプト / マスキング / サブエージェント設計の効果が表れるのはここだ。
+- **難 3 個**（マルチファイルリファクタ、曖昧な仕様、テストスイートなし）——ここで 3/3 を取る者はいない。3 分の 2 なら上出来だ。
+
+難しい方のいくつかは意図的に仕様を過少に書いてある。現実のユーザーは仕様を過少にしか書かない。整った依頼にしか対応できないエージェントは有用ではない。
+
+## 書きながらぶつかった落とし穴
+
+**動的ブロックの後ろにキャッシュブレークポイント。** 初稿では、システムメッセージの先頭に現在日付を挿入した上で *システムメッセージ文字列そのもの* に `cache_control` を付けた。キャッシュヒットゼロ、初回ランのコストはキャッシュなしと同じ。揮発性データはユーザーターンに移すか、ブレークポイントの下に置け。
+
+**非ヘルメティックなタスク。** 私のドラフトのタスク 07 は、グローバルにインストールされた `jq` に依存していた。同僚のマシンには `jq` がなく、タスクは常に失敗し、ベースラインが誤ったものになった。`setup.sh` は必要なものをすべてインストールするか、もしくはタスクがそれに依存しないようにしなければならない。クリーンなシェルでローカル検証せよ。
+
+**verify.sh が偽陽性を返す。** タスク 12 の `verify.sh` は `grep -q pattern file` だった。ファイルが存在しなくても、どこかで `|| true` にパイプしていたので `grep` はゼロ終了した。エージェントは何もせずに合格スコアを得た。すべての `|| true` を消せ。爆発させろ。
+
+**コスト行が嘘をついた。** 当初、合計 in のアカウンティングで `cache_read_input_tokens` を `input_tokens` に足していた。Anthropic の SDK は両者を分けて返す——`input_tokens` は *非キャッシュ* のみだ。SDK の型を読め、記憶ではなく。
+
+## 今回出荷するもの、しないもの
+
+出荷：このエバルハーネス、このベースライン、プロンプトキャッシング、`mcc eval` コマンド。
+
+Ep.06 で出荷しないもの：パラレル実行（タスクを並行に走らせる）、一時的エラーへのリトライ、モデル比較モード（同じセットに対する Sonnet 対 Haiku）、ウェブダッシュボード。それぞれが良い週末の題材だ。だがどれも「盲目にならずにプロンプトを反復できる」というクリティカルパス上にはない。
+
+## シリーズ全体を一枚で
+
+六エピソード、一つのエージェント、合計およそ 500 行の TypeScript：
+
+| Ep | 追加したもの | 触ったファイル |
+|---|---|---|
+| 01 | ストリーミングとヒストリを持つ 40 行 REPL | `agent.ts` |
+| 02 | 三つのツール + tool-use ループ | `agent.ts` |
+| 03 | ドライラン + 確認付きの `apply_patch` | `agent.ts`, `patch.ts` |
+| 04 | 観測マスキング + オートコンティニュー | `agent.ts` |
+| 05 | 独自のコンテキストを持つサブエージェント | `agent.ts`, `subagent.ts` |
+| 06 | エバルハーネス + プロンプトキャッシング + ベースライン | `evals/runner.ts`, `evals/tasks/*` |
+
+一緒に作ってきたなら、あなたは今、小さくスコープの絞られたコードエージェントに非常によく似た見た目と振る舞いのものを手にしている。それは Claude Code *ではない*——Claude Code には長年のハーデニング、多数のツール、本物のターミナル UI、MCP、サンドボックス、そして私が手を抜いてきたパーミッションモデルがある。しかしそれは、設計判断のすべてを理解しており、今夜にも変更できる、動作するエージェントだ。
+
+あなたが今所有している最も有用なものはコードではない。エバルハーネスだ。これから作るすべて——新ツール、新しいサブエージェントの形、新しいマスキングヒューリスティック、モデル切替え——は、Ep.06 を通過するか、しないかのどちらかだ。
+
+## クイックリファレンス — Episode 06
+
+| 何を | どこで |
+|---|---|
+| ランナーのエントリ | `evals/runner.ts` の `runEval()` |
+| タスクの形 | `setup.sh` + `task.md` + `verify.sh` |
+| ターンの上限 | 30（難タスクは息をつける必要がある） |
+| オートアプルーブ | ランナーが `MCC_AUTO_APPROVE=1` をセット |
+| キャッシュのブレークポイント | `system` の最後のテキストブロック、`tools` の最後のツール |
+| 記録するメトリクス | pass、ターン数、in/out/cache-r/cache-w トークン、コスト、ms |
+| ベースラインの場所 | `evals/baseline.json`、コミット済み |
+| CLI コマンド | `mcc eval`（`runEval` の薄いラッパー） |
+
+**最小限で動くキャッシュ済みリクエスト：**
+
+```typescript
+await client.messages.create({
+  model: "claude-sonnet-4-5",
+  max_tokens: 4096,
+  system: [{ type: "text", text: SYSTEM, cache_control: { type: "ephemeral" } }],
+  tools: TOOLS.map((t, i) =>
+    i === TOOLS.length - 1 ? { ...t, cache_control: { type: "ephemeral" } } : t
+  ),
+  messages: history,
+});
+```
+
+**シリーズを越えて生き延びる七つのルール：**
+1. 何かをチューニングする前にベースラインをピン留めせよ。
+2. 15 タスクはシグナルを得られる最小の数だ。
+3. ヘルメティックなタスクか、さもなくばタスクなし。
+4. `verify.sh` は大声で失敗しなければならない。すべての `|| true` を剥がせ。
+5. キャッシュのブレークポイントは安定プレフィックスの *後ろ* に置く。揮発性ブロックに付けるな。
+6. `usage` の四つのフィールドすべてをログせよ。それ以外は推測だ。
+7. エージェントへの将来のあらゆる変更は、着地前にエバルを通過させよ。
+
+これがアークだ。シーズンワンはここで幕を閉じる。エージェントは小さく、正直で——そして今夜初めて——測定可能だ。拡張するなら、エバルも並行して拡張せよ。それが規律のすべてだ。
+
+一緒に作ってくれてありがとう。

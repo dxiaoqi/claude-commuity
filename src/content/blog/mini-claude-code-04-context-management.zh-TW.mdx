@@ -1,0 +1,273 @@
+---
+title: "Mini Claude Code · 第 04 集：讓代理人有目的地遺忘"
+description: "第 4 集正面迎戰 token 帳單。我們實作 observation masking（JetBrains 團隊示範的技巧，在成本與品質上都勝過 LLM summarization），並加上一條 auto-continue 路徑，讓 max_tokens 截斷不再默默地破壞工具序列。"
+date: "2026-07-05"
+tags: ["mini-claude-code", "series", "typescript", "agents"]
+readTime: "16 min"
+---
+
+我們現在有一個會讀檔案、跑指令、改程式碼的代理人了。它也有個問題：在真實的編碼工作階段跑過 15–20 個回合之後，它的 `history` 就變成 50 KB、其中大多是過期的工具輸出。模型每次請求都在付錢重新注意這些雜訊，而且——根據 [context rot](/en/blog/context-engineering-for-coding-agents) 的研究——隨著上下文視窗被填滿，它的準確度也在下降。
+
+今晚我們教它遺忘。不是大多數人採用的那種做法（LLM summarization），而是 JetBrains 團隊在 NeurIPS 2025《The Complexity Trap》裡示範的方法：把舊的工具觀察值換成佔位符，同時保留完整的推理軌跡。他們的結果是——比 LLM summarization 更便宜，任務完成率甚至*略高一點*。這會是你在整個系列裡「每一行改動效益最大」的一次改動。
+
+我們同時也要修掉第 02 集裡那個沉默截斷的問題：當模型在計畫進行到一半就撞上 `max_tokens` 時，我們現在會自動續寫，而不是假裝什麼事都沒發生。
+
+## 今晚要打造什麼
+
+1. 一個 `maskOldObservations(history, keep)` 函式，就地改寫訊息陣列
+2. 一個 `budget` 會計員，告訴我們何時該遮罩
+3. 一個包裝 `messages.create` 的 `autoContinue`，能從 `max_tokens` 截斷中恢復
+4. 一個 `/stats` REPL 指令，讓我們看到成效
+
+大約新增 80 行。同一個 `agent.ts`。同一個 `patch.ts`。
+
+## 為什麼 observation masking 勝過 summarization
+
+對於歷史越長越大這件事，最直覺的回答是「讓模型摘要舊回合，把摘要塞進系統提示裡」。這樣做行得通。但它也會：
+
+- 每一次壓縮都花掉一次完整的生成（依模型與長度不同，大約 0.01 到 0.05 美元）。
+- 引入它自己的幻覺（摘要器會自行決定什麼算「重要」，還可能捏造因果關係）。
+- 丟掉精確的字串——變數名、行號、檔案路徑——而這些正是編碼代理人最需要的東西。
+
+JetBrains 的發現是：如果你去看一個編碼代理人的歷史裡 token 到底住在哪，大約 84% 都是*工具觀察值*（檔案內容、bash 輸出、grep 命中結果）。這些觀察值在比例上被嚴重高估：模型當下確實需要它們，但三個回合之後，這些內容已經完全被消化進助理端的推理裡了。所以你可以把它們丟掉。
+
+能撐到生產環境的規則其實很簡單：
+
+> 保留最近 N 筆工具觀察值的原文。把更舊的換成 `[N lines omitted for brevity]`。永遠不要動助理的推理，也永遠不要動使用者的訊息。
+
+就這樣。沒有 LLM 呼叫、沒有摘要提示、沒有幻覺表面。
+
+## 遮罩器
+
+在 `agent.ts`（或新開一個 `context.ts`）加上：
+
+```typescript
+import type Anthropic from "@anthropic-ai/sdk";
+
+type Msg = Anthropic.MessageParam;
+type Block = Anthropic.ContentBlockParam;
+
+const KEEP_RECENT_OBSERVATIONS = 4;
+const PLACEHOLDER_PREFIX = "[observation masked —";
+
+export function maskOldObservations(history: Msg[], keep = KEEP_RECENT_OBSERVATIONS): Msg[] {
+  // First pass: find indices of tool_result blocks, newest to oldest.
+  const toolResultIndices: { msgIdx: number; blockIdx: number }[] = [];
+  for (let i = history.length - 1; i >= 0; i--) {
+    const m = history[i];
+    if (m.role !== "user" || typeof m.content === "string") continue;
+    for (let j = 0; j < m.content.length; j++) {
+      const b = m.content[j];
+      if (b.type === "tool_result") toolResultIndices.push({ msgIdx: i, blockIdx: j });
+    }
+  }
+
+  // Keep the newest `keep`; mask the rest.
+  const toMask = toolResultIndices.slice(keep);
+  if (toMask.length === 0) return history;
+
+  // Return a shallow copy with modified blocks.
+  const next: Msg[] = history.map((m) => ({ ...m, content: Array.isArray(m.content) ? [...m.content] : m.content }));
+  for (const { msgIdx, blockIdx } of toMask) {
+    const msg = next[msgIdx];
+    if (typeof msg.content === "string") continue;
+    const block = msg.content[blockIdx];
+    if (block.type !== "tool_result") continue;
+    const original = typeof block.content === "string"
+      ? block.content
+      : (block.content ?? []).map((c) => (c.type === "text" ? c.text : "")).join("");
+    const lineCount = original.split("\n").length;
+    msg.content[blockIdx] = {
+      ...block,
+      content: `${PLACEHOLDER_PREFIX} ${lineCount} lines omitted]`,
+    };
+  }
+  return next;
+}
+```
+
+三個要注意的細節：
+
+**我們永遠不會就地修改 `history`。** 遮罩器回傳的是一個*新*陣列。理由：如果我們送一份遮罩過的視圖給 API，但在記憶體裡保留完整歷史，之後就還能把它「反遮罩」回來（例如當使用者想看代理人到底讀過什麼）。第 06 集會用到這一點。目前我們兩份都保留。
+
+**我們從最新往最舊迭代。** 最後 N 筆 tool_result 是模型很可能還需要用到的。更舊的可以放心遮罩，不會影響當下的推理。
+
+**我們保留 `tool_use_id`。** tool_result 區塊仍舊指向它對應的 tool_use。如果我們動了那個 id，API 會直接拒絕。只有 `content` 會被換掉。
+
+## 預算會計員
+
+我們需要一種方式來判斷歷史是否已經值得遮罩。一個粗糙但有效的近似值就是字元數：
+
+```typescript
+function approxTokens(history: Msg[]): number {
+  let chars = 0;
+  for (const m of history) {
+    if (typeof m.content === "string") { chars += m.content.length; continue; }
+    for (const b of m.content) {
+      if (b.type === "text") chars += b.text.length;
+      else if (b.type === "tool_use") chars += JSON.stringify(b.input).length + b.name.length + 20;
+      else if (b.type === "tool_result") {
+        chars += typeof b.content === "string"
+          ? b.content.length
+          : (b.content ?? []).reduce((s, c) => s + (c.type === "text" ? c.text.length : 0), 0);
+      }
+    }
+  }
+  return Math.ceil(chars / 4); // ~4 chars per token
+}
+```
+
+粗略、樂觀、誤差在 10–20% 上下。但這樣就夠了——我們只需要它幫我們決定*何時*要遮罩，不是拿來對帳的。
+
+## 把遮罩接進回合迴圈
+
+修改 `agent.ts` 裡的 `turn`：
+
+```typescript
+const MASK_THRESHOLD_TOKENS = 8_000;
+
+async function turn(userText: string) {
+  history.push({ role: "user", content: userText });
+
+  while (true) {
+    // Build the view we send to the API — mask when big.
+    const est = approxTokens(history);
+    const view = est > MASK_THRESHOLD_TOKENS ? maskOldObservations(history) : history;
+
+    const response = await autoContinue(view);
+
+    // Note: we push to the *full* history, not the masked view.
+    history.push({ role: "assistant", content: response.content });
+    for (const b of response.content) if (b.type === "text") process.stdout.write(b.text);
+    process.stdout.write("\n");
+
+    if (response.stop_reason !== "tool_use") return;
+
+    const toolResults = [];
+    for (const b of response.content) if (b.type === "tool_use") {
+      console.log(`[tool] ${b.name}(${JSON.stringify(b.input)})`);
+      const out = await runTool(b.name, b.input as Record<string, unknown>);
+      toolResults.push({ type: "tool_result" as const, tool_use_id: b.id, content: out });
+    }
+    history.push({ role: "user", content: toolResults });
+  }
+}
+```
+
+關鍵的差別是：*送出去的內容*跟*儲存下來的內容*不一樣。整件事的重點就在這個切分。
+
+## 自動續寫：不再讓計畫在半路被截斷
+
+`autoContinue` 這個包裝會偵測 `stop_reason === "max_tokens"`，並發出一個接續的「continue」回合：
+
+```typescript
+async function autoContinue(view: Msg[]): Promise<Anthropic.Message> {
+  const messages = [...view];
+  let assembled: Anthropic.ContentBlockParam[] = [];
+
+  for (let attempt = 0; attempt < 3; attempt++) {
+    const r = await client.messages.create({
+      model: MODEL,
+      max_tokens: 2048,
+      system: SYSTEM,
+      tools: TOOLS,
+      messages,
+    });
+
+    assembled = assembled.concat(r.content);
+
+    if (r.stop_reason !== "max_tokens") {
+      return { ...r, content: assembled as Anthropic.ContentBlock[] };
+    }
+
+    // Truncation — push what we have, then ask to continue.
+    console.warn(`[warn] max_tokens hit on attempt ${attempt + 1}, continuing`);
+    messages.push({ role: "assistant", content: r.content });
+    messages.push({ role: "user", content: "Continue where you left off. Do not repeat what you already said." });
+  }
+
+  // Fall through: return whatever we have with a synthetic end_turn.
+  return { content: assembled, stop_reason: "end_turn" } as Anthropic.Message;
+}
+```
+
+幾點註記：
+
+- 上限設 3 次。如果模型連在三段 2048-token 的爆發裡都寫不完，代表結構上有東西壞了；與其一直空轉，不如乾脆跳出來。
+- 接續給模型的使用者訊息裡明確要求它不要重複。少了這一句，模型常常會先把上一段話重講一次再繼續，這既浪費 token，又會讓歷史變得混亂。
+- 我們是把多次嘗試的*內容區塊*組起來。最後回傳的訊息帶著一個合成的 `end_turn`——呼叫端根本不需要知道中間發生過續寫。這是抽象層刻意撒的一個小謊；記得把它記錄下來。
+
+## `/stats` REPL 指令
+
+主迴圈裡加一小段：
+
+```typescript
+if (line === "/stats") {
+  const est = approxTokens(history);
+  const masked = maskOldObservations(history);
+  const maskedEst = approxTokens(masked);
+  console.log(`turns: ${history.length}   raw: ~${est} tok   masked: ~${maskedEst} tok`);
+  continue;
+}
+if (line === "/history") {
+  console.log(JSON.stringify(history, null, 2).slice(0, 2000));
+  continue;
+}
+```
+
+接下來在工作階段裡，你就可以看到差別：
+
+```
+you › /stats
+turns: 34   raw: ~11800 tok   masked: ~2400 tok
+```
+
+這是我自己測試時跑出來的真實數字：一個 11.8K 的工作階段，遮罩掉最後四筆以外的觀察值之後，被壓到 2.4K。模型後續還是能回答關於較早前那些檔案的追問——因為對那些檔案的*推理*（助理端的文字）都被保留了下來，只是原始內容被丟掉。
+
+## 我寫這一集時踩過的坑
+
+**「系統提醒」的誘惑。** 我第一版每回合都會在系統訊息前面加一句：*「注意：較舊的工具觀察值已被遮罩。如果你需要再看那個檔案，請重新讀取。」* 然後我跑了評測，結果變差了。模型把 token 浪費在回應這則提醒上。更好的做法：相信佔位符本身就會自我說明。`[observation masked — 47 lines omitted]` 已經把模型需要知道的都告訴它了。
+
+**遮罩方向反了。** 之前有一個版本我留下的是*最舊*的觀察值，卻把最新的遮掉。完全無法除錯。規則就是：新的活下來，舊的死掉。
+
+**快取失效。** 如果你有用 prompt caching（在第 06 集會建議這麼做），遮罩會改變前綴、把快取整個打爆。兩個緩解方式：（a）只在你反正也會發生快取未命中的時候才遮罩（歷史很大時），（b）把遮罩的分界點放在一個穩定的邊界上——例如永遠遮罩掉第 N-4 回合以前的所有內容，這樣遮罩邊界本身會以固定的區塊往前推進。
+
+**`.bak` 檔案被重讀。** 第 03 集我們在被編輯的檔案旁邊寫了 `.bak`。如果代理人之後執行 `list_dir`、或是把 `find` 透過 `run_bash` 串接起來，那些 `.bak` 檔案就會以雜訊的形式冒出來。解法先延到第 06 集：工作區層級的忽略清單。
+
+## 下一集要修的東西
+
+工作階段變長之後，有兩件事變得越來越明顯：
+
+**大任務想要自己的上下文。** 「重構整個目錄」這種任務會不斷地把我們推過遮罩門檻。我們真正想要的是一個*子代理人*——一個乾淨的上下文視窗，帶著範圍明確的任務簡報，最後回報一段五行的摘要。這是第 05 集。
+
+**觀察值上限仍然是以回合為單位。** 如果模型在一個回合裡發出三個大型工具呼叫，我們馬上就會超出預算。第 05 集也會引入一個模式：主代理人把大型讀取*派發*給子代理人，讓後者只回傳答案，而不是原始資料。
+
+## 快速參考——第 04 集
+
+| 內容 | 位置 |
+|---|---|
+| 遮罩函式 | `maskOldObservations(history, keep=4)` |
+| 佔位符 | `[observation masked — N lines omitted]` |
+| 觸發條件 | `approxTokens(history) > 8000` |
+| 被遮罩的內容 | 只有舊的 `tool_result` 區塊 |
+| 被保留的內容 | 所有助理文字/tool_use 區塊、所有使用者訊息、最後 4 筆 tool_result |
+| 自動續寫觸發條件 | `stop_reason === "max_tokens"` |
+| 自動續寫上限 | 3 次 |
+| 除錯指令 | `/stats`、`/history` |
+
+**最小可行遮罩：**
+
+```typescript
+const view = approxTokens(history) > 8000 ? maskOldObservations(history, 4) : history;
+const r = await autoContinue(view);
+history.push({ role: "assistant", content: r.content }); // store the FULL, not the masked view
+```
+
+**撐到第 05 集要記住的五條規則：**
+1. 存完整歷史；送出去的是遮罩過的視圖。
+2. 絕對不要動 tool_result 的 `tool_use_id`。
+3. 永遠保留最後 N 筆 tool_result 的原文；絕對不要少於 3 筆。
+4. 遇到 `max_tokens` 時，請模型繼續寫，*而且不要重複*。
+5. 不要為遮罩加系統提醒——佔位符本身就夠了。
+
+下一集是第 05 集——我們會把一個乾淨的上下文視窗交給一個新的代理人，讓這兩個代理人互相對話。

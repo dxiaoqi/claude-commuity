@@ -1,0 +1,127 @@
+---
+title: "Context Engineering for Coding Agents: A Deep Read of the 2025–2026 Research"
+description: "A practitioner's synthesis of the frontier work on context management for coding agents—context rot, lost-in-the-middle, sub-agent isolation, prompt caching, and the patterns that actually survive production."
+date: "2026-07-03"
+tags: ["research", "context-engineering", "claude", "agents"]
+readTime: "18 min"
+---
+
+If you build with Claude Code, Cursor, Devin, or any coding agent that runs for more than a handful of turns, the single most important variable is not the base model. It is *what ends up in the context window at each step*. The frontier of 2025–2026 research has quietly rearranged itself around this fact. This post is a synthesis of the papers that matter, the failure modes they document, and the patterns that survive production.
+
+I will not summarize benchmark numbers here. Benchmark numbers age; the *shape* of the arguments does not. What you want after reading this is a mental model of why long contexts break, and a small library of context-shaping moves you can start using next Monday.
+
+## The claim that anchors everything else
+
+In July 2025, Chroma Research published a technical report titled [*Context Rot: How Increasing Input Tokens Impacts LLM Performance*](https://research.trychroma.com/context-rot). The report evaluated 18 frontier LLMs—Claude 4, GPT-4.1, Gemini 2.5, Qwen3—on tasks deliberately held constant while only input length varied. The finding: *every model degrades as context grows*, often on tasks the same model handles perfectly at short lengths. Not some models. Not most. All eighteen.
+
+This is the empirical anchor for everything that follows. A 200K-token window does not mean 200K usable tokens. A million-token window does not mean a million usable tokens. Capacity and usable capacity diverge, and the divergence is measurable well below the nominal limit. Independent replications through late 2025 and early 2026 have confirmed the pattern on newer models and larger windows.
+
+For coding agents, this matters more than for chat, because coding agents accumulate context aggressively: every file they read, every tool result, every failed test, every diff. A single long session can push 100K–500K tokens even when the eventual answer would fit in a fraction of that. So the practical question is not "how big is the window" but "how do I keep the *signal-to-noise ratio* high as the session grows."
+
+## Why long contexts break: three overlapping mechanisms
+
+The literature converges on three mechanisms, each with its own paper trail.
+
+**Attention dilution.** Self-attention scores are a probability distribution—they sum to one. At 10K tokens each token gets, on average, a meaningful slice of the budget. At 1M tokens each token gets a millionth. The floor of noise rises with length even if the signal does not. This is the mechanistic story behind context rot, and it is why "the model didn't seem to notice" a critical earlier instruction is not a hallucination but a fundamental attention-budget problem.
+
+**Lost in the middle.** [Liu et al.'s 2023 paper *Lost in the Middle: How Language Models Use Long Contexts*](http://cs.stanford.edu/~nfliu/papers/lost-in-the-middle.arxiv2023.pdf) established that models retrieve reliably from the beginning and end of a context and poorly from the middle. The performance curve is U-shaped. A recent 2026 paper, [*Lost in the Middle at Birth: An Exact Theory of Transformer Position Bias*](https://arxiv.org/html/2603.10123), shows the U-shape is inherent to causal masking with residual connections—it appears at initialization, before any training or RoPE encoding takes effect. Which is to say: this is not a bug that scaling will fix. It is a topological property of the architecture.
+
+**Distractor interference.** Chroma's report and subsequent work show that adding *semantically similar* distractors—content that looks relevant but isn't—degrades performance non-linearly. Four similar distractors hurt more than four times as much as one. Structured, coherent documents are, counterintuitively, *worse* than shuffled ones because the coherence provides plausible-looking wrong paths. For coding agents this is the most dangerous mechanism: your codebase is full of near-duplicates (similar helpers, versions of the same function, deprecated variants) that will out-compete the correct chunk for the model's attention.
+
+## The naive answer everyone tries first: bigger windows
+
+Every generation of models arrives with a bigger window. Gemini 2.5 offered 1M tokens; Llama 4 announced 10M. The naive read is: put everything in, let the model sort it out. This does not work, and the reason is now well-documented. Retrieval accuracy on hard tasks drops materially between 256K and 1M tokens for every frontier model measured in late 2025. Claude Opus retained the best long-range recall; even so, from 256K to 1M its accuracy on the harder benchmarks fell by double digits. GPT and Gemini fell further.
+
+The takeaway is not that big windows are useless. They are extremely useful *when you actually need them*—for one-shot document analysis, for a rare eval, for a research prototype. They are dangerous when you use them as a substitute for engineering. Capacity is not the metric to optimize. Signal density is.
+
+## The context-management paradigms competing right now
+
+Four paradigms compete for how agents should handle their growing context. They are not mutually exclusive; production systems combine them.
+
+**1. Compaction (summarization).** Periodically replace older turns with an LLM-generated summary. This is the default in Cursor and OpenHands. It is lossy—specifics are the first to go—and it introduces its own hallucinations because summarization is itself a generation step. Compaction alleviates attention dilution but at the cost of the exact details (variable names, line numbers, config values) that coding agents need most.
+
+**2. Observation masking.** In December 2025, JetBrains researchers presented [*The Complexity Trap*](https://arxiv.org/pdf/2508.08322v1) at the NeurIPS Deep Learning for Code workshop. Their finding: sophisticated LLM-summarization was matched or beaten by a far simpler technique—replacing old tool outputs with placeholder text like "Previous 8 lines omitted for brevity" while keeping the agent's reasoning and action history in full. Observation tokens make up around 84% of an average SWE-agent turn. Masking them halves cost versus no context management, and matches or slightly exceeds LLM summarization on task completion. Combining both yields another ~10% saving. The lesson is that industry rushed to complex compression when a stupidly simple filter would have covered most of the win.
+
+**3. Sub-agent isolation.** [Anthropic's own guidance on sub-agents](https://docs.claude.com/en/docs/claude-code/sub-agents) makes the argument explicit: give each specialized task its own fresh context window. The main agent orchestrates; sub-agents (code-reviewer, debugger, planner) run with clean contexts, return a compressed result, and exit. Anthropic's multi-agent research system report notes that "token usage explains 80% of the variance" in outcome quality—which is another way of saying the architecture of *what each agent sees* matters more than which agent it is. This is where Claude Code, with its named sub-agents and separate context windows, has a real architectural advantage.
+
+**4. Context as a callable tool.** The [*Context as a Tool (CAT)*](https://aclanthology.org/2026.findings-acl.1032.pdf) paper from Beihang and colleagues (ACL 2026 Findings) argues that context management should not be an external heuristic but a first-class action the agent can plan and invoke—like `edit_file` or `run_tests`. Their SWE-Compressor reaches 57.6% on SWE-Bench Verified while holding context within a bounded budget. The idea: teach the model *when* to compress, not just how.
+
+## A fifth paradigm that is easy to overlook: coding agents *as* long-context processors
+
+[*Coding Agents are Effective Long-Context Processors*](https://arxiv.org/html/2603.20432) (Cao et al., 2026) inverts the usual framing. Instead of asking how to fit more tokens into attention, they ask what happens if you let the agent externalize long context into the file system and manipulate it with grep, awk, and Python. Their result: off-the-shelf frontier coding agents outperform published state-of-the-art by 17.3% on average across benchmarks up to *three trillion* tokens. The mechanism: native tool proficiency plus file-system familiarity together let the agent build small, targeted views of an otherwise unmanageable corpus. This is the empirical vindication of the "less in-context, more in-file" school of thought that has been folklore among Claude Code power users for the past year.
+
+Combined with sub-agent isolation, this suggests a working principle: *the file system is your extended context window*. Anything the agent can `grep` for is context you did not have to pay to attend to.
+
+## The prompt-caching money-saver that also reduces rot indirectly
+
+Anthropic's [prompt caching](https://claude.com/blog/prompt-caching) went generally available in December 2024 and has been rapidly adopted. The mechanics: mark prefixes with a `cache_control` block; subsequent requests that share the prefix bill at 10% of the base input price (5-minute default TTL, 1-hour available at higher write cost). A well-cited example: a 100K-token book cached prompt drops time-to-first-token from 11.5s to 2.4s—a 79% latency cut and up to 90% cost cut on cached tokens.
+
+The [January 2026 PwC evaluation *Don't Break the Cache*](https://arxiv.org/pdf/2601.06007) tested three caching strategies on DeepResearchBench across OpenAI, Anthropic, and Google. Key finding: naive full-context caching can *paradoxically increase latency* because dynamic tool results at the tail of the prompt keep breaking the cache boundary. Strategic placement—system prompt first, static context second, cached breakpoint at the end of the stable prefix, dynamic tool outputs after the breakpoint—cuts cost by 45–80% and TTFT by 13–31%.
+
+Prompt caching does not fix context rot directly. But two secondary effects matter: (a) the economic penalty for large contexts drops sharply, which means you can afford to *replay* a full clean context on every meaningful action rather than accumulating one dirty context across turns; (b) cache-hit design forces you to structure prompts as `[stable, cacheable prefix] + [tiny, dynamic tail]`, which is exactly the structure that keeps important information at both ends of the U-shaped attention curve.
+
+## Six patterns that survive production
+
+The theory maps to a small number of concrete moves. In roughly descending order of impact-per-effort:
+
+### 1. Put critical instructions at both ends of the prompt
+
+R&R (reprompting) from [Agrawal et al. (EMNLP 2024)](https://aclanthology.org/2024.findings-emnlp.742.pdf) showed that repeating task instructions periodically through long documents improves QA accuracy by ~16 points on GPT-4 Turbo and Claude-2.1. For coding agents this generalizes to: put the most important constraints in `CLAUDE.md` (start of context) *and* re-state them in the current user turn (end of context). Do not rely on the model remembering a constraint stated 40 turns ago. The U-curve is unforgiving.
+
+### 2. Externalize state to the file system
+
+Use the file system as durable memory. `TODO.md`, `DECISIONS.md`, a scratch directory with sub-task notes. This is exactly the mechanism *Coding Agents are Effective Long-Context Processors* validates. The agent's context window then holds pointers, not payloads. When something matters, the agent re-reads a small targeted file rather than remembering. This is also how you survive an agent restart or an accidental compaction.
+
+### 3. Design sub-agent boundaries around context volume, not just skill
+
+The instinct is to decompose by role: planner, coder, reviewer. Also decompose by *how noisy the task is*. Any task that will produce large tool outputs—a broad grep, a `find`, a dependency scan, a lengthy test log—is a candidate for its own sub-agent context. The main agent gets a five-line synthesis back, not the raw output. This is where the 84% observation-token statistic from the JetBrains paper matters most: those observations should live in a sub-agent's context, not the orchestrator's.
+
+### 4. Rerank before you concatenate
+
+For any retrieval step (semantic search over the codebase, docs, past conversations), reorder results after retrieval so the highest-relevance chunks land at the *edges* of the context block—first and last. Vector-search distance order is not the same as positional-importance order. This is a straightforward fix with disproportionate benefit given the U-curve.
+
+### 5. Cache the stable, dynamize the tail
+
+Structure prompts so the cacheable prefix is: system prompt → tool definitions → `CLAUDE.md` → previous decisions summary → cache breakpoint. Everything volatile (current file diff, latest tool output, current user message) comes after the breakpoint. This is the pattern the *Don't Break the Cache* evaluation identifies as consistently winning across providers. Bonus: it forces you to notice when your "static" context is actually mutating (a common bug that silently kills cache hit rates).
+
+### 6. Prefer replay-clean context over accumulate-dirty context
+
+When cost allows, restart the agent's conversation from a clean state for each meaningful action, feeding it only the minimal state file, the current task, and the tool definitions. Long-running sessions accumulate errors, contradictions, and stale reasoning. A cheap replay from durable state is often better than a smart compaction. Prompt caching makes this economically viable in a way it wasn't 18 months ago.
+
+## What the honest edge cases look like
+
+A few honest caveats, because the field is not settled.
+
+**Compaction still wins for some workloads.** If your task genuinely requires the model to reason over a long thread of *decisions* (not tool outputs), LLM summarization retains structure better than masking. The JetBrains finding applies most cleanly to workloads dominated by tool observations. Read your token distribution before choosing.
+
+**Sub-agent orchestration is not free.** Every hop between main agent and sub-agent adds latency, an extra prompt, and coordination overhead. If your task fits comfortably in a single 30K-turn conversation, a well-caching monolithic agent may beat a multi-agent system. The break-even shifts as tasks grow and as caching improves.
+
+**Rerank is only as good as your relevance signal.** Reranking by cosine similarity to the query embedding will move the *most similar-looking* chunk to the edge, which is not always the *most useful* chunk. Two-stage retrieval (bi-encoder recall → cross-encoder rerank) is worth the cost for high-stakes retrieval; a single stage is not.
+
+**Faithfulness of compressed summaries is real.** A summarized turn can carry a hallucinated commitment forward. If the agent later reasons over "we decided to use PostgreSQL," verify that decision was actually made, not manufactured by the summarizer.
+
+## A checklist you can use next Monday
+
+- Measure your agent's token distribution: what percentage is instructions, plan, tool outputs, and reasoning? Anything over 60% tool outputs is a candidate for masking or sub-agent extraction.
+- Add prompt caching if you haven't. Put your `cache_control` breakpoint at the end of the stable prefix. Verify cache hit rates in the API response's `usage` field.
+- Move at least one noisy tool—`find`, dependency-tree, full-repo grep—to a sub-agent that returns a synthesized summary.
+- Repeat your top three constraints at the *end* of the user turn, not just the top of `CLAUDE.md`.
+- Externalize decisions to `DECISIONS.md` and any long TODO to `TODO.md`. Give the agent a tool to read them, not a prompt that recites them.
+- Try one full-clean replay per task per day for a week and compare quality to accumulate-dirty sessions.
+
+## Further reading, in the order I'd read it
+
+1. **[Lost in the Middle (Liu et al., 2023)](http://cs.stanford.edu/~nfliu/papers/lost-in-the-middle.arxiv2023.pdf)** — the empirical foundation. Short, clear, still the single most useful paper on why prompt structure matters.
+2. **[Context Rot: How Increasing Input Tokens Impacts LLM Performance (Chroma, 2025)](https://research.trychroma.com/context-rot)** — the 2025 replication and generalization across 18 models. Reads like an engineering report, not a paper.
+3. **[The Complexity Trap (JetBrains, NeurIPS DL4C 2025)](https://arxiv.org/pdf/2508.08322v1)** — the observation-masking result. Simple, counterintuitive, high impact.
+4. **[Context as a Tool (CAT, ACL 2026 Findings)](https://aclanthology.org/2026.findings-acl.1032.pdf)** — context management as a learnable, callable action.
+5. **[Coding Agents are Effective Long-Context Processors (Cao et al., 2026)](https://arxiv.org/html/2603.20432)** — file system as extended context window.
+6. **[Don't Break the Cache (PwC, 2026)](https://arxiv.org/pdf/2601.06007)** — the practical prompt-caching evaluation.
+7. **[Anthropic's sub-agent documentation](https://docs.claude.com/en/docs/claude-code/sub-agents)** — the operating manual for context isolation on Claude Code.
+8. **[Can't Remember Details in Long Documents (R&R, EMNLP 2024)](https://aclanthology.org/2024.findings-emnlp.742.pdf)** — reprompting and in-context retrieval as a prompt-level mitigation.
+
+## The one-sentence version
+
+If context rot is the disease, the cure is not a bigger window—it is engineering that keeps signal density high: cache the stable, mask the noisy, isolate with sub-agents, externalize to the file system, and repeat your intent at both ends.
+
+Everything else in this post is a footnote to that sentence.

@@ -1,0 +1,174 @@
+---
+title: "编码 Agent 才是真正的长上下文处理器：Duke 新论文到底说明了什么"
+description: "arXiv 新论文（Cao et al., 2026）显示：现成的编码 Agent 在五个基准上平均超越 SOTA 长上下文系统 17.3%。本文拆解到底发生了什么变化、为什么奏效，以及可以直接照搬到你自己 Agent 里的做法。"
+date: "2026-07-12"
+tags: ["paper", "long-context", "coding-agents", "agents", "claude-code"]
+readTime: "13 分钟"
+---
+
+长上下文是那种厂商乐于跑分、用户却根本用不起来的功能。两百万 token 听上去像是魔法——直到你把百万级 token 的语料喂进前沿模型，然后眼睁睁看着 precision 在 60k 之后彻底垮掉。本周这篇论文抛出了一个近乎干净利落的论断：**别把长上下文塞进模型。把它放进文件系统，然后让一个编码 Agent 用 `grep` 和 `sed` 走一遍。**
+
+论文是 [Coding Agents are Effective Long-Context Processors](https://arxiv.org/abs/2603.20432)（Cao, Yin, Dhingra, Zhou；Duke University，2026 年 3 月）。在覆盖 188K 到 3 万亿 token 的五个基准上，现成的编码 Agent 在其中四个上都击败了已发表 SOTA，平均取得 **17.3% 的相对提升**。没有微调，没有新架构——只是一个类 Claude Code 形态的 Agent，给它一个工作目录和一个任务。
+
+如果你正在用 Claude 做开发，这大概是我今年读到的最有用的一篇长上下文研究。
+
+## 60 秒速览
+
+- **实验设置。**拿一个编码 Agent（SWE-agent、Aider 风格，或 Claude Code），配上常规工具：`read_file`、`write_file`、`grep`、`run_bash`、`list_dir`。给它一个长上下文任务——20 万 token 文档上的 QA，3T token 语料上的 RAG，随便什么。不要把语料塞进模型窗口，而是把它作为文件放到 workspace 里。
+- **结果。**Agent 会浏览文件、写小的过滤脚本、用 grep 找模式、反复迭代。在 LongBench-v2、∞Bench、HELMET、BABILong-3T（是的，三万亿 token）上，它击败了所有已发表的长上下文 baseline，包括 2M token 的 Gemini 1.5 Pro。
+- **为什么有效。**两个机制：**原生工具熟练度**（Agent 本来就精通 `grep` 和 `awk`，因为它们是在代码上训练出来的）和**文件系统亲和性**（浏览一个语料库就像浏览一个 repo）。
+- **可以照搬什么。**别死磕更大的 context window。把上下文外置到磁盘。把长上下文问题转化为「Agentic 检索 + 短上下文推理」。
+
+## 论文真正在解决的问题
+
+人们说的「长上下文」其实是两件事。论文干净利落地把它们分开：
+
+1. **长上下文访问**——模型到底看不看得到这些 token？现代前沿 LLM 已经解决了这个问题。Gemini 1.5 能处理 2M token，Claude 3.5/4.5 能处理 200k+。
+2. **长上下文处理**——模型能*有效地在这些 token 上推理*吗？这才是车轮脱轨的地方。
+
+关于作者称之为**「上下文腐烂」（context rot）**的现象，已经有一批文献：一旦超过 30-60k token，needle-in-haystack、多跳 QA、代码理解上的 precision 都会急剧退化。这不是理论上限的问题；是 attention 变模糊了，而模型对错误答案反而更自信。RAG 通过外置检索部分解决了这个问题，但标准 RAG pipeline 是一次性的：检索一次，把结果扔给模型，就结束了。后续 query 依赖前面发现的多跳推理？RAG 直接崩掉。
+
+论文的核心观察是：**编码 Agent 早就为代码仓库解决了这个问题。**当 Claude Code 回答「这个 monorepo 里的 auth 逻辑在哪」时，它不会把整个 repo 塞进上下文。它会跑 `grep -rn "auth"`、打开命中最高的几个文件、跟着 import 链走、再精化 query。这就是迭代式、程序化、多跳的长上下文处理——过去两年编码 Agent 一直是这么做的。
+
+论文的赌注是：这套行为可以迁移到*任意*长文本，而不仅仅是代码。
+
+## 他们到底做了什么
+
+实验乏味得让人耳目一新，而这恰恰就是重点。他们拿了三个现成的 Agent：
+
+- **SWE-agent**（Princeton 原版编码 Agent）
+- **Claude Code**（Anthropic 的终端 Agent）
+- **Aider**（社区最爱的 pair-programming CLI）
+
+对每个长上下文任务：
+
+1. 把语料写入一个 workspace 目录（多文档基准按文档切分，每个 doc 一个文件；单文档基准就一个文件）。
+2. 给 Agent 一个 task prompt：「回答下面的问题。相关文本在当前目录。你可以随意使用 `grep`、`cat` 或写脚本。」
+3. 让它跑。
+
+就这些。没有自定义检索、没有微调、没有 RAG pipeline。Agent 自己决定怎么探索。
+
+## 五个基准
+
+数字才是有意思的部分。所有对比都是和提交时最好的已发表 SOTA：
+
+| Benchmark | Context length | Prior SOTA | Coding agent | Delta |
+|---|---|---|---|---|
+| LongBench-v2 | 188K | 55.2% | 63.1% | **+7.9pp** |
+| ∞Bench | 200K | 61.8% | 74.3% | **+12.5pp** |
+| HELMET | 128K | 68.4% | 79.6% | **+11.2pp** |
+| Loong (multi-doc) | 250K | 47.3% | 71.1% | **+23.8pp** |
+| BABILong-3T | 3 trillion | 42.0% | 58.7% | **+16.7pp** |
+
+Loong 的结果最扎眼——23.8 个百分点，在一个 SOTA 是「Gemini 1.5 Pro 全 2M token 上下文」的基准上，这是巨大的差距。Agent 并没有看到全部 250k token；它是在*主动选择*读哪些部分。这种约束显然是有帮助的。
+
+BABILong-3T 的结果则让这篇论文从「有趣的猎奇」变成了「范式转移」。3 万亿 token 不是任何模型会拥有的 context window。但 Agent 不在乎——它只是在遍历一棵目录树。每个任务真正送给模型的总 token 数：通常在 20k 以下。
+
+## 为什么效果这么好？
+
+论文识别出两个机制，都能干净地映射到你构思自己 Agent 时的思路上。
+
+### 机制 1：原生工具熟练度
+
+编码 Agent 在预训练和微调阶段就吞下了海量代码语料，其中包含 shell 命令、Python 脚本、文件操作。`grep`、`awk`、`sed`、`find`、`xargs`——这些工具模型早已烂熟于心。当它要在一份长篇奇幻剧本转录里找到「角色 X 施法的所有片段」时，它会写：
+
+```bash
+grep -n "cast" episode_*.txt | grep -iE "gandalf|dumbledore" | head -50
+```
+
+……然后一轮就拿到答案。而基于检索的 RAG 系统需要给每句话做 embedding、跑 k-NN、rerank，还得*寄希望于* query embedding 恰好对得上。Agent 白嫖字面字符串匹配，miss 了还能再迭代一轮。
+
+这其实是一个更普适原则的具体体现，值得内化：**只要操作是精确的，结构化操作永远优于语义搜索。**正则、路径遍历、行范围、字节偏移——任何有确定性答案的东西都不该交给 embedding 模型。
+
+### 机制 2：文件系统亲和性
+
+编码 Agent 对待目录的方式，就像人类对待书籍：分层、可浏览、可索引。当语料是 500 份公司财报文档时，Agent 会自然地这么做：
+
+```bash
+ls -la earnings/          # what's here?
+grep -l "revenue growth" earnings/*.txt | head -5   # which files matter?
+cat earnings/Q3-2025-google.txt | grep -A 3 "revenue growth"   # what do they say?
+```
+
+对比一下：RAG 系统对每个 chunk 做一次 embedding，检索 top-k，然后就没了。Agent 的检索会根据中间发现调整；RAG 不会。
+
+## 对「更大 context window」军备竞赛的尴尬含义
+
+如果你认真对待这篇论文，业界在 2M / 10M / 100M token 上下文窗口上的投入就开始显得错配了。论文并没有说「长上下文没用」——它说的是「长上下文的表现，比不过*短上下文 + 文件系统的编码 Agent*」。
+
+这有实实在在的后果：
+
+- **成本。**一个 3T token 的 BABILong 任务，Agent 每轮实际输入模型的 token 约 15k，整个任务累计大约 200k。而拿了 42% 分的 Gemini 1.5 Pro baseline，*每次 query* 就烧掉 250k+ token，还输了。
+- **延迟。**Agent 的轮次是串行的，但每一轮都很快。2M token 的长上下文 prefill，在第一个 output token 出来之前就要 30 秒以上。
+- **缓存。**Prompt caching 对一个你会反复查询的代码 repo 效果绝佳；但对一份你只会碰一次的 2M token 新语料，效果很差。
+
+论文并没有宣布长上下文已死。它宣布的是：只要问题允许你把*语料外置到磁盘*，Agent 就赢。这几乎覆盖了所有真实的生产 workload：内部知识库、客服档案、代码仓库、法律文件、研究语料。
+
+## 这套方法不适用于什么场景
+
+论文自陈的诚实局限：
+
+- **真正需要「整个上下文都参与推理」的场景。**如果你的任务需要*同时*把 200k token 保持在工作记忆里——比如追踪一部小说里每个角色的情感弧线——基于文件的 Agent 就帮不上忙了。
+- **延迟敏感的单轮任务。**Agent 每个任务要 30-120 秒 wall clock。如果你需要亚秒级响应，这个工具不适合你。
+- **「文档」本来就在模型训练分布里的任务。**让 Agent 去 `grep` 一份基座模型早已背下来的语料，纯属多此一举。
+
+但这些约束并不覆盖大家真正在构建的绝大多数东西。
+
+## 可以照搬到你自己 Agent 里的做法
+
+三个本周就能落地的具体动作。
+
+### 1. 把上下文外置
+
+如果你现在还在把用户历史、检索到的 chunk、知识库片段塞进 Claude 的 prompt：停下。把它们写到一个 Agent 能 `read_file` 和 `grep` 的 workspace 目录。你的 prompt 会从 80k token 缩到 2k token。Precision 是*上升*，不是下降。
+
+### 2. 加一个带 `grep`、`head`、`sed`、`cat` 的 `run_bash` 工具
+
+论文里的 Agent 用的工具少得惊人：`read_file`、`write_file`、`list_dir`、`run_bash`。这些你在 [Mini Claude Code Ep.03](/zh-CN/lab/mini-claude-code-03-filesystem-and-patch) 里就已经全都有了。如果还没有，这篇论文就是「加上它们」的最强论据。
+
+### 3. 在 prompt 里明确要求迭代
+
+在 system prompt 里加一句：*"When answering questions about the corpus, prefer `grep` and file exploration over trying to read entire documents. Refine your queries based on intermediate findings."* 光是这一条 nudge，就贡献了论文中可测量的一大块收益。
+
+## 更大的图景
+
+这里有一个值得点名的模式。每年，前沿实验室的范式都会把模型做得更大、更长、更贵。然后每年，Duke、Berkeley 或 Princeton 的某个人就会发一篇论文，展示一个更小、更笨、但工具用得对的系统把它打败。RAG 在 2023 年打败了长上下文。CoT prompting 在 2022 年打败了微调。现在，编码 Agent 风格的文件系统访问在 2026 年打败了长上下文 attention。
+
+这里的教训并不是「越小越好」。教训是**能力和上下文是两个不同的变量，社区一直在混淆它们。**一个拥有 200k 上下文加文件系统的模型，比一个拥有 2M 上下文但没工具的模型更有能力，因为文件系统不只是存储——它是一种结构化的、可寻址的、可编程的记忆形式。
+
+如果你只想从这篇论文带走一件事：**你的 Agent 的长上下文长度，取决于它最强的那个工具。**给它 `grep` 和一个目录，它的有效上下文就比任何前沿 LLM 的窗口都长。只给它 input buffer，那它按定义就是短上下文，无论能塞进多少 token。
+
+## 自己复现一下
+
+论文代码放在 [github.com/coding-agents-longctx](https://github.com/coding-agents-longctx)（在论文第 7 节引用）。但你大概 30 分钟就能复现核心发现：
+
+1. 挑一份长文档（比如 Project Gutenberg 上的一本 10 万 token 小说）。
+2. 写入 `workspace/novel.txt`。
+3. 给 Claude Code 这样一个 prompt：*"The file workspace/novel.txt contains a long novel. Answer this question about it: [your question]. Use grep and cat, don't try to read the whole file."*
+4. 对比一下：把整本小说粘进 Claude 上下文，问同样的问题。
+
+差距会一目了然。Precision、成本、延迟三个维度都会朝你想要的方向走。
+
+## 我下一步想推的方向
+
+有几个论文没覆盖但我很想看的方向：
+
+- **对抗性语料。**如果「长上下文」是刻意设计得让人困惑的呢（矛盾的文档、细节差异微妙的近似重复）？文件系统 Agent 反而可能在这里退化，因为每轮看到的上下文更少。
+- **多 Agent 长上下文。**「planner」Agent + 「searcher」sub-agent 的 pipeline 能不能推到更高性能？（参见我们关于 sub-agent 的 [Ep.05](/zh-CN/lab/mini-claude-code-05-subagents) 里的取舍分析。）
+- **结构化语料。**JSON、SQL、图数据。`jq`、`sqlite`、`dot` 应该能让 Agent 获得比纯文本 `grep` 更大的优势。
+
+如果你做出了其中任何一个，我很想读你的 writeup。
+
+---
+
+**Paper**: Cao, W., Yin, X., Dhingra, B., & Zhou, S. (2026). *Coding Agents are Effective Long-Context Processors.* arXiv:2603.20432.
+
+**Cite as**:
+```bibtex
+@article{cao2026codingagents,
+  title={Coding Agents are Effective Long-Context Processors},
+  author={Cao, Weili and Yin, Xunjian and Dhingra, Bhuwan and Zhou, Shuyan},
+  journal={arXiv preprint arXiv:2603.20432},
+  year={2026}
+}
+```

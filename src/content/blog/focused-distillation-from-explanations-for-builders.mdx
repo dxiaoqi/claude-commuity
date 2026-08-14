@@ -1,0 +1,99 @@
+---
+title: "Distilling Reasoning: What Focused Distillation from Explanations Means for Builders"
+description: "A practitioner's read of the FDE (Focused Distillation from Explanations) line of research—Distilling Step-by-Step, CoT distillation, and what it means when you're shipping with Claude."
+date: "2026-07-02"
+tags: ["research", "distillation", "claude", "reasoning"]
+readTime: "11 min"
+---
+
+Every few weeks a new paper argues that small models can be made to reason "like" large ones if you distill not just their outputs, but the *reasons* behind those outputs. The umbrella term for this line of work is **Focused Distillation from Explanations (FDE)**: instead of imitating a teacher's final answer, the student is trained on the teacher's *explanation trace* alongside the answer.
+
+If you're building with Claude—especially if you ever wondered whether you could replace expensive Claude calls with a cheaper local model—this is the research thread to follow. It's also the one most likely to be misread as "small models are catching up." The reality is more useful, and more grounded.
+
+## The core idea in one paragraph
+
+Standard knowledge distillation trains a small "student" model to mimic a large "teacher" model's outputs. FDE-style methods add a second training signal: the teacher's *rationale*—usually a chain of thought, a step-by-step derivation, or a natural-language explanation. The student is trained on **(input, rationale, answer)** triples rather than just **(input, answer)** pairs. The bet is that forcing the student to internalize the *why* transfers something more general than pattern matching—transferable inductive bias, if you like.
+
+The paper that made this concrete for a lot of people was Hsieh et al.'s *Distilling Step-by-Step*, which showed a 770M-parameter T5 could outperform a 540B-parameter PaLM on certain benchmarks, using less than 1% of the training data, by learning from rationales. That result is real and it's replicable, but it comes with fine print that most SEO-optimized "AI news" summaries omit.
+
+## What the research actually says (and doesn't)
+
+Let's separate the claims cleanly.
+
+**What FDE-style methods reliably do:**
+- Improve sample efficiency: the student needs fewer labeled examples because the rationale carries additional structure.
+- Improve out-of-distribution generalization on tasks where the rationale reveals a *procedure* (arithmetic, symbolic manipulation, structured reasoning).
+- Give you a cheaper inference model that behaves *legibly*—you can inspect the rationale and reject bad answers upstream.
+
+**What they don't do (despite headlines):**
+- Close the gap on *open-ended* reasoning where the space of good rationales is enormous (long-horizon planning, novel scientific reasoning).
+- Guarantee the rationale is *faithful*. The student may learn to produce plausible-sounding traces that don't actually cause the answer—a well-documented failure mode in explanation-based training.
+- Eliminate the teacher. You still need a big model at training time to produce the rationales in the first place.
+
+The last point matters commercially. FDE is not "you can replace Claude Opus with a 7B model." It's "you can *offload some Claude Opus workload* to a smaller model, provided you've paid Claude Opus to generate rationales during training." The economics work when you have a stable, high-volume, narrow task. They fall apart when your task distribution keeps shifting.
+
+## Four papers worth reading in order
+
+If you have three hours to spend on this literature, I'd read these in this order. I'll describe each with what to look for, not just what it claims.
+
+1. **Distilling Step-by-Step (Hsieh et al., 2023)** — the accessible entry point. Read it for the training recipe: rationale as an auxiliary target with a separate loss weight. Look at their ablation on rationale quality; it's the single most important finding, and it's underemphasized.
+
+2. **Symbolic Chain-of-Thought Distillation (Li et al., 2023)** — the same idea applied to smaller models on symbolic reasoning tasks (math word problems, logical deduction). Read it to understand why some domains transfer better than others. The signal: distillation works best where the rationale exposes a *program*, not a *vibe*.
+
+3. **Distilling Reasoning Capabilities into Smaller Language Models (Shridhar et al., 2023)** — an alternative view that decomposes reasoning into sub-questions before distilling. Read it as a critique of monolithic CoT: sometimes the right unit of transfer is not the whole chain but a subroutine.
+
+4. **On the Faithfulness of Distilled Rationales (various 2024–2025 papers)** — a series of critiques showing that students often produce rationales that *sound* right but don't actually determine their answers. Read this last, as the corrective. It's the strongest argument for why you should never trust a small model's explanation without independent verification.
+
+I've deliberately not summarized numerical results here. Benchmarks in this literature change fast, and citing a specific number will age poorly. What ages well is the *shape* of the argument, and the shape is: FDE improves sample efficiency and legibility, does not close capability gaps on open-ended tasks, and comes with faithfulness caveats.
+
+## What this means when you're shipping with Claude
+
+Here's where the research meets your workbench. Three practical takeaways.
+
+### 1. Rationale is a first-class artifact, not a debug print
+
+If you're using Claude for a task that has stable structure—classifying tickets, extracting fields from documents, routing user intents—**store the rationales**. Not just for auditing (though that's useful). Rationales become training data if you ever need to distill a cheaper model, and they become verification signal if you want to catch failures.
+
+A concrete pattern: for every Claude call in a high-volume workflow, log `(input, rationale, output, downstream_outcome)`. Six months in, you have the exact dataset FDE research assumes you already have.
+
+### 2. Distill only where the rationale is a program
+
+The Symbolic CoT paper's implicit lesson: distillation transfers best when the rationale looks like an executable procedure. Extraction? Yes. Classification with clear features? Yes. "Write a thoughtful reply to this customer complaint"? No—the rationale space is too open, and a small model will learn to pattern-match on tone without inheriting the judgment.
+
+The heuristic: if you can imagine writing the rationale as a pseudocode function, distillation will probably work. If the rationale is "consider tone, context, and brand voice, then decide," it probably won't.
+
+### 3. Trust rationales conditionally, never absolutely
+
+The faithfulness literature is a sobering read. A student model can produce a perfectly reasonable-looking chain of thought that has no causal relationship to its final answer. This isn't hypothetical—it's been shown by ablating rationale tokens and seeing outputs unchanged.
+
+The practical response: when you use a distilled model in production, don't display its rationale to end users as a justification. Use the rationale internally as a *filter*—reject outputs whose rationale is inconsistent with the input—but treat the rationale itself as untrusted evidence, not proof.
+
+## A workflow you can start next Monday
+
+If this literature is convincing to you and you want to actually do something with it:
+
+1. **Pick one narrow task** you currently pay Claude Opus (or Sonnet) to do at volume.
+2. **Instrument the Claude call** to also request a structured rationale. Log everything.
+3. **Wait a month.** Collect 5,000–20,000 examples with rationales. This is your seed dataset.
+4. **Try a small fine-tune** on Claude Haiku, GPT-4o mini, or an open weights model like Qwen 2.5 7B. Use rationale as auxiliary target if the framework supports it; otherwise concatenate rationale into the target sequence.
+5. **Measure on held-out data with independent verification.** Don't score the rationale, score the outcome.
+6. **Only then** consider whether the cost savings justify the operational complexity.
+
+The step most teams skip is #5. They score the distilled model on rationale similarity and conclude it "learned to reason." It didn't—it learned to produce reasoning-shaped text.
+
+## What I want from the next wave of papers
+
+Speaking as someone who cares about builders more than benchmarks, the FDE literature is missing three things:
+
+- **A serious study of long-horizon rationale distillation**—multi-step tool use, not single-turn math.
+- **A robustness story**: how do distilled reasoners fail when the input distribution shifts? All the current results are on stable benchmarks.
+- **An economics paper**: at what task volume does distillation pay back the teacher-time cost? This is the actual question every builder asks, and the literature politely ignores it.
+
+If you know of papers that address any of these, tell me. Meanwhile, keep logging your rationales. The dataset you build in 2026 is what makes distillation feasible for you in 2027.
+
+---
+
+**Related reading on Claude Community:**
+- [The CLAUDE.md that survives a real codebase](/blog/claude-code-claude-md-complete-guide)
+- [Claude Code hooks: complete setup guide](/blog/claude-code-hooks-complete-guide)
+- [Claude Code vs Cursor: an honest comparison](/blog/claude-code-vs-cursor-comparison)

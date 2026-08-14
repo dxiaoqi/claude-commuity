@@ -1,0 +1,341 @@
+---
+title: "Mini Claude Code · 第 03 集：改文件而不砸掉整个仓库"
+description: "第 3 集加入 apply_patch tool——多数自建 agent 都是死在这一步，悄无声息地毁掉你的代码。我们构建一个严格的 unified diff 应用器，配上 dry-run 预览、workspace 护栏，以及一道能扛住 Claude 犯浑的确认闸门。"
+date: "2026-07-04"
+tags: ["mini-claude-code", "series", "typescript", "agents"]
+readTime: "17 min"
+---
+
+上周我们的 agent 学会了读文件、列目录、跑 bash。它已经能对你的代码指手画脚了。今晚，它拿到了改代码的资格——但要小心翼翼地拿。
+
+如果说第 02 集是那种"轻松愉快"的一集，那第 03 集就是那种*吓人*的一集。90% 的自建 agent 就是在这里悄悄搞崩一个文件、覆盖掉一段不相干的函数，或者往一份 JSON 配置里塞了个多余的分号，然后你三次提交之后才发现。我们今晚只做一个 tool——`apply_patch`——但要在它身上加的护栏，比前面三个加起来还多。
+
+**今晚的铁律**：每一次写入都必须可回滚、可预览、可拒绝。
+
+## 今晚要做什么
+
+在 `agent.ts` 上继续扩展：
+
+1. 第四个 tool：`apply_patch`，只接受严格的 unified diff
+2. 一个校验器，在碰硬盘之前就拒掉畸形或有歧义的 diff
+3. 一次 dry-run 过程，展示每个 hunk 精确的 `before → after`
+4. 一道确认闸门（默认交互式，加 flag 才能自动放行）
+5. 一步备份，让每次写入都在文件旁边留下一个 `.bak`
+
+一个 tool 装这么多东西，看着挺多，但总共不到 150 行代码。每一行都值。
+
+## 为什么用 unified diff，而不是 `write_file`？
+
+最直觉的另一种做法是搞一个 `write_file(path, content)` tool：让 agent 生成整份新文件，我们直接覆盖。别这么干。三个原因：
+
+1. **成本。**对一个 500 行、只改 3 行的文件来说，`write_file` 要花掉你 500 行的输出 token。`apply_patch` 只花大约 15 行。
+2. **推理。**diff 强迫模型以"*改动*"的方式思考，而不是"*复述*"。复述这种模式的失败方式是无声漂移——模型"顺手"把不相干的行也重写了，你根本注意不到。
+3. **可审查。**diff 是人类可读的。500 行的一坨代码不是。等下面加上确认闸门时，操作员（也就是你）需要能在两秒内扫完这份改动。
+
+代价是：diff 很挑剔。行号必须对得上；context line 必须对得上；空白也得对。这也是为什么校验器是今晚代码里最大的那一块。
+
+## 我们接受的 diff 格式
+
+我们接受 *unified diff* 格式，就是 `git diff` 输出的那种：
+
+```
+--- a/src/lib/blog.ts
++++ b/src/lib/blog.ts
+@@ -46,3 +46,4 @@ export function getAllPosts(...) {
+   if (!fs.existsSync(CONTENT_DIR)) return [];
+   const files = fs.readdirSync(CONTENT_DIR).filter((f) => /\.mdx?$/.test(f));
++  const cache = new Map<string, PostMeta>();
+   const bySlug = new Map<string, { file: string; locale: Locale }[]>();
+```
+
+我们严格执行的规则：
+
+- 每个 patch 只能有一个文件（一对 `--- a/…` / `+++ b/…` 头）。
+- 每个 hunk 必须以 `@@ -oldStart,oldCount +newStart,newCount @@` 开头。
+- 除头之外的每一行，都必须以 ` `（context）、`-`（删除）或 `+`（新增）开头。
+- context line 和删除行必须与当前文件在给定行区间内逐字节匹配。
+- 不允许二进制文件、不允许改名、不允许改权限。第 03 集有意把面收得很窄。
+
+任何一条不过，我们就用一个具体的错误串把它打回去。模型读到错误，自己重试。这就是我们在第 02 集里搭好的那个循环模式。
+
+## 加上 tool 声明
+
+在 `agent.ts` 顶部，往 `TOOLS` 数组里追加：
+
+```typescript
+{
+  name: "apply_patch",
+  description:
+    "Apply a unified diff to a single file in the workspace. The diff must include --- a/PATH / +++ b/PATH headers and one or more @@ hunks. Context lines must match the current file exactly.",
+  input_schema: {
+    type: "object",
+    properties: {
+      diff: { type: "string", description: "A unified diff, exactly one file." },
+    },
+    required: ["diff"],
+  },
+},
+```
+
+*不要*加 `dry_run` 参数。这个 tool 内部总是先做一次 dry-run 并把预览反馈给模型；真正的写入发生在人类确认之后，由另一套机制把关。
+
+## 解析器与应用器
+
+新建一个 `patch.ts` 文件——把它拆出去可以让 `agent.ts` 保持清爽：
+
+```typescript
+import fs from "node:fs/promises";
+import path from "node:path";
+
+export interface Hunk {
+  oldStart: number;
+  oldCount: number;
+  newStart: number;
+  newCount: number;
+  lines: string[]; // includes leading " ", "-", "+"
+}
+
+export interface ParsedPatch {
+  filePath: string;
+  hunks: Hunk[];
+}
+
+const HUNK_RE = /^@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@/;
+
+export function parsePatch(diff: string): ParsedPatch {
+  const lines = diff.split("\n");
+  let filePath: string | null = null;
+
+  const hunks: Hunk[] = [];
+  let current: Hunk | null = null;
+
+  for (let i = 0; i < lines.length; i++) {
+    const line = lines[i];
+    if (line.startsWith("--- a/")) continue;
+    if (line.startsWith("+++ b/")) {
+      if (filePath !== null) throw new Error("multiple files in patch not supported");
+      filePath = line.slice(6).trim();
+      continue;
+    }
+    const m = line.match(HUNK_RE);
+    if (m) {
+      if (current) hunks.push(current);
+      current = {
+        oldStart: parseInt(m[1], 10),
+        oldCount: m[2] ? parseInt(m[2], 10) : 1,
+        newStart: parseInt(m[3], 10),
+        newCount: m[4] ? parseInt(m[4], 10) : 1,
+        lines: [],
+      };
+      continue;
+    }
+    if (current) {
+      if (line === "" && i === lines.length - 1) continue; // trailing newline
+      if (line[0] !== " " && line[0] !== "-" && line[0] !== "+" && line[0] !== "\\") {
+        throw new Error(`invalid hunk line: ${JSON.stringify(line)}`);
+      }
+      current.lines.push(line);
+    }
+  }
+  if (current) hunks.push(current);
+  if (!filePath) throw new Error("missing +++ b/PATH header");
+  if (hunks.length === 0) throw new Error("no hunks in patch");
+  return { filePath, hunks };
+}
+
+export interface DryRunResult {
+  filePath: string;
+  before: string;
+  after: string;
+  hunkSummaries: { header: string; added: number; removed: number }[];
+}
+
+export async function dryRun(cwd: string, patch: ParsedPatch): Promise<DryRunResult> {
+  const absPath = path.resolve(cwd, patch.filePath);
+  if (!absPath.startsWith(cwd)) throw new Error("path escapes workspace");
+  const before = await fs.readFile(absPath, "utf-8");
+  const beforeLines = before.split("\n");
+
+  // Apply hunks in reverse so line numbers stay valid.
+  const workLines = [...beforeLines];
+  const hunkSummaries = [];
+  const sortedHunks = [...patch.hunks].sort((a, b) => b.oldStart - a.oldStart);
+
+  for (const h of sortedHunks) {
+    let added = 0;
+    let removed = 0;
+    const replacement: string[] = [];
+    let cursor = h.oldStart - 1;
+
+    for (const l of h.lines) {
+      const tag = l[0];
+      const body = l.slice(1);
+      if (tag === " ") {
+        if (workLines[cursor] !== body) {
+          throw new Error(
+            `context mismatch at line ${cursor + 1}: expected ${JSON.stringify(body)}, got ${JSON.stringify(workLines[cursor])}`,
+          );
+        }
+        replacement.push(body);
+        cursor++;
+      } else if (tag === "-") {
+        if (workLines[cursor] !== body) {
+          throw new Error(
+            `removal mismatch at line ${cursor + 1}: expected ${JSON.stringify(body)}, got ${JSON.stringify(workLines[cursor])}`,
+          );
+        }
+        removed++;
+        cursor++;
+      } else if (tag === "+") {
+        replacement.push(body);
+        added++;
+      }
+    }
+    workLines.splice(h.oldStart - 1, cursor - (h.oldStart - 1), ...replacement);
+    hunkSummaries.push({ header: `@@ -${h.oldStart},${h.oldCount} +${h.newStart},${h.newCount} @@`, added, removed });
+  }
+
+  return { filePath: patch.filePath, before, after: workLines.join("\n"), hunkSummaries };
+}
+
+export async function commit(cwd: string, patch: ParsedPatch, after: string): Promise<void> {
+  const absPath = path.resolve(cwd, patch.filePath);
+  // Backup first.
+  const original = await fs.readFile(absPath, "utf-8");
+  await fs.writeFile(absPath + ".bak", original, "utf-8");
+  await fs.writeFile(absPath, after, "utf-8");
+}
+```
+
+有三个细节值得停下来看一眼：
+
+**逆序应用 hunk。**这样能避开一个经典 bug：第二个 hunk 的行号，因为第一个 hunk 改变了文件长度而失效。应用前按 `oldStart` 降序排一下即可。
+
+**逐字节匹配 context。**不做空白归一化、不做模糊匹配、也没有"差不多就行"这回事。diff 里的空白 bug 是最常见的一种失败模式；把它们当错误对待，能强迫模型精确，也能强迫你注意到磁盘上的文件是不是已经和模型预期的对不上了。
+
+**文件旁边的 `.bak`** 是一种偷懒但有效的撤销机制。真正的 Claude Code 里我们会用 git 暂存；对 mini 版来说，我们只想有能力 `mv file.bak file` 把文件恢复回来。第 04 集起的每一集都可以指望这一步。
+
+## 把 tool 接进执行器
+
+回到 `agent.ts`，往 `runTool` 的 switch 里加：
+
+```typescript
+import { parsePatch, dryRun, commit } from "./patch.js";
+import readline from "node:readline/promises";
+import { stdin as input, stdout as output } from "node:process";
+
+const AUTO_APPROVE = process.env.MCC_AUTO_APPROVE === "1";
+const confirmRl = readline.createInterface({ input, output });
+
+async function confirmPatch(result: Awaited<ReturnType<typeof dryRun>>): Promise<boolean> {
+  console.log(`\n[patch preview] ${result.filePath}`);
+  for (const h of result.hunkSummaries) {
+    console.log(`  ${h.header}   +${h.added} -${h.removed}`);
+  }
+  console.log("--- before ---");
+  console.log(result.before.split("\n").slice(0, 3).join("\n") + "\n…");
+  console.log("--- after ----");
+  console.log(result.after.split("\n").slice(0, 3).join("\n") + "\n…");
+  if (AUTO_APPROVE) {
+    console.log("[patch] auto-approved (MCC_AUTO_APPROVE=1)");
+    return true;
+  }
+  const ans = (await confirmRl.question("apply? [y/N] ")).trim().toLowerCase();
+  return ans === "y" || ans === "yes";
+}
+
+// inside runTool switch:
+if (name === "apply_patch") {
+  const diff = String(input.diff);
+  const parsed = parsePatch(diff);
+  const result = await dryRun(CWD, parsed);
+  const ok = await confirmPatch(result);
+  if (!ok) return "PATCH_REJECTED: user declined";
+  await commit(CWD, parsed, result.after);
+  return `APPLIED to ${result.filePath}: ${result.hunkSummaries.map((h) => `+${h.added}/-${h.removed}`).join(", ")}. Backup at ${result.filePath}.bak`;
+}
+```
+
+仔细读一下这里。回给 Claude 的 tool result 字符串里包含：
+
+- 成功：改了哪个文件、hunk 级别的 `+X/-Y` 计数、备份放在哪里。
+- 拒绝：字面量 `PATCH_REJECTED: user declined`。
+
+两者都很短。两者都有信息量。两者都没有把 500 行新文件内容塞回 context——Claude 已经知道它自己写了什么，我们不必再复述一遍。
+
+## 一次真实的编辑会话长什么样
+
+```
+you › the getAllPosts function should cache its result — add a module-level Map<string, PostMeta[]> keyed by locale
+[tool] read_file({"path":"src/lib/blog.ts"})
+[tool] → import fs from "fs"; …
+[tool] apply_patch({"diff":"--- a/src/lib/blog.ts\n+++ b/src/lib/blog.ts\n@@ -44,6 +44,10 @@…"})
+
+[patch preview] src/lib/blog.ts
+  @@ -44,6 +44,10 @@   +4 -0
+--- before ---
+export function getAllPosts(options: ReadOptions…
+…
+--- after ----
+const cache = new Map<string, PostMeta[]>();
+…
+apply? [y/N] y
+
+cc  › Added a module-level Map cache keyed by locale. First call still walks the directory; subsequent calls return the cached slice. Backup left at src/lib/blog.ts.bak.
+```
+
+注意哪些事情*没*发生：
+
+- 模型没有整份重写文件。它发过来一份 15 行的 patch。
+- 我在改动落盘之前看到了它。
+- 模型回读到的 tool_result 只有 20 个 token，不是 2000。
+
+## 我在写这一集时踩到的坑
+
+**结尾换行 bug。**文件通常以换行结尾。对这样的文件 `split("\n")` 会得到一个空字符串结尾，重新拼接时很容易不经意间丢掉它。如果你在拼接时没有保留这个空字符串，你就悄悄把 agent 碰过的每个文件的结尾换行都剥掉了。git 会显示这个变化；你的 linter 未必会。修法：保留那个末尾空元素，`.join("\n")` 就能把它还原回来。
+
+**模型"贴心地"重排的 context line。**不止一次，Claude 发给我的 patch 里，某一行 context 的末尾空白被模型的 tokenizer 视作无关紧要给去掉了。`context mismatch` 报错会立刻把它暴露出来。**不要**加什么空白容忍匹配去掩盖这个问题——错误足够具体时，模型能自己纠正。
+
+**两个 hunk 命中了同一段。**如果模型在一个 patch 里生成两个互相重叠的 hunk，逆序应用会把文件搞乱。目前解析器还检测不到这一点；逐字节的 context 检查通常会在第二个 hunk 撞上不匹配时把它兜住。第 06 集（加固）里我们会加上重叠检测。
+
+**在 demo 时开自动放行。**我测试时连按了五十次 `y`，然后就不再看预览了。这就是人们亲手删掉自己仓库的经典姿势。如果你设置了 `MCC_AUTO_APPROVE=1`，请在临时目录或一条全新的 git 分支上做，永远别在你在乎的目录里干这事。
+
+## 下一集要修的两个问题
+
+现在有两个已经绕不过去的问题：
+
+**context 在膨胀。**十几次 tool 调用之后，`history` 轻松就超过 40 KB。里面一半都是模型已经推理过的 tool_result 块。第 04 集会引入 observation masking——这是 JetBrains 那篇《Complexity Trap》论文里的手法——用 `[N lines omitted]` 替换掉旧的 tool 输出，同时保留推理过程。这是整个系列里性价比最高的一次改动。
+
+**`max_tokens` 截断依然是"半沉默"的。**我们只是 `console.warn` 一下，并没有恢复。第 04 集会在模型撞到上限、计划做到一半时加上一段自动续写的提示。
+
+## 速查表 · 第 03 集
+
+| 什么 | 在哪里 |
+|---|---|
+| 声明的 tool | `apply_patch` |
+| diff 格式 | unified diff，单文件，严格 context 匹配 |
+| 应用顺序 | `oldStart` 降序，保持行号有效 |
+| 预览 | `before` 与 `after` 各前 3 行，加上每个 hunk 的 `+X/-Y` |
+| 审批 | 交互式 `y/N`（`MCC_AUTO_APPROVE=1` 时自动） |
+| 备份 | 覆盖前写入 `path.bak` |
+| 拒绝返回 | `"PATCH_REJECTED: user declined"` 回给 Claude |
+| 成功返回 | 文件路径 + hunk 计数 + 备份位置 |
+
+**最小可用的 patch 流程：**
+
+```typescript
+const parsed = parsePatch(diff);
+const preview = await dryRun(CWD, parsed);
+if (!await confirmPatch(preview)) return "PATCH_REJECTED: user declined";
+await commit(CWD, parsed, preview.after);
+return `APPLIED to ${parsed.filePath}`;
+```
+
+**活到第 04 集的五条纪律：**
+1. 不做 dry-run 就不写入。
+2. dry-run 不做逐字节 context 匹配就不算数。
+3. 不留 `.bak` 就不 apply。
+4. 不在临时目录里，就不开自动放行。
+5. 别把整份新文件当 tool result 回给模型——模型自己刚生成过它。
+
+第 04 集见——那一集里，我们终于要教 agent 忘掉那些不再重要的对话片段。

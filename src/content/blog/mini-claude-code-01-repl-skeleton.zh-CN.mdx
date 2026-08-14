@@ -1,0 +1,190 @@
+---
+title: "Mini Claude Code · 第 01 集：一个真的能记住上下文的 40 行 REPL"
+description: "一个动手系列的开篇——我们用 TypeScript 从零搭一个能跑的 coding agent。第 1 集先把最小闭环跑起来：stdin、streaming，以及一段能跨越多轮的对话。"
+date: "2026-07-03"
+tags: ["mini-claude-code", "series", "typescript", "agents"]
+readTime: "14 min"
+---
+
+欢迎来到 Mini Claude Code，一个共六集的动手系列，我们会用 TypeScript 从零搭一个真的能跑的 coding agent。不用框架，不玩魔法，也不碰 LangChain。就 Anthropic SDK、一个终端，加上"一次只加一个能力"的克制。
+
+到系列结束时，你手上会有一个虽小但完整的 Claude Code 克隆版：能读你的代码库，能用 unified diff 改文件，能自己管理上下文，能拉起 sub-agent，还能被一份 mini 评测集打分。第 01 集要做的东西，是最小到可以被称作 agent 的形态：一个能和模型对话、能把响应 streaming 回来、并且*记得上一轮说过什么*的 REPL。
+
+如果你已经跑过 10 个 chat demo，但还是搞不清自己写的那个为什么什么都记不住，这一集就是给你的。
+
+## 今晚要搭的东西
+
+一个单文件程序 `agent.ts`，做四件事：
+
+1. 在终端提示你输入
+2. 把你的消息连同之前所有轮次一起发给 Claude
+3. 把响应 streaming 回终端，边到边显示
+4. 循环直到你输入 `/exit`
+
+就这些。没有 tool use，没有文件系统访问，进程一退所有记忆全没。大约 40 行 TypeScript。重点是把*轮次结构*钉死——因为后面每一集加的能力，都会骑在这个循环之上。
+
+## 环境准备——三条命令
+
+假设你已经装了 Node 20+。如果版本更老，先升级；SDK 里 fetch 和 `AbortController` 的语义都依赖它。
+
+```bash
+mkdir mini-claude-code && cd mini-claude-code
+pnpm init && pnpm add @anthropic-ai/sdk
+pnpm add -D typescript tsx @types/node
+```
+
+写一份最小的 `tsconfig.json`：
+
+```json
+{
+  "compilerOptions": {
+    "target": "ES2022",
+    "module": "ESNext",
+    "moduleResolution": "Bundler",
+    "strict": true,
+    "esModuleInterop": true,
+    "skipLibCheck": true
+  }
+}
+```
+
+配好 key：
+
+```bash
+export ANTHROPIC_API_KEY=sk-ant-...
+```
+
+准备工作到此结束。接下来所有内容都在一个文件里。
+
+## 那 40 行 REPL
+
+新建 `agent.ts`：
+
+```typescript
+import Anthropic from "@anthropic-ai/sdk";
+import readline from "node:readline/promises";
+import { stdin as input, stdout as output } from "node:process";
+
+const client = new Anthropic();
+const MODEL = "claude-sonnet-4-5";
+const SYSTEM = "You are Mini Claude Code, a helpful engineering assistant. Keep answers concrete and short unless asked otherwise.";
+
+type Turn = { role: "user" | "assistant"; content: string };
+const history: Turn[] = [];
+
+const rl = readline.createInterface({ input, output });
+
+async function turn(userText: string) {
+  history.push({ role: "user", content: userText });
+
+  const stream = client.messages.stream({
+    model: MODEL,
+    max_tokens: 1024,
+    system: SYSTEM,
+    messages: history,
+  });
+
+  let assistantText = "";
+  for await (const event of stream) {
+    if (event.type === "content_block_delta" && event.delta.type === "text_delta") {
+      process.stdout.write(event.delta.text);
+      assistantText += event.delta.text;
+    }
+  }
+  process.stdout.write("\n");
+  history.push({ role: "assistant", content: assistantText });
+}
+
+async function main() {
+  console.log("Mini Claude Code · Ep.01 REPL. Type /exit to quit.\n");
+  while (true) {
+    const line = (await rl.question("you › ")).trim();
+    if (line === "/exit") break;
+    if (!line) continue;
+    process.stdout.write("cc  › ");
+    await turn(line);
+  }
+  rl.close();
+}
+
+main().catch((e) => { console.error(e); process.exit(1); });
+```
+
+跑起来：
+
+```bash
+pnpm tsx agent.ts
+```
+
+你应该会看到：
+
+```
+Mini Claude Code · Ep.01 REPL. Type /exit to quit.
+
+you › my name is Alice
+cc  › Hi Alice! How can I help?
+you › what did I just tell you my name was?
+cc  › Alice.
+```
+
+第二轮里那个 "Alice" 不是什么小胜利，它就是*这一集的全部意义*。我在 code review 里见过的"我的 chatbot 没有记忆"类 bug，一半都来自同一个原因：下一次请求的时候忘了把 assistant 上一轮的回复一起发回去。模型是无状态的。记忆得由你来维护。
+
+## 那 40 行里，有三件事比你想象中更重要
+
+### 1. history 数组*就是*状态
+
+Claude 在这个 REPL 里将来能"记住"的一切，都活在 `history` 数组里。清空它，记忆就没了。改动它，你就是在改写过去——是的，这一点在第 04 集会有大用，那时我们会有意识地编辑 history 来省 token。眼下先记住这条不变式：每一轮追加一条 user 消息，成功之后再追加一条 assistant 消息。如果请求半路失败，我们*不能*留下一条悬空的 user 消息；这个问题在第 02 集处理。
+
+### 2. streaming 对 agent 不是可选项
+
+你可以把 `client.messages.stream` 换成 `client.messages.create`，一次拿回一整坨响应。别这么干。将来要跑 tool 的 agent，必须用 streaming，理由有两个：（a）你希望响应边到边显示，用户才知道程序没卡住；（b）tool call 是作为 *content block* 出现在 stream 里的，现在把这套增量解析的管线搭好，比之后回头补要容易得多。从第 02 集开始我们就要重度使用这些 content block。
+
+### 3. system prompt 是安放"人设"的地方，不是堆砌指令的地方
+
+`SYSTEM` 只是一段很短的字符串。忍住冲动，别往里塞"永远做 X，绝不做 Y，记得 Z"。lost-in-the-middle 那条研究线（[context engineering 那篇文章](/en/blog/context-engineering-for-coding-agents)里聊过）告诉我们：模型对上下文的注意力集中在开头和结尾。在这个循环里，system prompt 是开头，*最近一条 user 消息*是结尾。如果一条规则只对某个特定任务重要，那就把它写进那一轮的 user 消息里，别塞进 system prompt。
+
+## 我自己写这一集时踩过的坑
+
+**"assistant 文本为空"的 bug。** 第一版我忘了把 `assistantText` 累起来，只是往 stdout 写。history 里于是塞进去一堆空的 assistant 轮次，Claude 就会像上一轮从没发生过一样重新作答。修法：把 streaming 到的文本累进一个字符串里，等 stream 结束*之后*再 push 进 history。
+
+**readline 提示把响应吃掉。** 如果你在模型还在 streaming 的时候就调用 `rl.question("you › ")`，提示字符串会和模型输出交错在一起。修法：先 `await turn(line)` 完整跑完再调 `rl.question`。上面这份代码里，`turn` 会 await 完整个 `for await` 循环，所以本身没问题——但你要是重构成 fire-and-forget，这个 bug 就会回来。
+
+**API key 没被读到。** SDK 会自动从环境变量里读 `ANTHROPIC_API_KEY`。Windows PowerShell 上是 `$env:ANTHROPIC_API_KEY = "sk-ant-..."`；macOS/Linux 上是 `export ANTHROPIC_API_KEY=...`。如果你用 `.env` 文件，装个 `dotenv/config`，或者用 SDK 的 `apiKey` 选项——千万别硬编码进代码。
+
+## 下一集要修的东西
+
+现在这个 agent 有一个明晃晃的局限：它活在鱼缸里。它读不了文件，列不了目录，跑不了命令。你问它的每个问题，它都只能靠训练数据回答，或者靠你手动粘到终端里的内容。
+
+第 02 集会改变这件事。我们会加入 *tool use*——三个 tool：`read_file`、`list_dir`、`run_bash`——让 Claude 真的能翻一翻项目目录。也正是从那一集起，我们今天搭的 streaming 管线才开始真正回本，因为 tool call 会作为 content block 回来，需要我们分发并作出响应。
+
+我们还会顺手修掉今晚这份代码里偷懒混过去的一件事：现在如果模型的响应被截断了（撞到了 `max_tokens`），我们是悄悄地截掉不吭声的。第 02 集会正经地处理 stop reason。
+
+## 速查表——第 01 集
+
+| 名目 | 位置 |
+|---|---|
+| 模型 | `claude-sonnet-4-5` |
+| SDK | `@anthropic-ai/sdk` |
+| 循环形状 | `while(true) { question → stream → push history }` |
+| 记忆 | 内存里的 `history: Turn[]` |
+| 关心的 streaming 事件 | `content_block_delta` 且 `delta.type === "text_delta"` |
+| 退出 | `/exit` |
+
+**最小可行轮次：**
+
+```typescript
+history.push({ role: "user", content: userText });
+const stream = client.messages.stream({ model, system, messages: history, max_tokens: 1024 });
+let out = "";
+for await (const e of stream) {
+  if (e.type === "content_block_delta" && e.delta.type === "text_delta") out += e.delta.text;
+}
+history.push({ role: "assistant", content: out });
+```
+
+**能让你活到第 02 集的三条规矩：**
+1. 永远不要忘了把 assistant 那一轮 push 回 history。
+2. 永远不要在 stream 还开着的时候调 `question`。
+3. 永远不要把和某次任务相关的动态指令塞进 system prompt。
+
+今晚这份 agent 的完整源码会放在 [github.com/claude-community/mini-claude-code](https://github.com/) 的 `ep-01` 目录下。周一见，讲 tool。

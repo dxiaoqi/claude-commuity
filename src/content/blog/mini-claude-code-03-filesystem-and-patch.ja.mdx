@@ -1,0 +1,341 @@
+---
+title: "Mini Claude Code · Episode 03: リポジトリを破壊せずにファイルを編集する"
+description: "Episode 3 では apply_patch ツールを追加する——多くのエージェントがひっそりと作業成果を破壊する、あのツールだ。ドライランでのプレビュー、ワークスペースのガードレール、機嫌の悪い Claude にも耐える確認ゲートを備えた、厳格な unified diff アプライヤを構築する。"
+date: "2026-07-04"
+tags: ["mini-claude-code", "series", "typescript", "agents"]
+readTime: "17 min"
+---
+
+先週、我々のエージェントはファイルを読み、ディレクトリを一覧し、bash を実行することを学んだ。もはやコードに対して意見を持てるようになっている。今夜は、それを *慎重に* 書き換える権利を得る。
+
+Ep.02 が楽しい回だったなら、Ep.03 は *怖い* 回である。自作エージェントの 9 割が、ファイルを静かに壊し、無関係な関数を上書きし、JSON 設定の真ん中にセミコロンを落とし、3 コミット後になって初めて気付く——そういう事故が起きるのがここだ。今夜構築するツールは `apply_patch` の一本だが、これまで 3 つのツールに付けたガードレールを合わせたよりも多くのガードレールを、この 1 本に載せる。
+
+**今夜のルール**：すべての書き込みは、可逆で、プレビュー可能で、拒否可能でなければならない。
+
+## 今夜作るもの
+
+`agent.ts` を以下で拡張する：
+
+1. 4 つめのツール：厳格な unified diff を受け取る `apply_patch`
+2. ディスクに触れる *前* に、不正または曖昧な diff を弾くバリデータ
+3. すべてのハンクについて `before → after` を正確に表示するドライランのパス
+4. 確認ゲート（既定は対話式、フラグで auto-approve に切り替え可能）
+5. すべての書き込みで隣に `.bak` を残すバックアップステップ
+
+1 つのツールとしてはかなり盛り込んでいる。それでも 150 行未満に収まる。この行数を投資する価値は十二分にある。
+
+## なぜ unified diff で、`write_file` ではないのか？
+
+明らかな代替案は `write_file(path, content)` ツールだ——エージェントに新しいファイルの全体を生成させ、我々は上書きする。これはやってはいけない。理由は 3 つある：
+
+1. **コスト。** 500 行のファイルに 3 行の変更を入れる場合、`write_file` は出力トークン 500 行分のコストがかかる。`apply_patch` なら 15 行程度で済む。
+2. **推論のかたち。** 差分はモデルに「*変化*」で考えることを強制し、「再記述」ではない発想を促す。再記述の失敗モードは静かなドリフトだ——モデルは「ついでに」無関係な行まで書き直し、あなたはそれに気付かない。
+3. **レビュー可能性。** 差分は人間可読だ。500 行の塊はそうではない。下で確認ゲートを追加するが、そこでオペレータ（あなた）は 2 秒で変更をスキャンできる必要がある。
+
+トレードオフ：差分は神経質だ。行番号は合っていなければならず、コンテキスト行は合っていなければならず、空白も意味を持つ。だからこそバリデータが今夜のコードで最大のパーツになる。
+
+## 受け入れる diff フォーマット
+
+我々は *unified diff* フォーマットを受け入れる——`git diff` が出力するのと同じものだ：
+
+```
+--- a/src/lib/blog.ts
++++ b/src/lib/blog.ts
+@@ -46,3 +46,4 @@ export function getAllPosts(...) {
+   if (!fs.existsSync(CONTENT_DIR)) return [];
+   const files = fs.readdirSync(CONTENT_DIR).filter((f) => /\.mdx?$/.test(f));
++  const cache = new Map<string, PostMeta>();
+   const bySlug = new Map<string, { file: string; locale: Locale }[]>();
+```
+
+厳格に強制するルール：
+
+- 1 パッチにつきちょうど 1 ファイル（`--- a/…` / `+++ b/…` のヘッダペア）。
+- すべてのハンクは `@@ -oldStart,oldCount +newStart,newCount @@` で始まる。
+- ヘッダ以外のすべての行は ` `（コンテキスト）、`-`（削除）、`+`（追加）のいずれかで始まる。
+- コンテキストと削除の行は、指定された行範囲で現在のファイルとバイト単位で一致しなければならない。
+- バイナリファイル不可、リネーム不可、モード変更不可。Ep.03 はあえて対象範囲を小さく保つ。
+
+いずれかのルールに違反したら、具体的なエラー文字列で拒否する。モデルはエラーを読んで再試行する。これは Ep.02 で構築したのと同じループのパターンだ。
+
+## ツール宣言を追加する
+
+`agent.ts` の先頭で、`TOOLS` 配列に追記する：
+
+```typescript
+{
+  name: "apply_patch",
+  description:
+    "Apply a unified diff to a single file in the workspace. The diff must include --- a/PATH / +++ b/PATH headers and one or more @@ hunks. Context lines must match the current file exactly.",
+  input_schema: {
+    type: "object",
+    properties: {
+      diff: { type: "string", description: "A unified diff, exactly one file." },
+    },
+    required: ["diff"],
+  },
+},
+```
+
+`dry_run` フラグは *あえて* 含めない。ツールは内部で常に先にドライランを走らせ、プレビューをモデルに返す。実際の書き込みは人間の確認の後で、別のメカニズムでゲートされる形で起こる。
+
+## パーサとアプライヤ
+
+新しいファイル `patch.ts` を追加する——こうすることで `agent.ts` の可読性が保たれる：
+
+```typescript
+import fs from "node:fs/promises";
+import path from "node:path";
+
+export interface Hunk {
+  oldStart: number;
+  oldCount: number;
+  newStart: number;
+  newCount: number;
+  lines: string[]; // includes leading " ", "-", "+"
+}
+
+export interface ParsedPatch {
+  filePath: string;
+  hunks: Hunk[];
+}
+
+const HUNK_RE = /^@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@/;
+
+export function parsePatch(diff: string): ParsedPatch {
+  const lines = diff.split("\n");
+  let filePath: string | null = null;
+
+  const hunks: Hunk[] = [];
+  let current: Hunk | null = null;
+
+  for (let i = 0; i < lines.length; i++) {
+    const line = lines[i];
+    if (line.startsWith("--- a/")) continue;
+    if (line.startsWith("+++ b/")) {
+      if (filePath !== null) throw new Error("multiple files in patch not supported");
+      filePath = line.slice(6).trim();
+      continue;
+    }
+    const m = line.match(HUNK_RE);
+    if (m) {
+      if (current) hunks.push(current);
+      current = {
+        oldStart: parseInt(m[1], 10),
+        oldCount: m[2] ? parseInt(m[2], 10) : 1,
+        newStart: parseInt(m[3], 10),
+        newCount: m[4] ? parseInt(m[4], 10) : 1,
+        lines: [],
+      };
+      continue;
+    }
+    if (current) {
+      if (line === "" && i === lines.length - 1) continue; // trailing newline
+      if (line[0] !== " " && line[0] !== "-" && line[0] !== "+" && line[0] !== "\\") {
+        throw new Error(`invalid hunk line: ${JSON.stringify(line)}`);
+      }
+      current.lines.push(line);
+    }
+  }
+  if (current) hunks.push(current);
+  if (!filePath) throw new Error("missing +++ b/PATH header");
+  if (hunks.length === 0) throw new Error("no hunks in patch");
+  return { filePath, hunks };
+}
+
+export interface DryRunResult {
+  filePath: string;
+  before: string;
+  after: string;
+  hunkSummaries: { header: string; added: number; removed: number }[];
+}
+
+export async function dryRun(cwd: string, patch: ParsedPatch): Promise<DryRunResult> {
+  const absPath = path.resolve(cwd, patch.filePath);
+  if (!absPath.startsWith(cwd)) throw new Error("path escapes workspace");
+  const before = await fs.readFile(absPath, "utf-8");
+  const beforeLines = before.split("\n");
+
+  // Apply hunks in reverse so line numbers stay valid.
+  const workLines = [...beforeLines];
+  const hunkSummaries = [];
+  const sortedHunks = [...patch.hunks].sort((a, b) => b.oldStart - a.oldStart);
+
+  for (const h of sortedHunks) {
+    let added = 0;
+    let removed = 0;
+    const replacement: string[] = [];
+    let cursor = h.oldStart - 1;
+
+    for (const l of h.lines) {
+      const tag = l[0];
+      const body = l.slice(1);
+      if (tag === " ") {
+        if (workLines[cursor] !== body) {
+          throw new Error(
+            `context mismatch at line ${cursor + 1}: expected ${JSON.stringify(body)}, got ${JSON.stringify(workLines[cursor])}`,
+          );
+        }
+        replacement.push(body);
+        cursor++;
+      } else if (tag === "-") {
+        if (workLines[cursor] !== body) {
+          throw new Error(
+            `removal mismatch at line ${cursor + 1}: expected ${JSON.stringify(body)}, got ${JSON.stringify(workLines[cursor])}`,
+          );
+        }
+        removed++;
+        cursor++;
+      } else if (tag === "+") {
+        replacement.push(body);
+        added++;
+      }
+    }
+    workLines.splice(h.oldStart - 1, cursor - (h.oldStart - 1), ...replacement);
+    hunkSummaries.push({ header: `@@ -${h.oldStart},${h.oldCount} +${h.newStart},${h.newCount} @@`, added, removed });
+  }
+
+  return { filePath: patch.filePath, before, after: workLines.join("\n"), hunkSummaries };
+}
+
+export async function commit(cwd: string, patch: ParsedPatch, after: string): Promise<void> {
+  const absPath = path.resolve(cwd, patch.filePath);
+  // Backup first.
+  const original = await fs.readFile(absPath, "utf-8");
+  await fs.writeFile(absPath + ".bak", original, "utf-8");
+  await fs.writeFile(absPath, after, "utf-8");
+}
+```
+
+立ち止まって見ておきたいディテールが 3 つある：
+
+**ハンクを逆順に適用する**ことで、最初のハンクがファイル長を変えたせいで 2 番目のハンクの行番号がずれる、という古典的なバグを避けられる。適用前に `oldStart` の降順でソートすること。
+
+**バイト単位で正確なコンテキストマッチ。** 空白の正規化なし、ファジーマッチなし、「だいたい合ってる」なし。差分における空白のバグは最も頻出する失敗モードだ。それをエラーとして扱うことで、モデルには正確であることを強制し、ディスク上のファイルがモデルの想定からずれたときに我々が気付けるようにする。
+
+**ファイルの隣の `.bak`** は雑ではあるが効果的な undo だ。本物の Claude Code なら git でステージするが、mini では `mv file.bak file` で復旧できる能力があれば十分だ。Ep.04 以降のすべての回はこれに依存できる。
+
+## ツールを実行系に組み込む
+
+`agent.ts` に戻り、`runTool` の switch に追加する：
+
+```typescript
+import { parsePatch, dryRun, commit } from "./patch.js";
+import readline from "node:readline/promises";
+import { stdin as input, stdout as output } from "node:process";
+
+const AUTO_APPROVE = process.env.MCC_AUTO_APPROVE === "1";
+const confirmRl = readline.createInterface({ input, output });
+
+async function confirmPatch(result: Awaited<ReturnType<typeof dryRun>>): Promise<boolean> {
+  console.log(`\n[patch preview] ${result.filePath}`);
+  for (const h of result.hunkSummaries) {
+    console.log(`  ${h.header}   +${h.added} -${h.removed}`);
+  }
+  console.log("--- before ---");
+  console.log(result.before.split("\n").slice(0, 3).join("\n") + "\n…");
+  console.log("--- after ----");
+  console.log(result.after.split("\n").slice(0, 3).join("\n") + "\n…");
+  if (AUTO_APPROVE) {
+    console.log("[patch] auto-approved (MCC_AUTO_APPROVE=1)");
+    return true;
+  }
+  const ans = (await confirmRl.question("apply? [y/N] ")).trim().toLowerCase();
+  return ans === "y" || ans === "yes";
+}
+
+// inside runTool switch:
+if (name === "apply_patch") {
+  const diff = String(input.diff);
+  const parsed = parsePatch(diff);
+  const result = await dryRun(CWD, parsed);
+  const ok = await confirmPatch(result);
+  if (!ok) return "PATCH_REJECTED: user declined";
+  await commit(CWD, parsed, result.after);
+  return `APPLIED to ${result.filePath}: ${result.hunkSummaries.map((h) => `+${h.added}/-${h.removed}`).join(", ")}. Backup at ${result.filePath}.bak`;
+}
+```
+
+ここは注意深く読んでほしい。Claude に返される tool result 文字列には次のものが含まれている：
+
+- 成功時：どのファイルが変わったか、ハンク単位の `+X/-Y` カウント、バックアップの場所。
+- 拒否時：リテラルの `PATCH_REJECTED: user declined`。
+
+どちらも短い。どちらも情報量がある。どちらも 500 行の新しいファイル内容をコンテキストに戻したりはしない——Claude は自分が書いたものをすでに知っている、我々がわざわざ再伝達する必要はないのだ。
+
+## 実際の編集セッションの見た目
+
+```
+you › the getAllPosts function should cache its result — add a module-level Map<string, PostMeta[]> keyed by locale
+[tool] read_file({"path":"src/lib/blog.ts"})
+[tool] → import fs from "fs"; …
+[tool] apply_patch({"diff":"--- a/src/lib/blog.ts\n+++ b/src/lib/blog.ts\n@@ -44,6 +44,10 @@…"})
+
+[patch preview] src/lib/blog.ts
+  @@ -44,6 +44,10 @@   +4 -0
+--- before ---
+export function getAllPosts(options: ReadOptions…
+…
+--- after ----
+const cache = new Map<string, PostMeta[]>();
+…
+apply? [y/N] y
+
+cc  › Added a module-level Map cache keyed by locale. First call still walks the directory; subsequent calls return the cached slice. Backup left at src/lib/blog.ts.bak.
+```
+
+*起こらなかった* ことに注目してほしい：
+
+- モデルはファイルを書き直さなかった。15 行のパッチを送っただけだ。
+- 変更がディスクに当たる前に、私はそれを見ることができた。
+- モデルが受け取る tool_result は 20 トークン、2000 トークンではない。
+
+## 書きながら踏んだ落とし穴
+
+**末尾改行のバグ。** ファイルは通常、改行で終わる。そのようなファイルを `split("\n")` すると、最後に空文字列が生まれる。再結合の際にこれを取りこぼしやすい。空文字列を無視して結合すると、エージェントが触れたすべてのファイルから末尾の改行を静かに剥ぎ取ってしまうことになる。git は変更として表示するかもしれないが、リンタは検知しないかもしれない。修正：末尾の空要素を保ち、`.join("\n")` で復元する。
+
+**モデルが「親切にも」リフローしてしまったコンテキスト行。** 一度ならず、Claude はコンテキスト行から末尾の空白が剥がれたパッチを送ってきた——モデルのトークナイザが末尾スペースを重要でないものとして扱うためだ。`context mismatch` エラーが即座にこれを表面化させる。空白を許容するマッチングを追加して問題を隠してはいけない——エラーが具体的であれば、モデルは自分で修正できる。
+
+**同じ範囲に触れる 2 つのハンク。** モデルが 1 つのパッチ内で重なるハンクを 2 つ生成した場合、逆順適用はファイルを破壊する。私のパーサはまだこれを検出できない。バイト単位のコンテキストチェックが、通常は 2 番目のハンクでのミスマッチとしてこれを捕まえてくれる。Ep.06（ハードニング）で重なりチェックを追加する。
+
+**デモでの auto-approve。** テスト中に私は `y` を 50 回連続で叩き、プレビューを読まなくなった。人が自分のリポジトリを消し飛ばすのは、まさにこの経路だ。`MCC_AUTO_APPROVE=1` を設定するときは、使い捨てディレクトリか新しい git ブランチでやること——大事にしているディレクトリでは絶対にやらないこと。
+
+## 次回で直すこと
+
+もはや避けられない問題が 2 つある：
+
+**コンテキストが膨らんできた。** ツール呼び出しを 10 数回繰り返せば、`history` は簡単に 40 KB を超える。その半分は、モデルがすでに推論を済ませた tool_result ブロックだ。Ep.04 では観測マスキングを導入する——JetBrains の "Complexity Trap" 論文の技法だ——古い tool 出力を `[N lines omitted]` に置き換えつつ、推論そのものは残す。シリーズを通して、行数あたりのインパクトが最大の変更になる。
+
+**`max_tokens` による打ち切りはまだ半分無音のままだ。** `console.warn` はしているが、回復はしない。Ep.04 ではモデルがプランの途中で天井に当たったときの自動継続プロンプトを追加する。
+
+## クイックリファレンス — Episode 03
+
+| 何を | どこで |
+|---|---|
+| 宣言するツール | `apply_patch` |
+| diff フォーマット | unified diff、1 ファイル、厳格なコンテキスト一致 |
+| 適用の順序 | `oldStart` の降順、行番号を有効に保つため |
+| プレビュー | `before` と `after` の先頭 3 行、およびハンク単位の `+X/-Y` |
+| 承認 | 対話式の `y/N`（`MCC_AUTO_APPROVE=1` で自動） |
+| バックアップ | 上書きの前に `path.bak` を書き出す |
+| 拒否時ペイロード | `"PATCH_REJECTED: user declined"` を Claude に返す |
+| 成功時ペイロード | ファイルパス + ハンクカウント + バックアップ位置 |
+
+**最小のパッチフロー：**
+
+```typescript
+const parsed = parsePatch(diff);
+const preview = await dryRun(CWD, parsed);
+if (!await confirmPatch(preview)) return "PATCH_REJECTED: user declined";
+await commit(CWD, parsed, preview.after);
+return `APPLIED to ${parsed.filePath}`;
+```
+
+**Ep.04 まで生き延びるための 5 つのルール：**
+1. ドライランなしで書き込むな。
+2. バイト単位のコンテキスト一致なしでドライランするな。
+3. `.bak` なしで適用するな。
+4. 使い捨てディレクトリの外で auto-approve するな。
+5. tool result として新しいファイル全体をモデルに返すな——モデルはすでにそれを生成している。
+
+次は Ep.04——ここでようやく、会話のうちもう関係なくなった部分をエージェントに忘れさせる方法を教える。

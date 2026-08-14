@@ -1,14 +1,34 @@
 import type { Metadata } from "next";
 import Link from "next/link";
+import { notFound } from "next/navigation";
 import { NewsletterForm } from "@/components/newsletter-form";
+import { defaultLocale, isLocale, locales, type Locale } from "@/i18n/config";
 
-export const metadata: Metadata = {
-  title: "Claude field guide",
-  description: "Practical patterns for research, writing, analysis, and reliable knowledge work with Claude.",
-  alternates: { canonical: "/claude" },
-};
+interface Props {
+  params: Promise<{ locale: string }>;
+}
 
-export default function ClaudePage() {
+export async function generateMetadata({ params }: Props): Promise<Metadata> {
+  const { locale: rawLocale } = await params;
+  const locale: Locale = isLocale(rawLocale) ? rawLocale : defaultLocale;
+  return {
+    title: "Claude field guide",
+    description: "Practical patterns for research, writing, analysis, and reliable knowledge work with Claude.",
+    alternates: {
+      canonical: `/${locale}/claude`,
+      languages: Object.fromEntries([
+        ...locales.map((l) => [l, `/${l}/claude`] as const),
+        ["x-default", `/${defaultLocale}/claude`] as const,
+      ]),
+    },
+  };
+}
+
+export default async function ClaudePage({ params }: Props) {
+  const { locale: rawLocale } = await params;
+  if (!isLocale(rawLocale)) notFound();
+  const locale = rawLocale;
+  const base = `/${locale}`;
   return <main id="main" className="article-shell shell-width">
     <header className="article-hero"><p className="section-label">{"// FIELD GUIDE 01"}</p><h1>Claude, without<br /><span>the magic tricks.</span></h1><p>A practical guide to better context, sharper instructions, and outputs you can actually use.</p></header>
     <div className="article-layout">
@@ -20,6 +40,6 @@ export default function ClaudePage() {
         <div className="article-cta"><h3>One sharp workflow per issue.</h3><NewsletterForm source="claude-guide" /></div>
       </article>
     </div>
-    <Link className="back-link" href="/">← Back to the workbench</Link>
+    <Link className="back-link" href={base}>← Back to the workbench</Link>
   </main>;
 }

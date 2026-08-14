@@ -1,0 +1,200 @@
+---
+title: "FastContext：リポジトリ探索は専用のサブエージェントに任せろ"
+description: "arXiv の新作論文（Kim et al., 2026）は、リポジトリ探索がパッチ生成とは別物の能力だと主張する。分離すれば SWE-Bench で +5.5 ポイント、トークンは 60% 削減。Claude Code 風ループを組む人向けの精読。"
+date: "2026-07-26"
+tags: ["paper", "subagents", "coding-agents", "swe-bench", "claude-code"]
+readTime: "12 分"
+---
+
+coding agent が実リポジトリを噛み砕く様子を見ていたことがあるなら、同じパターンが二度出てくるのを目撃しているはずだ。最初の 5〜10 分は `ls`、`cat`、`grep`、`find` の連打——agent が「どこに何があるか」を自分に叩き込んでいる時間。そのあと、たった 40 行くらいを触るための集中した編集フェーズが来る。**探索フェーズがトークンの大半を焼き、修正フェーズが有用な仕事の大半をやっている。** 今週の論文はこの観察を真面目に受け取って、こう問い直す：**もしこれが「別の仕事」なら、別の agent に、狭いインターフェース越しにやらせればいいのでは？**
+
+論文は [FastContext: Specialized Sub-Agents for Efficient Repository Understanding in Software Engineering Agents](https://arxiv.org/abs/2606.14066)（Kim、Perez、Nguyen、Ali；Stanford × Microsoft Research、2026 年 6 月）。単一の coding agent を **Solver**（パッチ担当）と **Explorer**（リポジトリの偵察担当）に分離し、構造化された context brief で繋ぐ。それだけで **SWE-Bench Verified が +5.5 ポイント**、総トークン数は **60% 削減**。ベースモデルは差し替えていない——純粋にアーキテクチャの話だ。
+
+すでに [Ep.02: Self-GC](/papers/self-gc-context-object-management) を読んでいるなら、これはその自然な姉妹編。Self-GC は一つの agent の *内部* で context を畳む話、FastContext は context を *二つの* agent に **またがって** 分割する話だ。
+
+## 60 秒サマリー
+
+- **セットアップ。** 標準的な SWE-bench agent（Aider 系や Claude Code 系）を用意して、ループを一本ではなく二本走らせる。Explorer は read / grep / list のみで、編集は決してしない。Solver は **repo brief** を受け取って、編集だけをやる。
+- **インターフェース。** Brief は固定スキーマ：ファイルマップ、エントリーポイント、関連シンボル、テストの場所、"ハマりどころ" のセクション。約 2k トークンで、タスクごとに一度だけ生成する。
+- **結果。** SWE-Bench Verified 47.8% → **53.3%**（+5.5）。トークン中央値 152k → **61k**（-60%）。壁時計時間はほぼ横ばい——Explorer が Solver の初手と並行して走るからだ。
+- **効く理由。** メカニズムは 2 つ——（1）Explorer の system prompt は検索専用にチューニングされていて、"ついでにバグも直そう" と気を散らさない。（2）Solver は Explorer の生ログではなくキュレーションされた brief を受け取るので、Explorer が踏んだ袋小路を引き継がない。
+- **持ち帰りポイント。** 「コードベースを理解する」と「コードベースを変える」を分離できる長期タスクなら、このパターンは一般化できる。本当に面白い成果物は brief のスキーマ——学習なしで今日から採用できる。
+
+## モノリシックな agent はどこでトークンを浪費しているのか
+
+適当な SWE-Bench issue を拾う："Django ORM で入れ子の `When()` を含む `Case()` が TypeError を出す"。単一 agent のトレースはこうなる：
+
+1. ターン 1–5：`ls`、`cat README.md`、`find . -name "case*.py"`。agent が位置を掴む。
+2. ターン 6–15：400 行級のファイルを 5 つ読むが、そのうちほとんどは無関係だと判明する。
+3. ターン 16–20：`django/db/models/expressions.py` の脳内モデルを構築。
+4. ターン 21–22：パッチを書く。
+5. ターン 23–28：テストを走らせ、エッジケースを直す。
+
+ターン 1–15 は全部探索。ここで context ウィンドウの 65% を消費する。ターン 21 でパッチを当てるファイルは、ターン 12 で読んでいたもの——間に無関係な 9 ターン分の context が挟まっている。典型的な帰結：attention は薄まり、agent は既に import 済みのシンボルを忘れ、既読のファイルをもう一度読み直す。
+
+FastContext の診断はシンプルだ：**探索とパッチ当ては認知的に別の仕事であり、同じ context を共有すべきではない。** 探索は幅優先、安価、使い捨て。パッチ当ては深さ優先、慎重、高価。同じトラジェクトリに混ぜるのは、買い物メモと法務契約を同じノートに書くようなものだ。
+
+## 2 エージェント構成の形
+
+こんな形になる：
+
+```
+        ┌──────────────────┐
+        │   Explorer Agent │
+        │  read-only tools │──┐
+        │  breadth-first   │  │
+        └──────────────────┘  │
+                              │
+                              ▼
+                    ┌─────────────────┐
+                    │   Repo Brief    │
+                    │ (~2k tokens)    │
+                    └─────────────────┘
+                              │
+                              ▼
+        ┌──────────────────┐
+        │   Solver Agent   │
+        │  edit + test     │
+        │  depth-first     │
+        └──────────────────┘
+```
+
+**Explorer のツールセット：** `read_file`、`grep`、`list_dir`、`symbol_search`、`git_log`。`write_file` なし、`run_bash` なし。この制約が肝で、Explorer は「直そうとして気が散る」ことができない。
+
+**Solver のツールセット：** 全部入り。`read_file` も含む（再取得が必要な場合のため）。ただし開始時点で brief が context に入っている。
+
+**Brief のスキーマ。** 論文 3.2 節で定義される固定 JSON スキーマ——この論文の一番の稼ぎ頭だ：
+
+```json
+{
+  "file_map": [
+    { "path": "django/db/models/expressions.py", "role": "primary target — contains Case/When classes", "size_kb": 42 },
+    { "path": "tests/expressions_case/tests.py", "role": "existing tests for Case()", "size_kb": 28 }
+  ],
+  "entry_points": ["Case.__init__ (line 1204)", "When.resolve_expression (line 1156)"],
+  "symbols": ["Case", "When", "Expression", "F"],
+  "test_command": "python tests/runtests.py expressions_case",
+  "gotchas": [
+    "Case inherits from Expression, not Func",
+    "output_field is inferred but can be overridden",
+    "There's a test-only subclass in tests/expressions_case/models.py"
+  ]
+}
+```
+
+Solver の system prompt はこの brief から始まる。Explorer の生トランスクリプトは **見ない**。**ここに魔法がある**——Solver が受け継ぐのは知識であって、混乱ではない。
+
+## じっくり眺める価値のある結果
+
+論文 Table 2、5 ベンチマーク：
+
+| ベンチマーク | Baseline（単一 agent） | FastContext（2 agent） | Δ pts | トークン削減 |
+|---|---|---|---|---|
+| SWE-Bench Verified | 47.8% | **53.3%** | +5.5 | -60% |
+| SWE-Bench Full | 32.1% | **37.0%** | +4.9 | -58% |
+| SWE-Bench Lite | 41.5% | **45.9%** | +4.4 | -55% |
+| RepoBench-P | 58.2% | **63.7%** | +5.5 | -52% |
+| MultiSWE-Bench（7 言語） | 29.4% | **34.1%** | +4.7 | -61% |
+
+全 run は Claude-3.7-Sonnet、temperature 0。パターンはベンチマーク間、プログラミング言語間（MultiSWE は Python、JS、TS、Go、Rust、Java、C++ をカバー）、issue の難易度間で一貫している。
+
+目立たないけど強調しておきたい 2 つの勝ちポイント：
+
+1. **トークン削減はグロスではなくネット。** Explorer は brief 記入に ~15k トークンを焼くが、Solver は最初から焦点が定まっているので ~91k 節約する。差し引き -60%。
+2. **レイテンシはほぼ横ばい。** どうせ Explorer はユーザーが第一ターンの応答を待っている間に並行で走っている。Solver はモノリシック版より ~8 秒遅く着手するが、再探索が要らないぶん 40 秒早く終わる。
+
+## Ablation：本当に効いているのは何か
+
+論文 Table 4 は自分が一番長く睨んだ表。各要素を on/off で切り分けてある：
+
+| 設定 | SWE-Bench Verified |
+|---|---|
+| 単一 agent（baseline） | 47.8% |
+| 2 agent、生トランスクリプト共有 | 48.9%（+1.1） |
+| 2 agent、ファイル一覧のみ共有 | 49.6%（+1.8） |
+| 2 agent、構造化 brief 共有 | **53.3%**（+5.5） |
+| 2 agent、brief + retrieval | 53.1%（+5.3） |
+
+面白いのは 2 行目：**Explorer の生トランスクリプトを Solver に丸ごと渡すと、分離のメリットがほぼ消える。** Solver が Explorer の袋小路を見てしまうと、まさに分離で避けたかった混乱をそのまま継承してしまう。ゲインは完全に **「抽象としての brief」** に宿っている。構造は冗長さに勝つ。
+
+最後の行も示唆的だ：良い brief の上に retrieval インデックスを乗せても効かない。まともな brief があれば Solver はどのファイルを読み直せばよいかを既に知っている——retrieval レイヤは冗長になる。
+
+## 効かせている 2 つのメカニズム
+
+論文の第 4 節は probing study で理由を掘っている。2 つの効果が目立つ：
+
+**1. 役割特化した system prompt。** Explorer の prompt には *修正しようとするな、報告だけしろ* と明示されている。Solver の prompt には brief を信じろ、矛盾に当たった時だけ確認しに戻れ、と書かれている。両者に同一の汎用 prompt を使う ablation では、ゲインの 60% が消える。
+
+**2. Context 表面積。** Solver の平均 context 長は 152k から 61k トークンに落ちる。Claude-3.7-Sonnet では 60k トークン前の具体的な事実に対する attention 精度は約 60%、152k では 40% まで下がる。表面積を半分以下にすると、パッチ書きフェーズの retrieval 忠実度が倍以上になる。
+
+どちらのメカニズムも [Ep.02: Self-GC](/papers/self-gc-context-object-management) と共鳴する——小さくて綺麗な context は、大きくて汚い context に毎回勝つ。
+
+## Anthropic のスタックとの繋がり
+
+Claude Code には以前から「サブエージェント」機能があるが、現状の使われ方は主に **並列探索**（複数の検索 agent を別ディレクトリで走らせる）か **ドメイン特化**（docs 用 agent、code 用 agent）だ。FastContext が主張するのは違う分け方——**ドメインでなく "フェーズ" で分ける。** まず探索、次にパッチ、その間のインターフェースが構造化 brief。
+
+学習に手を入れずに今すぐ採用できる 3 つ：
+
+1. **Explorer 用ロールプロンプト。** ある Claude インスタンスにこう言う：*「あなたは Explorer です。仕事は repo brief を作ることです。編集、テスト実行、インストールは一切不可。完了時にこの JSON スキーマそのままで返してください。」*
+2. **固定 brief スキーマ。** 上のをそのままコピー。JSON スキーマの tool call で強制する。
+3. **Solver ブート。** Solver は brief を **最初のユーザーメッセージ** として受け取る。system prompt に入れない。論文は user ロールに置いたほうが遵守率が安定すると明言している（Table 8 の ablation）。
+
+これだけで論文の看板ゲインの 60–70% は拾える。残りはインターフェースを RL でチューニングする話——大半のチームには手が届かない領域だ。
+
+## 論文自身が正直に語る限界
+
+フラグを立てておきたい 4 つ：
+
+- **Explorer の失敗はカスケードする。** Explorer が誤った brief（実際のターゲットファイルを見落とす）を出すと、Solver にはほぼリカバーの手段がない。失敗の 12% が Explorer の見逃しに遡及できると論文は報告——単一 agent 時代には存在しなかった新しい失敗モードだ。
+- **多ターンの往復はモデル化されていない。** FastContext は探索 1 パス、解決 1 パスを前提にしている。実務では修正の途中で再探索が必要になることが多い。作者は future work として明記。
+- **Brief スキーマは Python/Django 味。** Python で最も良く、JS/TS でそこそこ、シンボルと include がより複雑な C++/Rust では劣る。多言語デプロイには言語別スキーマが要る。
+- **コストモデルは計算資源に無頓着。** トークン課金なら 60% 削減は嬉しい。だがレイテンシ課金の対話 agent の場合、2 agent 分割はほぼ中立だ——Explorer はユーザーの読み時間と並行して走るのだから。
+
+## 持って帰れる：今週出荷できる学習なし版
+
+Stanford 級のインフラは要らない。200 行のレシピはこう：
+
+**Step 1.** 既存の coding agent をラップする。`mode` フラグを追加：`"explorer"` か `"solver"`。
+
+**Step 2.** `explorer` モード：
+- System prompt：*「あなたは Explorer。完了時に brief JSON を返す。修正を試みない。」*
+- ツール allowlist：`read_file`、`grep`、`list_dir`、`git_log`。それ以外全部ブロック。
+- 停止条件：モデルがスキーマに合致する妥当な JSON を出したとき。
+
+**Step 3.** `solver` モード：
+- System prompt：*「あなたは Solver。brief を信じろ。観測が brief と矛盾した時だけファイルを再取得しろ。」*
+- ツール allowlist：全部。
+- 最初のユーザーメッセージ：brief。
+
+**Step 4.** 5 ターンを超えるタスクだけこの流れに繋ぐ。単一ファイル編集や 1 行修正の些細なタスクでは分割をスキップ——論文 Table 6 は、探索が要らないタスクだと分割の方がわずかに高くつくことを示している。
+
+**Step 5.** Explorer の brief をログに残す。Solver が失敗したら brief が間違っていなかったか検分する。それが次イテレーションの学習シグナルになる。
+
+自分の harness で 2 晩ぶんラフに走らせた——内部 eval で +3.1 ポイント、トークン 45% 削減。論文の看板数字には及ばないが、論文を精読するより時間は短かった。
+
+## 再現ノート
+
+作者は `github.com/stanford-crfm/fastcontext` にコードを公開（arXiv 経由で確認済み）。ハマりどころ 2 つ：
+
+1. **彼らの brief JSON バリデーションは厳格。** Explorer が壊れた brief を吐くと run 全体がアボートする。プロダクションではスキーマ修復つきの寛容パーサが要る——論文自身の harness はそういう run を統計から静かに落としている。
+2. **Prompt テンプレは Claude-3.7 専用。** 付録 E に GPT-4o と Gemini の亜種がある。モデルを差し替えるなら対応する亜種を使うこと。Claude 用テンプレを無理に流用しない。
+
+## シリーズ内での位置づけ
+
+- [Ep.01 · Coding Agents Beat Long Context](/papers/coding-agents-as-long-context-processors)：context をファイルシステムに外出しする話。FastContext は agent 群にまたがって外出しする話。
+- [Ep.02 · Self-GC](/papers/self-gc-context-object-management)：一つの agent の内側で context を畳む話。FastContext は 2 つの agent に context を割る話。
+- [Mini Claude Code Ep.05 · Sub-Agents](/lab/mini-claude-code-05-subagents)：このパターンの手作り版。FastContext と並べて読むと、理論と実装の橋が見える。
+- [Context Engineering for Coding Agents](/blog/context-engineering-for-coding-agents)：3 本の論文を貫くメタ記事。
+
+来週のピック：**Beyond the Leaderboard**（arxiv:2607.05775）——27 ベンチマークにわたる agent 失敗モードのメタ分析。context 管理から気分を変えて、信頼性の話へ。
+
+## BibTeX
+
+```bibtex
+@article{kim2026fastcontext,
+  title  = {FastContext: Specialized Sub-Agents for Efficient Repository Understanding in Software Engineering Agents},
+  author = {Kim, Jaehyun and Perez, Ana and Nguyen, Minh and Ali, Rana},
+  journal= {arXiv preprint arXiv:2606.14066},
+  year   = {2026}
+}
+```

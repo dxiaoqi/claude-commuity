@@ -1,0 +1,317 @@
+---
+title: "Mini Claude Code · 第 06 集：终于能告诉你是不是改砸了的 eval 循环"
+description: "第一季收官。我们造一套 15 个任务的 SWE-lite 测试架，把 agent 端到端地跑在可验证的代码任务上，再接上 prompt caching 让迭代变便宜。通过率、平均轮数、单任务成本——钉成一个 baseline，之后每次回归都拿它来对比。"
+date: "2026-07-05"
+tags: ["mini-claude-code", "series", "typescript", "agents"]
+readTime: "18 min"
+---
+
+五集造下来，到目前为止每一处改进都是靠感觉调出来的。"加 masking 有帮助。""sub-agent 感觉更干净。"到底怎么个"感觉"法？对比谁？今晚我们要为这一季收尾，写的这块内容如果我早点严格要求自己，应该在最开始就写：一套评测架，钉一份 baseline，这样下次我再动 system prompt，三十分钟之内就能判断 agent 是变好了还是变差了。
+
+今晚还要处理的另一件事：prompt caching。从第 02 集起，每一轮我们都在为完全一样的 system prompt 和工具定义付满价的 input token。之前还在探索阶段，无所谓。可一旦要跑一次连续打 15 发的 eval，那就荒唐了。这两件事放在同一个 commit 里，是因为不把迭代成本压下来，你根本没法在 prompt 上迭代。
+
+## 今晚要造的东西
+
+1. `evals/tasks/` —— 15 个可验证的 SWE-lite 风格任务，每个都是一个目录，里面放 `setup.sh`、`task.md`、`verify.sh`
+2. `evals/runner.ts` —— 一个 `mcc eval` 命令，让 agent 依次跑每个任务，记录 pass / fail / 轮数 / token / 成本
+3. 把 prompt caching 接进 `client.messages.create` —— 在 system 块和 tools 上打 `cache_control`
+4. 一份 `baseline.json` —— 第一次跑完之后钉在 commit 里，未来每一次跑报告的是*增量*，而不是一个孤零零的数字
+
+## 为什么是 15 个任务，为什么叫 "SWE-lite"
+
+15 个足够小，能在 ~15 分钟内跑完；也足够大，能给出信号 —— 15 个任务里 80% 通过率和 60% 通过率不是统计噪声。再多，这套 eval 就不再是"改完 prompt 顺手再跑一遍"的东西了。
+
+"SWE-lite" 的意思是：小、真实、可验证：
+
+- 每个任务住在自己的目录里。`setup.sh` 准备文件。`task.md` 是 agent 看到的内容。`verify.sh` 退出码为 0 表示通过。
+- 任务的形态取自 Claude Code 日常真正在做的事：「修好这个挂掉的测试」、「加一个 null check」、「把这个函数在所有引用处都重命名」、「把这段抽成 helper」。
+- 没有任何任务需要联网或者接真数据库。所有东西都在一个全新的临时目录里跑。
+
+一个任务长这样：
+
+```
+evals/tasks/03-fix-off-by-one/
+├── setup.sh       # writes buggy code + failing test into $WORK_DIR
+├── task.md        # "The test in sum_test.ts fails. Fix sum.ts so it passes."
+└── verify.sh      # cd $WORK_DIR && npm test -- sum_test.ts
+```
+
+15 个这样的任务能给你一条信号通道。再少就只是一则轶事。
+
+## runner
+
+新建 `evals/runner.ts`：
+
+```typescript
+import { readdir, readFile, mkdtemp, rm } from "node:fs/promises";
+import { join } from "node:path";
+import { tmpdir } from "node:os";
+import { execFile } from "node:child_process";
+import { promisify } from "node:util";
+import Anthropic from "@anthropic-ai/sdk";
+import { TOOLS, runTool } from "../src/agent.js";
+
+const execFileP = promisify(execFile);
+const client = new Anthropic();
+const MODEL = "claude-sonnet-4-5";
+const MAX_TURNS = 30;
+
+interface TaskResult {
+  id: string;
+  passed: boolean;
+  turns: number;
+  inputTokens: number;
+  outputTokens: number;
+  cacheReadTokens: number;
+  cacheWriteTokens: number;
+  costUsd: number;
+  durationMs: number;
+  error?: string;
+}
+
+async function runOneTask(taskDir: string, taskId: string): Promise<TaskResult> {
+  const t0 = Date.now();
+  const workDir = await mkdtemp(join(tmpdir(), `mcc-eval-${taskId}-`));
+  process.env.WORK_DIR = workDir;
+  process.env.MCC_AUTO_APPROVE = "1"; // no y/N inside eval
+
+  try {
+    await execFileP("sh", [join(taskDir, "setup.sh")], { env: process.env });
+    const brief = await readFile(join(taskDir, "task.md"), "utf8");
+
+    const history: Anthropic.MessageParam[] = [
+      { role: "user", content: `Working directory: ${workDir}\n\n${brief}` },
+    ];
+
+    let totIn = 0, totOut = 0, totCacheR = 0, totCacheW = 0;
+    let turns = 0;
+
+    for (; turns < MAX_TURNS; turns++) {
+      const response = await client.messages.create({
+        model: MODEL,
+        max_tokens: 4096,
+        system: [
+          {
+            type: "text",
+            text: "You are Mini Claude Code, running inside an eval harness. Complete the task and stop. Use tools decisively.",
+            cache_control: { type: "ephemeral" },
+          },
+        ],
+        tools: TOOLS.map((t, i) =>
+          i === TOOLS.length - 1 ? { ...t, cache_control: { type: "ephemeral" } } : t
+        ),
+        messages: history,
+      });
+
+      totIn += response.usage.input_tokens;
+      totOut += response.usage.output_tokens;
+      totCacheR += response.usage.cache_read_input_tokens ?? 0;
+      totCacheW += response.usage.cache_creation_input_tokens ?? 0;
+      history.push({ role: "assistant", content: response.content });
+
+      if (response.stop_reason !== "tool_use") break;
+
+      const results = [];
+      for (const b of response.content) {
+        if (b.type === "tool_use") {
+          const out = await runTool(b.name, b.input as Record<string, unknown>);
+          results.push({ type: "tool_result" as const, tool_use_id: b.id, content: out });
+        }
+      }
+      history.push({ role: "user", content: results });
+    }
+
+    let passed = false;
+    try {
+      await execFileP("sh", [join(taskDir, "verify.sh")], { env: process.env, timeout: 30_000 });
+      passed = true;
+    } catch { /* verify script exited non-zero */ }
+
+    // Sonnet 4.5 pricing (USD per 1M tokens)
+    const cost =
+      (totIn - totCacheR - totCacheW) * 3 / 1e6 +
+      totCacheW * 3.75 / 1e6 +
+      totCacheR * 0.30 / 1e6 +
+      totOut * 15 / 1e6;
+
+    return {
+      id: taskId, passed, turns,
+      inputTokens: totIn, outputTokens: totOut,
+      cacheReadTokens: totCacheR, cacheWriteTokens: totCacheW,
+      costUsd: Number(cost.toFixed(4)),
+      durationMs: Date.now() - t0,
+    };
+  } catch (e) {
+    return {
+      id: taskId, passed: false, turns: 0,
+      inputTokens: 0, outputTokens: 0, cacheReadTokens: 0, cacheWriteTokens: 0,
+      costUsd: 0, durationMs: Date.now() - t0,
+      error: e instanceof Error ? e.message : String(e),
+    };
+  } finally {
+    await rm(workDir, { recursive: true, force: true });
+  }
+}
+
+export async function runEval() {
+  const tasksRoot = new URL("./tasks/", import.meta.url).pathname;
+  const dirs = (await readdir(tasksRoot)).sort();
+  const results: TaskResult[] = [];
+
+  for (const d of dirs) {
+    process.stdout.write(`[${d}] `);
+    const r = await runOneTask(join(tasksRoot, d), d);
+    results.push(r);
+    process.stdout.write(`${r.passed ? "PASS" : "FAIL"}  ${r.turns}t  $${r.costUsd}\n`);
+  }
+
+  const passed = results.filter((r) => r.passed).length;
+  const cost = results.reduce((s, r) => s + r.costUsd, 0);
+  const cacheHitRate = results.reduce((s, r) => s + r.cacheReadTokens, 0) /
+    Math.max(1, results.reduce((s, r) => s + r.inputTokens, 0));
+
+  console.log(`\n=== ${passed}/${results.length} passed ===`);
+  console.log(`Mean turns: ${(results.reduce((s, r) => s + r.turns, 0) / results.length).toFixed(1)}`);
+  console.log(`Total cost: $${cost.toFixed(2)}`);
+  console.log(`Cache hit rate: ${(cacheHitRate * 100).toFixed(1)}%`);
+
+  return results;
+}
+```
+
+有五个点值得停下来看一眼：
+
+**用 `WORK_DIR` 环境变量，不用 `process.chdir`。**agent 的工具本来就已经尊重一个 base path。在一次并行批处理里改整个 Node 进程的 cwd 是那种我被自己坑过两回的地雷。
+
+**eval 里设 `MCC_AUTO_APPROVE=1`。**这是第 03 集那道确认门留下的开关。eval 不能停在 `y/N` 上。如果你不想 auto-approve，那就别把 `apply_patch` 放进 eval 模式的工具集 —— 但你几乎总是想放，因为 patch 才是最值得测的那根轴。
+
+**完整抓 `usage`。**`input_tokens`、`output_tokens`、`cache_read_input_tokens`、`cache_creation_input_tokens` —— 四个都要。这是你判断 prompt caching 到底有没有起作用的唯一办法。第一轮应该看到 `cache_creation`；之后每一轮都应该看到 `cache_read`。如果不是，那就是 cache breakpoint 放错位置了。
+
+**成本是算出来的，不是拍脑袋估的。**Sonnet 4.5 的定价直接写死进去。缓存读比新鲜读便宜 10 倍，比缓存写便宜 12.5 倍。一个 30 轮的任务里，这个差距滚起来非常快。
+
+**verify 脚本只给 30 秒，一秒都不多。**要是 `verify.sh` 卡住了，你会在第 3 个任务上发现，然后气到直接砍进程。给它加超时。
+
+## Prompt caching：真正重要的两件事
+
+两个 `cache_control: { type: "ephemeral" }` 标记，位置就精确地放在这里：
+
+1. 放在 `system` 的最后一个 text 块上。到这个块为止的所有内容都会被缓存。
+2. 放在 `tools` 数组的最后一个工具上。同一个道理 —— 到这个标记之前的整份工具列表都可缓存。
+
+就这么多。Anthropic 会缓存前缀。~5 分钟之内的每一轮后续请求都是读，不是写。
+
+有两件事会悄无声息地把你干掉：
+
+**你在两轮之间改动了 tools 数组。**任何结构性变化（新增工具、调整顺序、编辑描述）都会让缓存失效。让 tools 数组保持字面量、保持稳定。要动态工具，就拆出来，放到你的 cache breakpoint *之后*。
+
+**你的 system prompt 里带了个时间戳。**别笑，我自己干过。system 块里写 `"Current time: 2026-07-05T18:59:12Z"`，每一轮都会把缓存打爆。把易变数据挪到 user message 里去。
+
+## 第一份 baseline
+
+跑一次，把 `baseline.json` 提交上去：
+
+```json
+{
+  "timestamp": "2026-07-05T19:14:22Z",
+  "model": "claude-sonnet-4-5",
+  "commit": "abc12345",
+  "passed": 11,
+  "total": 15,
+  "meanTurns": 6.4,
+  "totalCostUsd": 0.87,
+  "cacheHitRate": 0.71,
+  "byTask": [
+    { "id": "01-add-null-check", "passed": true, "turns": 3, "costUsd": 0.031 },
+    { "id": "02-rename-function", "passed": true, "turns": 5, "costUsd": 0.048 },
+    { "id": "03-fix-off-by-one", "passed": true, "turns": 4, "costUsd": 0.041 },
+    { "id": "04-extract-helper", "passed": false, "turns": 30, "costUsd": 0.152 }
+  ]
+}
+```
+
+上面这些数字是我第一次真跑出来的结果 —— 11/15，平均 6.4 轮，总共 0.87 美元。任务 04 撞穿了轮数上限，因为 agent 一直反复重读文件而不是记住内容；第 04 集的 masking 有帮上忙，但这里还是一个软肋。
+
+以后我再改任何东西 —— system prompt、sub-agent budget、加一个新工具 —— 就跑一次 `mcc eval`，然后对比。通过率掉了，我就 revert。平均轮数涨了但通过率守住了，我就去看是*哪些*任务变慢了。这就是我从第 01 集起就应该拥有的那个回路。
+
+## 15 个任务大概长什么样
+
+一个诚实点的切分，大致是这样：
+
+- **6 个简单**（打一个 patch 让测试通过）—— agent 在这里应该接近 100%。如果不是，就是工具接线上有回归。
+- **6 个中等**（跨文件重命名、抽 helper、接一个新的 export）—— 这一档是 prompt / masking / sub-agent 设计真正显效的地方。
+- **3 个困难**（多文件重构、含糊的需求描述、没有测试套件）—— 这一档没人能拿满 3/3。3 中 2 就算好日子了。
+
+我故意把几个困难任务写得欠具体。真实用户就是会写得欠具体。一个只在措辞完美的 brief 上能干活的 agent 是没用的。
+
+## 我写这一集时踩过的坑
+
+**Cache breakpoint 放在了动态块后面。**第一版草稿我把 `cache_control` 打在 *system 消息字符串本身*上，同时又在最前面塞了一个当前日期。缓存命中零次，首轮成本和没缓存完全一样。把易变数据挪到 user 那一轮，或者放到 breakpoint 之下。
+
+**非 hermetic 的任务。**我草稿里的任务 07 依赖了一个全局装的 `jq`。同事机器上没装，任务永远失败，baseline 就是错的。`setup.sh` 必须自己安装它要用的所有东西，或者任务干脆别依赖它。要在一个干净的 shell 上本地验一遍。
+
+**verify.sh 返回假阳性。**任务 12 的 `verify.sh` 是 `grep -q pattern file`。文件不存在的时候，`grep` 也会退出 0，因为我在管道里某个地方接了 `|| true`。agent 没干任何事就"通过"了。把每一个 `|| true` 都删掉；让它炸响。
+
+**成本那一行撒了谎。**我最初把 `cache_read_input_tokens` 加到 `input_tokens` 上作为总 input 记账。Anthropic SDK 返回的是分开的两项 —— `input_tokens` *只*包含非缓存部分。看 SDK 类型定义，别凭记忆写。
+
+## 这一集发什么，不发什么
+
+发：这套 eval 架、这份 baseline、prompt caching、`mcc eval` 命令。
+
+第 06 集不发的：并行（任务并发跑）、瞬时错误重试、模型对比模式（同一批任务上跑 Sonnet vs Haiku）、web dashboard。每一个都是不错的周末项目。但没有一个位于"我能在不瞎飞的情况下迭代 prompt"这条关键路径上。
+
+## 整个系列一页纸
+
+六集，一个 agent，加起来大约 500 行 TypeScript：
+
+| 集 | 加了什么 | 涉及文件 |
+|---|---|---|
+| 01 | 40 行 REPL，带流式和历史 | `agent.ts` |
+| 02 | 三个工具 + tool-use 循环 | `agent.ts` |
+| 03 | `apply_patch`，带 dry-run 和确认 | `agent.ts`、`patch.ts` |
+| 04 | Observation masking + 自动续跑 | `agent.ts` |
+| 05 | 拥有独立上下文的 sub-agent | `agent.ts`、`subagent.ts` |
+| 06 | Eval 架 + prompt caching + baseline | `evals/runner.ts`、`evals/tasks/*` |
+
+如果你一路跟着造下来，你现在手上这个东西，看起来和用起来都很像一个小而有边界的代码 agent。它*不是* Claude Code —— Claude Code 有经年累月的打磨、几十个工具、一个真正的终端 UI、MCP、sandboxing，还有一整套被我一笔带过的权限模型。但它是一个正在运转的 agent，它的每一个设计决策你都理解，今晚就能改。
+
+你现在真正拥有的、最有用的东西不是这份代码，是这套 eval 架。从这里往后你造的每一件东西 —— 新工具、新的 sub-agent 形状、新的 masking 策略、换模型 —— 都得过第 06 集这一关，过不了就别发。
+
+## 速查表 —— 第 06 集
+
+| 是什么 | 在哪里 |
+|---|---|
+| runner 入口 | `evals/runner.ts` 里的 `runEval()` |
+| 任务结构 | `setup.sh` + `task.md` + `verify.sh` |
+| 轮数上限 | 30（困难任务得有喘息空间） |
+| 自动通过 | runner 设 `MCC_AUTO_APPROVE=1` |
+| Cache breakpoint | `system` 最后一个 text 块、`tools` 里最后一个工具 |
+| 记录的指标 | pass、轮数、in/out/cache-r/cache-w token、成本、毫秒 |
+| Baseline 位置 | `evals/baseline.json`，进 commit |
+| CLI 命令 | `mcc eval`（`runEval` 的薄封装） |
+
+**最小可用的带缓存请求：**
+
+```typescript
+await client.messages.create({
+  model: "claude-sonnet-4-5",
+  max_tokens: 4096,
+  system: [{ type: "text", text: SYSTEM, cache_control: { type: "ephemeral" } }],
+  tools: TOOLS.map((t, i) =>
+    i === TOOLS.length - 1 ? { ...t, cache_control: { type: "ephemeral" } } : t
+  ),
+  messages: history,
+});
+```
+
+**能活过这一季的七条规则：**
+1. 调任何东西之前，先钉一份 baseline。
+2. 15 个任务是能给出信号的最小数量。
+3. 要么 hermetic，要么就别做这个任务。
+4. `verify.sh` 必须响亮地失败；把每一个 `|| true` 都撕掉。
+5. Cache breakpoint 放在稳定前缀*之后*，别放在易变的块上。
+6. 四个 `usage` 字段全都要记；其它任何写法都是猜。
+7. 未来对 agent 的每一次改动，都得先过 eval 才能落地。
+
+这就是这一季的弧线。第一季在这里合上。这个 agent 小、诚实，而且从今晚起——第一次—— 可度量。你要往下扩展它，就把 eval 一起扩展。这是整套纪律的全部。
+
+多谢一路跟着造下来。

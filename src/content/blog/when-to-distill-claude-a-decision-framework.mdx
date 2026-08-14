@@ -1,0 +1,123 @@
+---
+title: "When to Distill Claude: A Decision Framework for Cost-Sensitive Teams"
+description: "A practitioner's guide to deciding when distilling Claude into a smaller model is worth it, when it isn't, and how to route between them in production."
+date: "2026-07-02"
+tags: ["claude", "distillation", "economics", "architecture"]
+readTime: "11 min"
+---
+
+Distillation has a marketing story and a real story. The marketing story is that you replace an expensive frontier model with a cheap 7B student and keep 95% of the quality. The real story is that most teams who try this discover the student is fine on the eval set, mediocre in production, and impossible to debug when it drifts. Distillation is a genuinely useful tool—but the decision of when to pull it out of the box deserves more care than it usually gets.
+
+This piece is a decision framework, not a tutorial. If you're weighing whether to distill Claude for a specific workload, these are the signals to look at, the economics to reason about, and the routing patterns that keep you from betting the product on a student model alone.
+
+## The false promise (why "replace Opus with 7B" is usually wrong)
+
+The pitch is seductive: your Claude bill is climbing, a small open model can be fine-tuned for a fraction of the cost, and inference on your own GPUs is essentially free once amortized. Swap them in, keep shipping.
+
+What actually happens is more subtle. The student model works well on the exact distribution you distilled from, then quietly fails on the long tail. Users ask something slightly out of scope, or phrase a familiar request in an unfamiliar way, and the student produces confident nonsense where Claude would have hedged, asked a clarifying question, or refused. You don't notice for weeks because your eval set was drawn from the same distribution as your training data.
+
+There's a second problem: capability collapse across dimensions you didn't measure. You distilled for "classify this ticket," and the student is great at classification. But somewhere in your pipeline, you were also relying on Claude's ability to write a coherent one-sentence summary of the ticket for the audit log. The student produces summaries that pass a smoke test and fail a careful read. Nobody notices until an auditor does.
+
+The third problem is that "cheap 7B student" is often more expensive than the API when you count honestly. GPU rental, ops time, the engineer-months to build and maintain the training pipeline, the retraining cycle every time your data distribution shifts—these costs are real and they front-load. You pay them whether or not the distilled model ends up in production.
+
+None of this means distillation is wrong. It means "replace Opus with 7B" is the wrong framing. The right framing is: which specific slice of my workload has the properties that make distillation actually pay off?
+
+## 5 signals your task is a good distillation candidate
+
+The tasks where distillation earns its keep share a family of properties. When you see most of these, the math starts to work.
+
+**1. The task is narrow.** Not "customer support," but "given a ticket, classify it into one of twelve categories and extract the affected product SKU." Narrow tasks have a bounded input distribution, a bounded output space, and few edge cases that require broad world knowledge. Claude's generality is wasted on them, which is exactly why a student can catch up.
+
+**2. The behavior is stable.** The task hasn't changed materially in six months and isn't scheduled to change. If your product manager is going to add three new categories next quarter, every change is a retraining cycle. Distillation rewards stability and punishes churn.
+
+**3. The volume is high.** You're making millions of calls a month, not thousands. Distillation has a fixed cost—teacher inference to build the dataset, training, evaluation, deployment—and a per-call savings. High volume amortizes the fixed cost; low volume doesn't.
+
+**4. The rationale is program-like.** The reasoning Claude does on this task looks like following a checklist or applying a set of rules, not synthesizing novel insight. Program-like rationales compress well into smaller models. Open-ended reasoning does not. If you can imagine writing the logic as a very long decision tree, you can probably distill it.
+
+**5. The outcome is verifiable.** You can tell, cheaply and automatically, whether the student's output is right. Structured outputs, extractive tasks, code that compiles and passes tests, classifications with ground truth—these are verifiable. "Did the model write a good response" is not, unless you have a separate verifier you trust.
+
+The strong case for distillation is when four or five of these are true. Two or three, and you're probably better off staying on Claude and optimizing something else—prompt length, caching, routing.
+
+## 5 signals it isn't
+
+The mirror image is equally important. These are the tasks where distillation looks tempting on paper and disappoints in production.
+
+**1. The task is broad or open-ended.** "Answer any customer question" or "write a helpful reply" pulls on general capability. Students trained on a specific distribution of examples will fail the moment reality drifts off that distribution, and reality always drifts.
+
+**2. The rationale requires world knowledge or judgment.** Anything where Claude is drawing on broad knowledge, weighing tradeoffs, or exercising taste is a bad distillation target. The teacher's outputs on these tasks aren't a function of the input alone; they're a function of the input plus the teacher's entire training. You can't compress that into a 7B model.
+
+**3. The distribution is drifting.** Your inputs change monthly—new products, new user behaviors, new terminology. Distilled models freeze at the moment you train them. If the frontier model adapts naturally to a shifting world and the student doesn't, you'll burn engineer-months on retraining just to stay level.
+
+**4. The cost of a subtle failure is high.** Distilled models fail differently than teachers. They tend to fail confidently, with plausible-sounding output that's wrong in ways a human reviewer might not catch. If a wrong answer is expensive—legal review, medical triage, financial recommendations—the tail risk of distillation is usually not worth the runtime savings.
+
+**5. You can't build a verifier.** Without an automatic way to check the student's output, you can't run continuous evals, can't build a router that falls back to Claude on low-confidence cases, and can't detect regressions. Distillation without a verifier is a blind bet.
+
+Notice the asymmetry: it takes multiple positive signals to justify distillation, and any single strong negative signal is often enough to kill it. That's the right ratio. Distillation is an optimization; optimizations should only be pursued when the case is clear.
+
+## The economics: teacher cost vs runtime savings
+
+The economic question is not "is inference on my student cheaper than the API?" It's "does the total cost of distillation, over the horizon I care about, beat the total cost of staying on the API?" That's a break-even calculation, and it's worth doing symbolically before you do it numerically.
+
+Let:
+
+- **N** = expected calls over the horizon
+- **c_t** = per-call cost of the teacher (Claude) at your prompt and completion sizes
+- **c_s** = per-call cost of the student, including amortized GPU and ops
+- **D** = one-time cost to build the distillation dataset (teacher inference to generate rationales, human review, tooling)
+- **T** = one-time cost to train the student (compute, engineering time)
+- **M** = ongoing maintenance cost per unit time (retraining cycles, monitoring, on-call)
+- **q** = quality gap, expressed as the fraction of student outputs that need to be re-routed to the teacher or human-reviewed
+- **c_r** = per-call cost of that fallback path (usually close to c_t, sometimes higher if humans are involved)
+
+Staying on the teacher costs roughly **N · c_t** over the horizon.
+
+Distilling and routing costs roughly **D + T + M + N · ((1 - q) · c_s + q · c_r)**.
+
+Distillation wins when:
+
+**N · c_t > D + T + M + N · ((1 - q) · c_s + q · c_r)**
+
+Rearranged, the per-call savings **(c_t - (1 - q) · c_s - q · c_r)** has to be large enough, over N calls, to pay back **D + T + M**.
+
+A few things fall out of this immediately. Volume matters quadratically in practice, because higher N both amortizes the fixed cost and makes the savings visible. Quality gap matters more than people expect—if q is 20%, and c_r is close to c_t, you've eaten most of your savings on the fallback path alone. And maintenance is not optional; if you don't budget for M, you'll pay for it in incidents.
+
+Don't put fake numbers on this. The point of the formula is to force you to estimate each term honestly. Most teams who run through it discover that either N is too small, q is too high, or M was ignored, and the break-even horizon is longer than the lifetime of the feature.
+
+When the formula does work out, it usually works out overwhelmingly—the savings are 5x or 10x, not 20%. If your estimate is that distillation saves 15%, you probably haven't accounted for something and the real answer is negative.
+
+## 3 routing patterns
+
+Even when distillation makes sense, deploying the student alone is rarely the right architecture. The interesting question is how to route between the student, the teacher, and other components. Three patterns cover most production setups.
+
+### Cascade
+
+Every call goes to the student first. If the student's output passes a confidence threshold—a logit-based score, a verifier's check, an out-of-distribution signal—you return it. If it doesn't, you fall back to the teacher.
+
+This is the workhorse pattern. It captures most of the runtime savings on the high-confidence majority of traffic while preserving teacher quality on the tail. The engineering complexity is moderate: you need a real confidence signal (not just the model's self-reported certainty, which is often useless), and you need to monitor the fallback rate as a leading indicator of drift.
+
+Cascade fails when your confidence signal is bad. If the student is confidently wrong, the cascade lets those failures through. Invest in the signal, not just the student.
+
+### Distill + verify
+
+The student produces an output, and a separate verifier—sometimes the teacher, sometimes a small rules engine, sometimes a second distilled model—checks it. If verification fails, you retry with the teacher or escalate.
+
+This pattern shines when the verifier is much cheaper than the teacher and much more reliable than the student's self-reported confidence. Extractive tasks (did the model pull the right field?), structured outputs (does this JSON validate?), and code (does it compile and pass tests?) are natural fits, because verification is nearly free and nearly perfect.
+
+The trap is when the "verifier" is really just another model that has the same blind spots as the student. Then you've added latency without adding safety.
+
+### Ensemble
+
+Both the student and the teacher run in parallel; you combine or arbitrate their outputs. Sometimes you use the student for a first-pass, cheap answer and the teacher for the authoritative one, returned in a second stream. Sometimes you weight votes.
+
+Ensembles are the least common pattern in cost-sensitive setups because they usually cost more than the teacher alone. Where they earn their keep is in latency-critical paths: the student's answer streams to the user immediately while the teacher's answer completes in the background and overrides if it disagrees. That's a UX win, not a cost win.
+
+Most teams should reach for cascade first, add a verifier when they have one, and only build ensembles when there's a specific latency requirement they can't meet another way.
+
+## The right question
+
+The right question is not "should we distill Claude?" It's "which slice of our workload has the properties—narrow, stable, high-volume, program-like, verifiable—that make distillation genuinely worth the ongoing cost?" For most teams, the answer is "one or two slices, not the whole product." Those slices are worth pursuing carefully. The rest belongs on the teacher.
+
+If you're convinced you have a good candidate, the next questions are practical: how do you build a rationale dataset that actually teaches the student what Claude knows, and how do you keep the distillation focused on explanation rather than mimicry? Those are separate posts.
+
+- [Focused distillation from explanations, for builders](/blog/focused-distillation-from-explanations-for-builders)
+- [Building a rationale dataset with Claude](/blog/building-a-rationale-dataset-with-claude)

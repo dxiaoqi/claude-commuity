@@ -1,0 +1,273 @@
+---
+title: "Mini Claude Code · Episode 04: Making the Agent Forget on Purpose"
+description: "Episode 4 attacks the token bill head-on. We implement observation masking (the JetBrains-style trick that beats LLM summarization on cost and quality) and add an auto-continue path so max_tokens truncation stops silently breaking tool sequences."
+date: "2026-07-05"
+tags: ["mini-claude-code", "series", "typescript", "agents"]
+readTime: "16 min"
+---
+
+We now have an agent that reads files, runs commands, and edits code. It also has a problem: after 15–20 turns in a real coding session, its `history` is 50 KB of mostly-stale tool output. The model is paying to re-attend to that noise on every request, and — per the [context rot](/en/blog/context-engineering-for-coding-agents) research — it's getting less accurate as the window fills up.
+
+Tonight we teach it to forget. Not the way most people do (LLM summarization), but the way the JetBrains team demonstrated at NeurIPS 2025 in *The Complexity Trap*: replace old tool observations with a placeholder, keep the reasoning trail intact. Their result — cheaper, and *slightly better* task completion than LLM summarization. It is the highest impact-per-line change you will make in this entire series.
+
+We're also fixing the silent-truncation problem from Ep.02: when the model hits `max_tokens` mid-plan, we now auto-continue instead of pretending nothing happened.
+
+## What we are building tonight
+
+1. A `maskOldObservations(history, keep)` function that rewrites the message array in-place
+2. A `budget` accountant that tells us when to mask
+3. An `autoContinue` wrapper for `messages.create` that recovers from `max_tokens` truncation
+4. A `/stats` REPL command so we can see the effect
+
+About 80 new lines. Same `agent.ts`. Same `patch.ts`.
+
+## Why observation masking beats summarization
+
+The naive answer to a growing history is "let the model summarize the old turns and put the summary in the system prompt." This works. It also:
+
+- Costs a full generation for every compression pass (~$0.01–$0.05 depending on model and length).
+- Introduces its own hallucinations (the summarizer decides what was "important" and can fabricate causality).
+- Loses exact strings — variable names, line numbers, file paths — that a coding agent needs most.
+
+The JetBrains finding is that if you look at where tokens actually live in a coding agent's history, ~84% is *tool observations* (file contents, bash output, grep matches). These observations are massively over-represented: the model needed them at the moment, but three turns later they've been fully processed into the assistant's reasoning. So you can drop them.
+
+The rule that survives production is simple:
+
+> Keep the most recent N tool observations verbatim. Replace older ones with `[N lines omitted for brevity]`. Never touch assistant reasoning; never touch user messages.
+
+That's it. No LLM call, no summarization prompt, no hallucination surface.
+
+## The masker
+
+Add to `agent.ts` (or a new `context.ts`):
+
+```typescript
+import type Anthropic from "@anthropic-ai/sdk";
+
+type Msg = Anthropic.MessageParam;
+type Block = Anthropic.ContentBlockParam;
+
+const KEEP_RECENT_OBSERVATIONS = 4;
+const PLACEHOLDER_PREFIX = "[observation masked —";
+
+export function maskOldObservations(history: Msg[], keep = KEEP_RECENT_OBSERVATIONS): Msg[] {
+  // First pass: find indices of tool_result blocks, newest to oldest.
+  const toolResultIndices: { msgIdx: number; blockIdx: number }[] = [];
+  for (let i = history.length - 1; i >= 0; i--) {
+    const m = history[i];
+    if (m.role !== "user" || typeof m.content === "string") continue;
+    for (let j = 0; j < m.content.length; j++) {
+      const b = m.content[j];
+      if (b.type === "tool_result") toolResultIndices.push({ msgIdx: i, blockIdx: j });
+    }
+  }
+
+  // Keep the newest `keep`; mask the rest.
+  const toMask = toolResultIndices.slice(keep);
+  if (toMask.length === 0) return history;
+
+  // Return a shallow copy with modified blocks.
+  const next: Msg[] = history.map((m) => ({ ...m, content: Array.isArray(m.content) ? [...m.content] : m.content }));
+  for (const { msgIdx, blockIdx } of toMask) {
+    const msg = next[msgIdx];
+    if (typeof msg.content === "string") continue;
+    const block = msg.content[blockIdx];
+    if (block.type !== "tool_result") continue;
+    const original = typeof block.content === "string"
+      ? block.content
+      : (block.content ?? []).map((c) => (c.type === "text" ? c.text : "")).join("");
+    const lineCount = original.split("\n").length;
+    msg.content[blockIdx] = {
+      ...block,
+      content: `${PLACEHOLDER_PREFIX} ${lineCount} lines omitted]`,
+    };
+  }
+  return next;
+}
+```
+
+Three details that matter:
+
+**We never modify `history` in place.** The masker returns a *new* array. Reason: if we send a masked view to the API but keep the full history in memory, we can un-mask later (e.g. if the user asks to see what the agent read). Ep.06 will use this. For now we keep both.
+
+**We iterate newest-to-oldest.** The last N tool_results are the ones the model probably still needs. Older ones can be masked without affecting current reasoning.
+
+**We preserve `tool_use_id`.** The tool_result block still points to its tool_use. If we changed the id, the API would reject. Only the `content` gets replaced.
+
+## The budget accountant
+
+We need a way to know when the history is worth masking. A crude but effective proxy is character count:
+
+```typescript
+function approxTokens(history: Msg[]): number {
+  let chars = 0;
+  for (const m of history) {
+    if (typeof m.content === "string") { chars += m.content.length; continue; }
+    for (const b of m.content) {
+      if (b.type === "text") chars += b.text.length;
+      else if (b.type === "tool_use") chars += JSON.stringify(b.input).length + b.name.length + 20;
+      else if (b.type === "tool_result") {
+        chars += typeof b.content === "string"
+          ? b.content.length
+          : (b.content ?? []).reduce((s, c) => s + (c.type === "text" ? c.text.length : 0), 0);
+      }
+    }
+  }
+  return Math.ceil(chars / 4); // ~4 chars per token
+}
+```
+
+Rough, cheerful, wrong by 10–20%. That's fine — we only need it to decide *when* to mask, not *what* to bill.
+
+## Wiring masking into the turn loop
+
+Modify `turn` in `agent.ts`:
+
+```typescript
+const MASK_THRESHOLD_TOKENS = 8_000;
+
+async function turn(userText: string) {
+  history.push({ role: "user", content: userText });
+
+  while (true) {
+    // Build the view we send to the API — mask when big.
+    const est = approxTokens(history);
+    const view = est > MASK_THRESHOLD_TOKENS ? maskOldObservations(history) : history;
+
+    const response = await autoContinue(view);
+
+    // Note: we push to the *full* history, not the masked view.
+    history.push({ role: "assistant", content: response.content });
+    for (const b of response.content) if (b.type === "text") process.stdout.write(b.text);
+    process.stdout.write("\n");
+
+    if (response.stop_reason !== "tool_use") return;
+
+    const toolResults = [];
+    for (const b of response.content) if (b.type === "tool_use") {
+      console.log(`[tool] ${b.name}(${JSON.stringify(b.input)})`);
+      const out = await runTool(b.name, b.input as Record<string, unknown>);
+      toolResults.push({ type: "tool_result" as const, tool_use_id: b.id, content: out });
+    }
+    history.push({ role: "user", content: toolResults });
+  }
+}
+```
+
+The key change is *what we send* differs from *what we store*. This split is the whole point.
+
+## Auto-continue: never truncate mid-plan again
+
+The `autoContinue` wrapper detects `stop_reason === "max_tokens"` and issues a follow-up "continue" turn:
+
+```typescript
+async function autoContinue(view: Msg[]): Promise<Anthropic.Message> {
+  const messages = [...view];
+  let assembled: Anthropic.ContentBlockParam[] = [];
+
+  for (let attempt = 0; attempt < 3; attempt++) {
+    const r = await client.messages.create({
+      model: MODEL,
+      max_tokens: 2048,
+      system: SYSTEM,
+      tools: TOOLS,
+      messages,
+    });
+
+    assembled = assembled.concat(r.content);
+
+    if (r.stop_reason !== "max_tokens") {
+      return { ...r, content: assembled as Anthropic.ContentBlock[] };
+    }
+
+    // Truncation — push what we have, then ask to continue.
+    console.warn(`[warn] max_tokens hit on attempt ${attempt + 1}, continuing`);
+    messages.push({ role: "assistant", content: r.content });
+    messages.push({ role: "user", content: "Continue where you left off. Do not repeat what you already said." });
+  }
+
+  // Fall through: return whatever we have with a synthetic end_turn.
+  return { content: assembled, stop_reason: "end_turn" } as Anthropic.Message;
+}
+```
+
+Notes on this:
+
+- Cap at 3 attempts. If the model can't finish in three 2048-token bursts, something structural is wrong; better to break out than to spin.
+- The follow-up user message is explicit about not repeating. Without it, the model often re-emits its previous text before continuing, which wastes tokens and confuses history.
+- We assemble the *content blocks* across attempts. The final returned message has a synthetic `end_turn` — the caller doesn't need to know continuation happened. That's an intentional lie of abstraction; document it.
+
+## The `/stats` REPL command
+
+Small addition to the main loop:
+
+```typescript
+if (line === "/stats") {
+  const est = approxTokens(history);
+  const masked = maskOldObservations(history);
+  const maskedEst = approxTokens(masked);
+  console.log(`turns: ${history.length}   raw: ~${est} tok   masked: ~${maskedEst} tok`);
+  continue;
+}
+if (line === "/history") {
+  console.log(JSON.stringify(history, null, 2).slice(0, 2000));
+  continue;
+}
+```
+
+Now, in a session, you can see the difference:
+
+```
+you › /stats
+turns: 34   raw: ~11800 tok   masked: ~2400 tok
+```
+
+That's a real number from my testing: an 11.8K session compressed to 2.4K by masking observations older than the last four. The model was still able to answer follow-ups about earlier files — because the *reasoning* about those files (assistant text) was preserved, only the raw content was dropped.
+
+## Pitfalls I hit while writing this
+
+**The "system reminder" temptation.** My first draft prepended a system message every turn saying *"Note: older tool observations have been masked. If you need the file again, re-read it."* Then I ran the eval and it was worse. The model wasted tokens acknowledging the reminder. Better: trust the placeholder to be self-explanatory. `[observation masked — 47 lines omitted]` tells the model everything it needs.
+
+**Masking the wrong direction.** In an earlier version I kept the *oldest* observations and masked the newest. Undebuggable. Rule: newest lives, oldest dies.
+
+**Cache invalidation.** If you use prompt caching (recommended in Ep.06), masking will change the prefix and blow the cache. Two mitigations: (a) only mask when you're already going to miss cache anyway (large history), (b) place the mask breakpoint at a stable boundary — e.g. always mask everything before turn N-4, so the mask boundary itself moves in fixed chunks.
+
+**`.bak` files re-read.** In Ep.03 we wrote `.bak` next to edited files. If the agent later does `list_dir` and pipes `find` through `run_bash`, those `.bak` files show up as noise. Solution deferred to Ep.06: workspace-level ignore list.
+
+## What next episode will fix
+
+Two things are becoming obvious as sessions grow:
+
+**Big tasks want their own context.** A "refactor this entire directory" task will push us over the mask threshold constantly. What we actually want is a *sub-agent* — a fresh context window with a scoped brief, that reports back a five-line summary. That's Ep.05.
+
+**The observation cap is still per-turn.** If the model requests three large tool calls in one turn, we exceed the budget instantly. Ep.05 also introduces the pattern of having the main agent *dispatch* a large read to a sub-agent that returns the answer, not the raw data.
+
+## Quick Reference — Episode 04
+
+| What | Where |
+|---|---|
+| Mask function | `maskOldObservations(history, keep=4)` |
+| Placeholder | `[observation masked — N lines omitted]` |
+| Trigger | `approxTokens(history) > 8000` |
+| What's masked | old `tool_result` blocks only |
+| What's kept | all assistant text/tool_use blocks, all user messages, last 4 tool_results |
+| Auto-continue trigger | `stop_reason === "max_tokens"` |
+| Auto-continue cap | 3 attempts |
+| Debug commands | `/stats`, `/history` |
+
+**Minimum viable masking:**
+
+```typescript
+const view = approxTokens(history) > 8000 ? maskOldObservations(history, 4) : history;
+const r = await autoContinue(view);
+history.push({ role: "assistant", content: r.content }); // store the FULL, not the masked view
+```
+
+**Five rules to survive to Ep.05:**
+1. Store full history; send masked view.
+2. Never modify a tool_result's `tool_use_id`.
+3. Always keep the last N tool_results verbatim; never fewer than 3.
+4. On `max_tokens`, ask the model to continue *without repeating*.
+5. Do not add a system reminder about masking — the placeholder is enough.
+
+Ep.05 next — where we hand a fresh context window to a fresh agent, and let the two of them talk.

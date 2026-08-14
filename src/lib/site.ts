@@ -4,7 +4,8 @@ export const siteConfig = {
   url: process.env.NEXT_PUBLIC_SITE_URL || "https://www.claudecommunity.com",
   description:
     "Independent field notes, practical workflows, and sharp tools for people building with Claude and Claude Code.",
-  email: "hello@claudecommunity.com",
+  email: "maojin52@gmail.com",
+  githubMcc: "https://github.com/claude-community/mini-claude-code",
 } as const;
 
 export function absoluteUrl(path = "/") {

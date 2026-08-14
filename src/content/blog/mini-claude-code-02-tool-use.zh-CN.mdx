@@ -1,0 +1,243 @@
+---
+title: "Mini Claude Code · 第 02 集：教 Agent 使用工具"
+description: "第 2 集给我们的 REPL 装上前三个工具——read_file、list_dir、run_bash——并完整走一遍 Anthropic SDK 的 tool use 循环。我们会处理 stop_reason、tool 错误，以及那件出人意料棘手的事：到底该把什么塞回对话里。"
+date: "2026-07-04"
+tags: ["mini-claude-code", "series", "typescript", "agents"]
+readTime: "16 min"
+---
+
+上周我们搭了一个能和 Claude 聊天、能记住上一轮的 REPL。挺不错，但对写代码来说毫无用处——Agent 看不到你的项目。这一集我们就来补上这个短板。今晚结束时，我们的 Agent 就能列目录、读文件、跑 shell 命令了，而且全都在 Claude 的控制之下。
+
+如果你只想从这一集里拿走一件事，那就是这句：**tool use 并不是模型的某种特殊模式，它只是我们围绕模型搭出来的一个具体循环**。SDK 并不会"运行"你的工具，它只是告诉你 Claude 想跑什么；由我们去执行，再由我们把结果报回去。把这个循环写对，Agent 就完成了 80%。
+
+## 今晚要做的事
+
+在第 01 集的 `agent.ts` 基础上扩展：
+
+1. 三个 tool 定义：`read_file`、`list_dir`、`run_bash`
+2. 一个 tool 执行路由器
+3. 一个 while 循环，只要模型还在要求调用工具就不停地对话
+4. 妥当处理 `stop_reason`（不再有静默截断）
+
+同一个文件，体积大致翻倍——大概 100 行左右。
+
+## 一段话讲清 tool use 循环
+
+发送消息 → 模型回一个最终答案 *或* 一到多个 `tool_use` content block → 我们执行每个工具 → 我们把结果以 `tool_result` block 的形式，装进一条新的 user 消息发回去 → 模型再回复 → 一直重复，直到模型返回 `stop_reason: "end_turn"`。就这样。你在任何 Agent 框架里见过的花活儿，都是挂在这条主干循环上的铃铛。
+
+## 定义这三个工具
+
+在 `agent.ts` 顶部加上：
+
+```typescript
+import fs from "node:fs/promises";
+import path from "node:path";
+import { execFile } from "node:child_process";
+import { promisify } from "node:util";
+
+const execFileP = promisify(execFile);
+const CWD = process.cwd();
+
+const TOOLS = [
+  {
+    name: "read_file",
+    description: "Read a UTF-8 text file from the workspace. Path is relative to the workspace root.",
+    input_schema: {
+      type: "object",
+      properties: { path: { type: "string" } },
+      required: ["path"],
+    },
+  },
+  {
+    name: "list_dir",
+    description: "List entries in a directory relative to the workspace root. Returns one entry per line, directories suffixed with '/'.",
+    input_schema: {
+      type: "object",
+      properties: { path: { type: "string", default: "." } },
+      required: [],
+    },
+  },
+  {
+    name: "run_bash",
+    description: "Run a short shell command in the workspace. Use for grep, find, git status, npm test, etc. Do NOT use for long-running processes.",
+    input_schema: {
+      type: "object",
+      properties: { command: { type: "string" } },
+      required: ["command"],
+    },
+  },
+] as const;
+```
+
+有两个决策值得单独拎出来说：
+
+**只接受相对路径。** 这几个工具会拒绝绝对路径。真实的 Claude Code 里你会做一套正经的 sandbox；对我们来说，一个 `path.resolve(CWD, p)` 加上一次 `startsWith(CWD)` 检查，就够挡住 Agent 在学习阶段乱逛到 `/etc/passwd` 里去了。sandbox 严不严格，取决于你打算让多少人跑你的 Agent。
+
+**`run_bash` 用的是 `execFile`，最初我特意避开了 `shell: true`，后来又把它打开了。** 对一个 demo Agent 来说，shell 语义（管道、通配符）比最后那 5% 的安全性更要紧。allow-list 我们留到后面某一集再加。
+
+## Tool 执行器
+
+```typescript
+async function safeResolve(p: string): Promise<string> {
+  if (path.isAbsolute(p)) throw new Error("absolute paths not allowed");
+  const resolved = path.resolve(CWD, p);
+  if (!resolved.startsWith(CWD)) throw new Error("path escapes workspace");
+  return resolved;
+}
+
+async function runTool(name: string, input: Record<string, unknown>): Promise<string> {
+  try {
+    if (name === "read_file") {
+      const p = await safeResolve(String(input.path));
+      const buf = await fs.readFile(p, "utf-8");
+      return buf.length > 20_000 ? buf.slice(0, 20_000) + "\n…[truncated]" : buf;
+    }
+    if (name === "list_dir") {
+      const p = await safeResolve(String(input.path ?? "."));
+      const entries = await fs.readdir(p, { withFileTypes: true });
+      return entries.map((e) => (e.isDirectory() ? e.name + "/" : e.name)).join("\n");
+    }
+    if (name === "run_bash") {
+      const cmd = String(input.command);
+      const { stdout, stderr } = await execFileP("bash", ["-c", cmd], { cwd: CWD, timeout: 15_000, maxBuffer: 200_000 });
+      return (stdout + (stderr ? "\n[stderr]\n" + stderr : "")).slice(0, 20_000) || "(empty)";
+    }
+    return `Unknown tool: ${name}`;
+  } catch (e: unknown) {
+    const msg = e instanceof Error ? e.message : String(e);
+    return `TOOL_ERROR: ${msg}`;
+  }
+}
+```
+
+三个细节：
+
+- **所有 tool 错误都以字符串形式返回，绝不抛出。** 模型得看到错误，才能推理下一步怎么走。抛异常会把整个循环干掉。
+- **每一份输出都在 20 KB 处截断。** 过长的 tool 输出是 context 炸掉的头号元凶。参见 [context engineering](/blog/context-engineering-for-coding-agents)——一个 Agent 的一轮里，84% 常常是 tool 观测。要在源头截断。
+- **bash 设了 15 秒超时和 200 KB stdout 上限。** 这些数字看起来就该像是随手拍脑袋定的——它们本来就是。它们的作用是挡住一眼能看到的雷，不是在所有场景下都要求"正确"。
+
+## Tool use 循环，替换掉之前的 `turn`
+
+```typescript
+async function turn(userText: string) {
+  history.push({ role: "user", content: userText });
+
+  while (true) {
+    const response = await client.messages.create({
+      model: MODEL,
+      max_tokens: 2048,
+      system: SYSTEM,
+      tools: TOOLS,
+      messages: history,
+    });
+
+    // Push the raw content blocks back — Claude expects them exactly.
+    history.push({ role: "assistant", content: response.content });
+
+    // Print any text blocks for the user.
+    for (const block of response.content) {
+      if (block.type === "text") process.stdout.write(block.text);
+    }
+    process.stdout.write("\n");
+
+    if (response.stop_reason !== "tool_use") {
+      if (response.stop_reason === "max_tokens") {
+        console.warn("[warn] response truncated — consider asking Claude to continue or raising max_tokens");
+      }
+      return;
+    }
+
+    // Execute every tool_use block and collect tool_result blocks.
+    const toolResults = [];
+    for (const block of response.content) {
+      if (block.type === "tool_use") {
+        console.log(`\n[tool] ${block.name}(${JSON.stringify(block.input)})`);
+        const result = await runTool(block.name, block.input as Record<string, unknown>);
+        console.log(`[tool] → ${result.slice(0, 200)}${result.length > 200 ? "…" : ""}\n`);
+        toolResults.push({
+          type: "tool_result" as const,
+          tool_use_id: block.id,
+          content: result,
+        });
+      }
+    }
+    history.push({ role: "user", content: toolResults });
+    // Loop continues — Claude gets to react to the tool results.
+  }
+}
+```
+
+注意这一集我把 `messages.stream` 换成了 `messages.create`。流式的 tool 调用也能跑通，但增量拼装 content block 挺磨人的，而且和今晚要讲的主题不在一条线上。等到第 05 集延迟真正开始要紧了，我们再回来聊 streaming。
+
+## 一次真实对话长这样
+
+在某个项目目录里把它跑起来：
+
+```
+you › what test frameworks does this project use?
+[tool] read_file({"path":"package.json"})
+[tool] → {"name":"my-app","scripts":{"test":"vitest run"},"devDependencies":{"vitest":"^1.3…
+cc  › This project uses Vitest. The test script runs `vitest run`, and Vitest 1.3+ is listed in devDependencies.
+```
+
+两次调用、一个工具、一个最终答案。再看它需要到处翻一翻的时候：
+
+```
+you › does this project have any TODO comments?
+[tool] run_bash({"command":"grep -rn 'TODO' src --include='*.ts' | head -20"})
+[tool] → src/lib/blog.ts:47: // TODO: cache getAllPosts result…
+cc  › Yes — 4 TODOs in src/lib/blog.ts and 1 in src/app/api/upload/route.ts. Want the specifics?
+```
+
+模型自己选对了工具，没人告诉它该用哪个。这就是全部的回报。
+
+## 我写这段代码时踩过的坑
+
+**忘了把 `response.content` 原封不动地塞回 history。** 我在下一条 user 消息里发的 tool_result block，是通过 `tool_use_id` *引用* assistant 上一条消息里的 block 的。如果我把 assistant 的 tool_use block 剥掉（比如只把 text 部分塞回去），API 就会用一个"tool_result without matching tool_use"的错误拒掉下一次请求。修法：`response.content` 原样 push 回去，让 SDK 的类型帮你扛住。
+
+**死循环。** 我第一版忘了写 `if (response.stop_reason !== "tool_use") return;` 这道守卫。模型跑完了，给了一段文字答案，`stop_reason` 是 `"end_turn"`，但我的循环还在跑，把同一段 history 又送回去重新生成。我按下 Ctrl+C 之前，账上已经烧掉大约 $0.20 了。上到生产之前记得加一个硬上限——比方说每次用户 turn 最多 20 次迭代。
+
+**Tool 输出把 context 撑爆。** 我第一次让它在一个大仓库里跑 `find .`，tool_result 差不多 800 KB 的路径。context 直接耗尽，下一次请求就报错。修法：在源头截断（就是上面那 20 KB 上限）。别指望模型会"自动忽略"过长的 tool 输出。
+
+**`max_tokens` 静默截断。** 第 01 集里，我们的 REPL 就把这一轮结束了。现在模型可能是在做计划做到一半时被截断，静默截断意味着 tool 调用序列会被拦腰打断。上面那句 `console.warn` 只是个占位；到第 06 集我们会加一个自动"继续"的 prompt。
+
+## 下一集要修的东西
+
+现在这个 Agent 能*读*你的项目，但还不能*改*你的项目。这就是下一项能力——也正是刺激开始的地方，因为让 LLM 改文件，是生产环境里 Agent 大部分翻车事故的所在。第 03 集会加上第四个工具 `apply_patch`，它接收 unified diff，先做校验，再空跑一遍，只有在这之后才真正写盘。我们还会引入"破坏性操作前先确认"这个套路——每一次编辑，在终端里都要先给出一份预览。
+
+也留意一下今晚代码里一个不太显眼的细节：`history` 会随着 tool 输出线性增长。一次 10 轮的会话，只要有几次 `run_bash` 调用，history 轻轻松松就上 30 KB。现在没关系；到第 04 集就会变成问题，而那一集专门讲怎么把 context 再压回去。
+
+## 速查表 · 第 02 集
+
+| 是什么 | 在哪里 |
+|---|---|
+| 声明的工具 | `read_file`、`list_dir`、`run_bash` |
+| 需要继续循环的 stop reason | `stop_reason === "tool_use"` |
+| 需要给出警告的 stop reason | `stop_reason === "max_tokens"` |
+| 塞回 assistant 内容 | `response.content` 原封不动，不能只塞 text |
+| 塞回 tool 结果 | 一条新的 user 消息，装若干 `type: "tool_result"` block |
+| 截断 tool 输出 | 在执行器里硬砍到 20 KB |
+| Bash 的安全兜底 | `execFile` 加 `timeout`、`maxBuffer`，再加相对路径校验 |
+
+**最小可用的 tool use 一轮：**
+
+```typescript
+while (true) {
+  const r = await client.messages.create({ model, system, tools, messages: history, max_tokens: 2048 });
+  history.push({ role: "assistant", content: r.content });
+  if (r.stop_reason !== "tool_use") return;
+  const results = [];
+  for (const b of r.content) if (b.type === "tool_use") {
+    results.push({ type: "tool_result", tool_use_id: b.id, content: await runTool(b.name, b.input) });
+  }
+  history.push({ role: "user", content: results });
+}
+```
+
+**活到第 03 集的四条铁律：**
+1. 永远不要在 tool 里抛异常——把错误当字符串返回。
+2. 永远不要相信 tool 输出的长度——在源头就截断。
+3. 永远不要在发 tool_result 之前，把 history 里的 `tool_use` block 剥掉。
+4. 永远不要让这个循环没有迭代上限就跑起来。
+
+第 03 集下周见——那一集我们终于让 Claude *改*文件，还不至于把你的 git 历史毁掉。

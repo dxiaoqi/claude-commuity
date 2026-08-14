@@ -1,0 +1,127 @@
+---
+title: "写给编码 Agent 的上下文工程：2025–2026 前沿研究深读"
+description: "一名工程师视角对上下文工程前沿工作的整理——context rot、lost-in-the-middle、子 Agent 隔离、prompt caching，以及那些真正能扛住生产环境的模式。"
+date: "2026-07-03"
+tags: ["research", "context-engineering", "claude", "agents"]
+readTime: "18 min"
+---
+
+只要你在用 Claude Code、Cursor、Devin 或者任何一款会连续跑上好几轮的编码 Agent，最关键的那个变量其实不是底模，而是*每一步实际塞进上下文窗口里的东西*。2025–2026 年的前沿研究已经悄悄把重心挪到了这一点上。这篇文章是我对这些论文的一次整理——重要的论文、它们记录下来的失效模式，以及在生产环境里真正活下来的那些模式。
+
+我不会在这里堆基准数字。基准数字会过时，但*论证的形状*不会。读完这篇文章，你应该能在脑子里建立一个模型：为什么长上下文会坏掉，以及一份下周一就能上手用的上下文塑形招式清单。
+
+## 一个撑起后面所有内容的核心结论
+
+2025 年 7 月，Chroma Research 发了一份技术报告，标题是 [*Context Rot: How Increasing Input Tokens Impacts LLM Performance*](https://research.trychroma.com/context-rot)。报告在 18 款前沿 LLM 上做了评估——Claude 4、GPT-4.1、Gemini 2.5、Qwen3——刻意固定任务本身，只改变输入长度。结论：*每一款模型都会随上下文变长而退化*，而且往往是在同一个模型在短上下文下能完美搞定的任务上。不是某些模型，不是大多数，而是十八款全部。
+
+这就是后面所有内容的经验锚点。一个 200K token 的窗口，并不意味着 200K token 全部可用；一个百万 token 的窗口，也并不意味着一百万 token 全部可用。容量和*可用容量*会分叉，而且这个分叉早在标称上限之前就已经能测出来了。2025 年底到 2026 年初的独立复现，已经在更新的模型和更大的窗口上确认了同一模式。
+
+对编码 Agent 来说，这件事比对 Chat 更要命，因为编码 Agent 攒上下文特别凶：读的每个文件、每一次工具返回、每一条失败测试、每一段 diff。一段稍微长一点的会话就能轻松冲到 100K–500K token，哪怕最终答案压根用不到那么多。所以真正实用的问题不是"窗口有多大"，而是"随着会话越拉越长，我怎么把*信噪比*维持住"。
+
+## 长上下文为什么会坏：三条互相叠加的机制
+
+文献里收敛出三条机制，每一条都有自己的论文脉络。
+
+**注意力稀释（Attention dilution）。** self-attention 的打分是一个概率分布——加起来等于一。10K token 的时候，每个 token 平均能分到一份还算像样的预算；到了 1M token，每个 token 只能分到百万分之一。噪声底噪随长度一起涨，即便信号没涨。这就是 context rot 背后的机制故事，也是为什么"模型好像没注意到"某条重要的早前指令，不是幻觉，而是根本上的注意力预算问题。
+
+**Lost in the middle。** [Liu 等人 2023 年的论文 *Lost in the Middle: How Language Models Use Long Contexts*](http://cs.stanford.edu/~nfliu/papers/lost-in-the-middle.arxiv2023.pdf) 已经确立：模型能可靠地从上下文开头和结尾里取信息，但从中间取的时候表现很差。性能曲线是 U 形的。2026 年的一篇新论文 [*Lost in the Middle at Birth: An Exact Theory of Transformer Position Bias*](https://arxiv.org/html/2603.10123) 进一步证明：这个 U 形是带残差连接的因果 mask 结构本身固有的——它在模型初始化时就已经存在了，早于任何训练、早于 RoPE 编码生效。换句话说：这不是一个能靠继续 scale 修好的 bug，而是这套架构的拓扑属性。
+
+**干扰项干扰（Distractor interference）。** Chroma 的报告以及后续工作显示，加入*语义上相近*的干扰项——那些看起来像但其实不是的内容——会以非线性的方式拖垮性能。四个相似干扰项造成的伤害，远超单个干扰项的四倍。反直觉的地方在于：结构良好、连贯清晰的文档，比乱序拼起来的还要*更糟*，因为它的连贯性给出了一条条看起来煞有介事的错误路径。对编码 Agent 来说，这条机制才是最危险的：你的代码库里到处是近似重复的东西（相似的 helper、同一个函数的多个版本、废弃的旧变体），它们会在模型注意力上盖过真正正确的那块。
+
+## 每个人都会先试的天真答案：更大的窗口
+
+每一代新模型出来都带着更大的窗口。Gemini 2.5 给了 1M token，Llama 4 宣布 10M。天真的思路是：都塞进去，让模型自己去挑。这种做法不行，而且原因现在已经很清楚了。2025 年底测过的每一款前沿模型，在困难任务上的检索准确率，从 256K 到 1M 之间都会出现明显下滑。Claude Opus 在长距离召回上表现最好；即便如此，从 256K 到 1M，它在更难基准上的准确率也跌了两位数百分点。GPT 和 Gemini 掉得更多。
+
+要说的不是大窗口没用。它在你*真正需要*的时候极其有用——一次性的长文档分析、一次难得的评测、一个研究原型。但当你拿它来替代工程手段时，它就是危险的。你要优化的指标不是容量，而是*信号密度*。
+
+## 现在正在竞争的几种上下文管理范式
+
+关于 Agent 该怎么处理不断膨胀的上下文，目前有四种范式在竞争。它们不是互斥的，生产系统一般会组合着用。
+
+**1. 压缩（Compaction / summarization）。** 每隔一段时间把较早的对话轮次替换成一段 LLM 生成的摘要。这是 Cursor 和 OpenHands 的默认做法。它是有损的——细节是最先被丢掉的——而且它本身也会引入幻觉，因为总结这一步本身就是一次生成。压缩缓解了注意力稀释，代价却是那些精确的细节（变量名、行号、配置值），而这些恰恰是编码 Agent 最需要的东西。
+
+**2. Observation masking（观察掩蔽）。** 2025 年 12 月，JetBrains 的研究者在 NeurIPS Deep Learning for Code workshop 上发了 [*The Complexity Trap*](https://arxiv.org/pdf/2508.08322v1)。他们的结论是：搞得很复杂的 LLM 摘要，竟然被一种朴素得多的技巧打平甚至打赢——把旧的工具输出替换成占位符文本，比如"Previous 8 lines omitted for brevity"，同时把 Agent 自己的推理和动作历史完整保留。一次典型的 SWE-agent turn 里，observation token 约占 84%。把它们 mask 掉，相比不做任何上下文管理，成本直接减半，而任务完成率能和 LLM 摘要打平甚至略胜。两种一起用能再省 10% 左右。教训是：行业一窝蜂冲去搞复杂压缩，其实一个蠢到不能再蠢的过滤器就能拿走大部分收益。
+
+**3. 子 Agent 隔离（Sub-agent isolation）。** [Anthropic 官方关于 sub-agents 的文档](https://docs.claude.com/en/docs/claude-code/sub-agents) 把这个论证摆得很明白：给每一个专项任务一个全新的上下文窗口。主 Agent 只做编排；子 Agent（code-reviewer、debugger、planner）在干净的上下文中跑，返回一段压缩过的结果，然后退出。Anthropic 多 Agent 研究系统那份报告提到，"token usage explains 80% of the variance"——换个说法就是：*每个 Agent 看到什么*这件架构决策，比它是哪个 Agent 更重要。这也是 Claude Code 凭借它的命名 sub-agents 和独立上下文窗口，在架构上拥有真正优势的地方。
+
+**4. 把上下文当作可调用的工具（Context as a Tool）。** 北航等团队在 ACL 2026 Findings 的论文 [*Context as a Tool (CAT)*](https://aclanthology.org/2026.findings-acl.1032.pdf) 主张：上下文管理不该是外挂的启发式，而应该是 Agent 能主动规划并调用的一等动作——就跟 `edit_file` 或 `run_tests` 一样。他们的 SWE-Compressor 在 SWE-Bench Verified 上跑到 57.6%，同时把上下文控制在一个有界的预算内。核心理念是：教会模型*什么时候*压缩，而不只是怎么压缩。
+
+## 一个容易被忽视的第五种范式：编码 Agent *本身就是*长上下文处理器
+
+[*Coding Agents are Effective Long-Context Processors*](https://arxiv.org/html/2603.20432)（Cao 等，2026）把常见的框架反了过来。他们没有问"怎么把更多 token 塞进 attention"，而是问：如果让 Agent 把长上下文外化到文件系统里，用 grep、awk 和 Python 去操作，会怎么样？结果是：现成的前沿编码 Agent 在多个基准上平均超过已发表 SOTA 17.3%，而这些基准的规模最高可达*三万亿* token。机制是：原生的工具熟练度 + 对文件系统的熟悉，让 Agent 能在一份原本无法管理的语料上，构建出小而精准的视图。这实际上是从经验层面为过去一年 Claude Code 老玩家之间的口口相传——"少放上下文里，多留在文件里"——盖了个印章。
+
+再叠上子 Agent 隔离，就得到一条可用的原则：*文件系统就是你扩展出来的上下文窗口*。任何 Agent 能 `grep` 到的东西，都是你不用花钱去让它 attend 的上下文。
+
+## prompt caching：省钱之余顺带缓解 rot
+
+Anthropic 的 [prompt caching](https://claude.com/blog/prompt-caching) 在 2024 年 12 月全面开放，之后很快被广泛采用。机制上：在前缀上打一个 `cache_control` 块；后续共享该前缀的请求，按基础 input 单价的 10% 计费（默认 5 分钟 TTL，也可以用更贵的 write 成本升到 1 小时）。一个常被引用的例子：一本 100K token 的书作为缓存 prompt，TTFT 从 11.5s 降到 2.4s——延迟砍掉 79%，缓存命中部分成本最多降低 90%。
+
+[2026 年 1 月 PwC 的评估 *Don't Break the Cache*](https://arxiv.org/pdf/2601.06007) 在 DeepResearchBench 上测了三种缓存策略，覆盖 OpenAI、Anthropic 和 Google。关键结论：天真地把整段上下文都拿去缓存，反而可能*让延迟变高*——因为在 prompt 尾部动态变化的工具结果会不断打断缓存边界。策略性摆放才行——系统 prompt 在前、静态上下文其次、稳定前缀末尾放一个 cache breakpoint、动态工具输出放到 breakpoint 之后——成本能砍 45–80%，TTFT 能降 13–31%。
+
+prompt caching 并不能直接治好 context rot。但有两个次级效应很重要：（a）大上下文的经济成本大幅下降，意味着你可以负担得起在每一次有意义的动作上*重放*一份干净的完整上下文，而不是把一段脏的上下文越攒越长；（b）为了命中缓存，你被迫把 prompt 结构组织成 `[稳定的、可缓存前缀] + [极小的、动态尾部]`——这刚好就是那种能把重要信息同时留在 U 形注意力曲线两端的结构。
+
+## 六条能在生产扛下来的模式
+
+理论最后会落到几条具体动作。大致按性价比从高到低排：
+
+### 1. 把关键指令同时放在 prompt 的两端
+
+R&R（reprompting）来自 [Agrawal 等（EMNLP 2024）](https://aclanthology.org/2024.findings-emnlp.742.pdf)，他们展示：在长文档中周期性地重复任务指令，能让 QA 准确率在 GPT-4 Turbo 和 Claude-2.1 上提升约 16 个点。对编码 Agent，这条泛化成：把最重要的约束写在 `CLAUDE.md`（上下文开头）*同时*在当前用户 turn 里再复述一遍（上下文末尾）。不要指望模型还记得 40 轮之前说过的一条约束，U 曲线不会跟你客气。
+
+### 2. 把状态外化到文件系统
+
+把文件系统当作持久化记忆：`TODO.md`、`DECISIONS.md`、放着子任务笔记的临时目录。这就是 *Coding Agents are Effective Long-Context Processors* 验证过的机制。Agent 的上下文窗口就只装指针，不装货本身。真到关键时刻，让 Agent 去重新读一小段精准的文件，而不是靠"记住"。这也是当 Agent 重启、或者意外触发一次压缩之后你能活下来的原因。
+
+### 3. 按上下文体量来切子 Agent 边界，而不只按角色
+
+大家的第一反应是按角色拆分：planner、coder、reviewer。也顺便按*任务噪声量*来拆分。任何会产生大量工具输出的任务——大范围的 grep、`find`、依赖扫描、超长的测试日志——都是拉出一个独立子 Agent 上下文的候选。主 Agent 只拿回一段五行的综述，而不是原始输出。JetBrains 那篇论文里 84% observation token 的数据，就是在这里最有价值：这些 observation 就该活在子 Agent 的上下文里，而不是编排器的上下文里。
+
+### 4. 拼接之前先重排
+
+任何一个检索步骤（代码库的语义搜索、文档、历史对话），都应该在检索之后重新排序，把相关性最高的块摆到上下文的*边缘*——最前和最后。向量搜索的距离顺序，跟位置重要性的顺序不是一回事。这是一个成本不高但收益不成比例的调整，因为 U 曲线就摆在那里。
+
+### 5. 稳定的进缓存，尾部让它动
+
+把 prompt 结构组织成：system prompt → 工具定义 → `CLAUDE.md` → 前面决策的摘要 → cache breakpoint。所有会变的东西（当前 diff、最新工具输出、当前用户消息）都放在 breakpoint 之后。这就是 *Don't Break the Cache* 里在各家提供商上都稳赢的模式。附带的好处是：它会强迫你注意到某些原本以为"静态"的上下文其实一直在悄悄变（这是一个静默杀死缓存命中率的常见 bug）。
+
+### 6. 宁可 replay 一份干净上下文，也别一直攒脏的
+
+在成本允许的前提下，每一次有意义的动作都让 Agent 从干净状态重启对话，只喂给它最少必要的状态文件、当前任务、工具定义。长时间运行的 session 会攒下错误、自相矛盾和过时的推理。基于持久化状态做一次便宜的 replay，往往比一次聪明的压缩更好。prompt caching 让这条路在经济上变得可行——18 个月前它还不是。
+
+## 那些诚实的边界条件
+
+再给几条老实话，因为这个领域远远没定论。
+
+**压缩在某些工作负载下仍然赢。** 如果你的任务真的要求模型对一长串*决策*（而不是工具输出）做推理，LLM 摘要在保留结构上会比 masking 好。JetBrains 那个结论最干净地适用于以工具 observation 为主的负载。选择之前先读一下你自己的 token 分布。
+
+**子 Agent 编排不是免费的。** 主 Agent 和子 Agent 之间的每一跳都会带来延迟、多一个 prompt、多一层协调开销。如果你的任务本来就能舒服地塞进一段 30K 轮的对话里，一个把缓存做好的单体 Agent 完全可能干掉一套多 Agent 系统。任务规模越大、缓存越成熟，收支平衡点就会往多 Agent 那边挪。
+
+**重排的效果取决于你的相关性信号。** 按 query embedding 的余弦相似度重排，会把*看起来最像*的那块挪到边缘，但那不见得是*最有用*的那块。两阶段检索（bi-encoder 召回 → cross-encoder 重排）在高风险检索里值这个成本；单阶段的就不太行。
+
+**压缩摘要的忠实度是真问题。** 一段被摘要过的 turn，可能把一个幻觉出来的承诺带下去。当 Agent 后面基于"我们决定用 PostgreSQL"来推理时，你最好去核实一下那个决定是不是真的做过，还是摘要器凭空捏出来的。
+
+## 一份下周一就能开跑的清单
+
+- 测一下你 Agent 的 token 分布：指令、计划、工具输出、推理各占多少？工具输出超过 60% 的话，就是 masking 或者子 Agent 抽离的候选。
+- 如果还没上 prompt caching，加上。把 `cache_control` 的 breakpoint 放在稳定前缀的末尾。用 API 响应里的 `usage` 字段验证一下命中率。
+- 至少把一条噪声大的工具——`find`、依赖树、全库 grep——挪到子 Agent 里，只返回一段综合摘要。
+- 你最重要的三条约束，别只写在 `CLAUDE.md` 的开头，把它们在用户 turn 的*末尾*再复述一遍。
+- 把决策外化到 `DECISIONS.md`，把长 TODO 外化到 `TODO.md`。给 Agent 一个读它们的工具，而不是一段把它们背下来的 prompt。
+- 挑一周时间，每天每个任务跑一次完全干净的 replay，跟"一直攒脏"的 session 比一下质量。
+
+## 进一步阅读，按我个人推荐的顺序
+
+1. **[Lost in the Middle（Liu 等，2023）](http://cs.stanford.edu/~nfliu/papers/lost-in-the-middle.arxiv2023.pdf)** —— 经验基石。短、清楚，仍然是"为什么 prompt 结构重要"这件事上最有用的一篇论文。
+2. **[Context Rot: How Increasing Input Tokens Impacts LLM Performance（Chroma，2025）](https://research.trychroma.com/context-rot)** —— 2025 年在 18 款模型上的复现与推广。读起来更像工程报告，而不是学术论文。
+3. **[The Complexity Trap（JetBrains, NeurIPS DL4C 2025）](https://arxiv.org/pdf/2508.08322v1)** —— observation masking 的关键结果。简单、反直觉、影响很大。
+4. **[Context as a Tool（CAT, ACL 2026 Findings）](https://aclanthology.org/2026.findings-acl.1032.pdf)** —— 把上下文管理当作一个可学习、可调用的动作。
+5. **[Coding Agents are Effective Long-Context Processors（Cao 等，2026）](https://arxiv.org/html/2603.20432)** —— 把文件系统当作扩展的上下文窗口。
+6. **[Don't Break the Cache（PwC，2026）](https://arxiv.org/pdf/2601.06007)** —— 关于 prompt caching 的实用评估。
+7. **[Anthropic 的 sub-agent 文档](https://docs.claude.com/en/docs/claude-code/sub-agents)** —— 在 Claude Code 上做上下文隔离的操作手册。
+8. **[Can't Remember Details in Long Documents（R&R, EMNLP 2024）](https://aclanthology.org/2024.findings-emnlp.742.pdf)** —— reprompting 与 in-context 检索作为 prompt 层面的缓解手段。
+
+## 一句话总结
+
+如果 context rot 是病，那治疗它的不是更大的窗口——而是让信号密度维持高位的一整套工程手段：稳定的进缓存、噪声的做 mask、用子 Agent 做隔离、把状态外化到文件系统、并在 prompt 的两端复述你的意图。
+
+这篇文章里其他所有东西，都是这句话的脚注。

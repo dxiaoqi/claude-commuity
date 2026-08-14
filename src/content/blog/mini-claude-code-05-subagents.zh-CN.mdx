@@ -1,0 +1,298 @@
+---
+title: "Mini Claude Code · 第 05 集：让 sub-agent 拥有自己的上下文"
+description: "第 5 集把 agent 一分为二。我们加入一个 spawn_subagent 工具，把带作用域的任务分派给一个全新的 Claude——它有自己的一套工具、自己的上下文窗口，最后回吐一份紧凑的摘要。这就是 Anthropic 那句『token 用量解释了 80% 的结果质量方差』背后的模式，用大约 90 行代码搞定。"
+date: "2026-07-05"
+tags: ["mini-claude-code", "series", "typescript", "agents"]
+readTime: "17 min"
+---
+
+四集下来，我们的 agent 已经会读、会写、会有选择地记忆，还能在截断之后继续跑。它还做不到的一件事：分工。每一次 observation、每一次工具调用、每一步推理，都挤在同一个上下文窗口里。一个"把 `src/lib/` 下面的所有东西都重构一遍"的任务，就算套上上周那层带屏蔽的视图，也会被撑穿。
+
+今晚我们从架构上把这件事修好。我们引入 *sub-agent* —— 一个全新的 Claude，有自己的 system prompt、自己的一套工具，而且关键在于有自己独立的上下文窗口。主 agent 做 orchestrator。sub-agent 只干一件带作用域的事，然后回一份紧凑的摘要。主 agent 拿着这份摘要继续执行计划，它自始至终都没有看到 sub-agent 咀嚼过的那些嘈杂原始数据。
+
+这就是 Anthropic 那条发现——"token 用量解释了 80% 的结果质量方差"——背后的模式。[context engineering 那篇研究](/en/blog/context-engineering-for-coding-agents) 讲的是理论；今晚我们把它落成约 90 行代码。
+
+## 今晚要造的东西
+
+1. 一个 `runSubagent(brief, tools, model?)` 函数 —— 一个自成一体、带独立历史的 tool-use 循环
+2. 一个暴露给主 agent 的 `spawn_subagent` 工具
+3. 一份硬性 budget：sub-agent 有最大轮数和最大输出长度
+4. 一份"返回契约" —— sub-agent 的最后一条消息就是回给主 agent 的内容，原样返回，带上限
+
+`agent.ts` 不变。新增一个 `subagent.ts`。
+
+## 正确的心智模型
+
+主 agent 是个*经理*。它读起来应该像一份计划："先找到 auth 是在哪里接进去的，再看我们是否已经有 rate-limit 中间件，然后提一个 patch。"这里每一个子步骤都是一个*任务*，每个任务都可以扔给一个 sub-agent，那个 sub-agent 的全部工作就是这一个子步骤，别的都不管。
+
+有两件事让这套模式既便宜又安全：
+
+- **每个 sub-agent 都是干净的上下文。**没有继承来的噪音。也不会不小心把不同任务的推理串到一起。
+- **回复要紧凑。**sub-agent 必须*自己决定*要跟经理说什么。这个约束反而提升了质量 —— 就像逼一个不错的新人写两句话的状态汇报，会比让他在 Slack 里刷屏时思考得更清楚。
+
+代价是多了一次 orchestration 上的往返延迟，以及调试稍微更麻烦一点。对于 observation 占用超过 4000 token 的任务来说，这个代价可以接受。
+
+## 实现 `runSubagent`
+
+新建 `subagent.ts`：
+
+```typescript
+import Anthropic from "@anthropic-ai/sdk";
+import type { runTool } from "./agent.js";
+
+const client = new Anthropic();
+
+export interface SubagentOptions {
+  brief: string;
+  toolNames: string[];         // subset of the main agent's tools
+  model?: string;
+  maxTurns?: number;
+  maxOutputChars?: number;
+  systemHint?: string;
+}
+
+export interface SubagentResult {
+  finalText: string;
+  turnsUsed: number;
+  reason: "end_turn" | "max_turns" | "error";
+  errorMessage?: string;
+}
+
+const DEFAULT_MODEL = "claude-sonnet-4-5";
+const DEFAULT_MAX_TURNS = 8;
+const DEFAULT_MAX_OUTPUT = 2000;
+
+const SUBAGENT_SYSTEM = (hint?: string) => `
+You are a scoped sub-agent inside Mini Claude Code. You have a single brief. Complete it, then STOP.
+
+Rules:
+- Do the smallest amount of work that answers the brief.
+- Use tools only when needed. Do not explore.
+- Your final message will be sent back to the manager verbatim. Keep it under ~300 words and structured.
+- If the brief is infeasible, say so in one sentence and stop.
+${hint ? "\nManager hint: " + hint : ""}
+`.trim();
+
+export async function runSubagent(
+  opts: SubagentOptions,
+  runToolFn: typeof runTool,
+  allTools: readonly { name: string; description: string; input_schema: unknown }[],
+): Promise<SubagentResult> {
+  const model = opts.model ?? DEFAULT_MODEL;
+  const maxTurns = opts.maxTurns ?? DEFAULT_MAX_TURNS;
+  const maxOutput = opts.maxOutputChars ?? DEFAULT_MAX_OUTPUT;
+  const tools = allTools.filter((t) => opts.toolNames.includes(t.name));
+
+  const history: Anthropic.MessageParam[] = [
+    { role: "user", content: opts.brief },
+  ];
+
+  for (let turn = 0; turn < maxTurns; turn++) {
+    let response: Anthropic.Message;
+    try {
+      response = await client.messages.create({
+        model,
+        max_tokens: 1500,
+        system: SUBAGENT_SYSTEM(opts.systemHint),
+        tools,
+        messages: history,
+      });
+    } catch (e) {
+      return {
+        finalText: "",
+        turnsUsed: turn,
+        reason: "error",
+        errorMessage: e instanceof Error ? e.message : String(e),
+      };
+    }
+
+    history.push({ role: "assistant", content: response.content });
+
+    if (response.stop_reason !== "tool_use") {
+      const text = response.content
+        .filter((b): b is Anthropic.TextBlock => b.type === "text")
+        .map((b) => b.text)
+        .join("\n")
+        .trim();
+      const capped = text.length > maxOutput ? text.slice(0, maxOutput) + "\n…[truncated by sub-agent budget]" : text;
+      return { finalText: capped, turnsUsed: turn + 1, reason: "end_turn" };
+    }
+
+    const results = [];
+    for (const b of response.content) {
+      if (b.type === "tool_use") {
+        const out = await runToolFn(b.name, b.input as Record<string, unknown>);
+        results.push({ type: "tool_result" as const, tool_use_id: b.id, content: out });
+      }
+    }
+    history.push({ role: "user", content: results });
+  }
+
+  return { finalText: "(sub-agent hit turn cap without concluding)", turnsUsed: maxTurns, reason: "max_turns" };
+}
+```
+
+这段代码里有五个地方值得一提：
+
+**一个精简版 system prompt。**sub-agent 有一份不一样的人格：简短、任务导向、禁止探索。这是让 sub-agent 真正好用的最重要的一根杠杆。一个话痨 sub-agent 就是一个坏 sub-agent。
+
+**工具 allow-list。**不是每个 sub-agent 都需要所有工具。由主 agent 来决定。一个"找相关文件"的 sub-agent 可能只拿到 `list_dir` 和 `run_bash`，没有 `apply_patch`。把最小权限原则套到 prompt 上。
+
+**内部没有屏蔽循环。**sub-agent 的上下文靠"活得短"来保持小 —— 它在几轮之内就死掉了。第 04 集那套机器在这里属于杀鸡用牛刀。
+
+**`apply_patch` 没有额外的确认门。**如果主 agent 把 `apply_patch` 授权给 sub-agent，那 sub-agent 通过 `runToolFn` 继承的是同一条确认流程。这道门属于工具，不属于 agent。这也是为什么我们要把 `runToolFn` 传进去 —— sub-agent 完全不用自己重写任何逻辑。
+
+**输出硬上限。**主 agent 最多拿回 `maxOutputChars` 的内容。如果一个 sub-agent 想把整个文件甩回来，我们就截断。这时候经理该反思的是：是不是应该问一个更好的问题。
+
+## 把工具暴露给主 agent
+
+加到主 `TOOLS` 数组里：
+
+```typescript
+{
+  name: "spawn_subagent",
+  description:
+    "Dispatch a scoped task to a fresh sub-agent. Use for large searches, exploration, or focused refactors. The sub-agent has its own context window; you will only see its final summary. Prefer this over reading many files yourself.",
+  input_schema: {
+    type: "object",
+    properties: {
+      brief: {
+        type: "string",
+        description: "A single-paragraph task description. Be specific about what to return.",
+      },
+      tools: {
+        type: "array",
+        items: { type: "string" },
+        description: "Subset of tool names to grant. Never include spawn_subagent (no recursion).",
+      },
+    },
+    required: ["brief", "tools"],
+  },
+},
+```
+
+注意那句显式的"no recursion"注释。在第 05 集里，sub-agent 不能再 spawn sub-agent。这不是一个难解的问题，但它的失效模式（fan-out、budget 爆炸、调试黑箱）是难的，我宁愿先发一个读者能推理清楚的版本。
+
+## 接进 `runTool`
+
+`agent.ts` 里：
+
+```typescript
+import { runSubagent } from "./subagent.js";
+
+// inside runTool:
+if (name === "spawn_subagent") {
+  const brief = String(input.brief);
+  const requestedTools = (input.tools as string[]).filter((t) => t !== "spawn_subagent");
+  console.log(`[subagent] brief: ${brief.slice(0, 100)}${brief.length > 100 ? "…" : ""}`);
+  console.log(`[subagent] tools: ${requestedTools.join(", ")}`);
+
+  const result = await runSubagent(
+    { brief, toolNames: requestedTools },
+    runTool, // pass ourselves so the sub-agent reuses tool implementations
+    TOOLS,
+  );
+
+  console.log(`[subagent] done in ${result.turnsUsed} turns, ${result.reason}`);
+  return `SUBAGENT_RESULT (${result.turnsUsed} turns, ${result.reason}):\n\n${result.finalText}`;
+}
+```
+
+我们把 `runTool` 传进了 `runSubagent`。循环引用，但没有副作用 —— 工具执行器根本不需要知道自己现在是在为主 agent 服务，还是在为 sub-agent 服务。
+
+## 一次带 sub-agent 的真实会话长什么样
+
+```
+you › are there any files under src/lib that don't have a matching test?
+
+cc  › I'll dispatch a sub-agent to enumerate this cleanly.
+
+[tool] spawn_subagent({"brief":"List every .ts file under src/lib recursively.
+For each, check whether a file with the same basename exists under
+tests/lib or under src/lib with a .test.ts suffix. Return a plain list
+of untested files, one per line. If everything is covered, say so.",
+"tools":["list_dir","run_bash"]})
+[subagent] brief: List every .ts file under src/lib recursively. For each, check…
+[subagent] tools: list_dir, run_bash
+[subagent] done in 4 turns, end_turn
+
+Files without tests:
+- src/lib/blog.ts
+- src/lib/mdx-renderer.ts
+- src/lib/i18n-utils.ts
+
+Everything else in src/lib has a matching *.test.ts.
+
+cc  › Three files lack tests: blog.ts, mdx-renderer.ts, i18n-utils.ts.
+Want me to draft skeleton tests for one of them?
+```
+
+主 agent 的上下文一共只增长了：
+- 大约 200 个 token，用来在工具调用里描述 brief
+- 大约 150 个 token，用来放 sub-agent 的最终摘要
+
+就这么多。sub-agent 内部跑了 4 轮，处理了好几份 `list_dir` 和 `grep` 的输出 —— 这些原始数据一个都没有碰到主 agent 的历史。压缩就是从这里来的。不是靠什么聪明的文本压缩，而是靠*把原始数据放在墙的另一边*。
+
+## 怎么挑选要不要开 sub-agent 的任务
+
+不是每个任务都值得开 sub-agent。我大致的判断标准：
+
+- **开 sub-agent**：任务的预期工具输出超过 4000 token，*而且*经理需要的答案很短。
+- **inline 处理**：经理反正也要用到那批原始数据（比如打开某一个具体文件来编辑它）。
+- **绝对不要开 sub-agent**：交互式决策。用户盯着主 REPL 看着呢，把一个 `y/N` 提示藏在 sub-agent 里面只会让人困惑。
+
+经理在做计划的时候就要决定。实践中，只要工具描述写得诚实（"Prefer this over reading many files yourself"），Claude 这件事做得挺好。
+
+## 我写这一集时踩过的坑
+
+**sub-agent 以为自己可以聊天。**第一次跑起来，sub-agent 的摘要是三段"这个问题真有意思！我发现……"的开场白。修复办法：加强 system prompt，强制要求结构化、简短的输出。任务偏长的时候，我偶尔还会看到散文式的文字冒出来；再狠一点，写成"用 bulleted list 回复"能更好。
+
+**通过 loop 触发 fan-out。**早期一版草稿里，我允许 sub-agent 用工具名的子串匹配来授权。主 agent 直接写了 `["*"]`，把所有工具都拿到手，包括 `spawn_subagent`。然后它就开始递归。我在深度 12 层、大约烧掉 0.60 美元的时候把它掐了。修复办法：只做精确匹配；无条件把 `spawn_subagent` 从 allow-list 里剥掉。
+
+**sub-agent 的 `apply_patch` 需要自己的确认。**因为工具代码调的是同一个 `confirmPatch`，用户会看到一个来自 sub-agent 编辑的 `y/N`。这本身没问题，但不够直观。日志里要清楚地打出来是哪个 agent 在问。在真正的 Claude Code 里，这通常是操作员最不喜欢的意外。
+
+**成本可见性。**一个 sub-agent 可以在操作员没注意的情况下烧掉 8 轮 × 2K max_tokens。加一行按 sub-agent 计的成本日志：`[subagent] tokens: in=… out=…`。今晚为了篇幅我没放进去，但第 06 集会通过一次正式的记账 pass 把它补回来。
+
+## 下一集要解决什么
+
+我们现在有了架构层面的能力，但还没有办法度量它。第 06 集 —— 也是第一季的最后一集 —— 全部围绕评测：
+
+- 一套 15 个任务的 SWE-lite 集合（小、真实、可验证），放在 `evals/` 目录下。
+- 一个 `mcc eval` 命令，用当前 agent 跑一遍这套任务，报出通过率、轮数和成本。
+- 一个钉住的基线，让你能判断明天改一版 system prompt 到底是变好了还是变差了。
+- 终于接上 prompt caching，因为 eval 循环让缓存命中变得可见。
+
+如果说第 05 集给了我们架构，那第 06 集给的就是让我们能迭代它、又不至于回归的反馈回路。
+
+## 速查表 —— 第 05 集
+
+| 是什么 | 在哪里 |
+|---|---|
+| sub-agent 运行器 | `runSubagent(opts, runTool, TOOLS)` |
+| 主 agent 工具 | `spawn_subagent` |
+| 轮数上限 | 8 |
+| 输出上限 | 2000 字符 |
+| 模型 | `claude-sonnet-4-5`（跟主 agent 一样；不同的 system prompt） |
+| 工具 allow-list | 由经理传入，剔除 `spawn_subagent` |
+| 返回格式 | `"SUBAGENT_RESULT (N turns, reason):\n\nTEXT"` |
+| recursion 策略 | 第 05 集里禁止 |
+
+**最小可用的 sub-agent 调用：**
+
+```typescript
+const result = await runSubagent(
+  { brief: "...", toolNames: ["list_dir", "run_bash"] },
+  runTool, TOOLS,
+);
+return `SUBAGENT_RESULT (${result.turnsUsed}, ${result.reason}):\n\n${result.finalText}`;
+```
+
+**活到第 06 集要守住的六条规则：**
+1. sub-agent 用*不一样的* system prompt —— 简短、有作用域、禁止探索。
+2. sub-agent 拿到的是工具的*子集*，绝不给全套。
+3. 永远不要把 `spawn_subagent` 授权给 sub-agent。
+4. 同时给轮数*和*输出加 cap；碰到任何一个 cap 都是信号，不是成功。
+5. 日志里标清楚是哪个 agent 在请求确认。
+6. 按 observation 占用量来挑 sub-agent 任务，别按"看起来复杂"来挑。
+
+下一集是第 06 集 —— 我们终于要把反馈回路造起来了。

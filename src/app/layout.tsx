@@ -1,18 +1,38 @@
 import type { Metadata, Viewport } from "next";
+import { headers } from "next/headers";
 import { Analytics } from "@/components/analytics";
-import { SiteFooter } from "@/components/site-footer";
-import { SiteHeader } from "@/components/site-header";
 import { siteConfig } from "@/lib/site";
+import { defaultLocale, htmlLangAttr, isLocale, locales, type Locale } from "@/i18n/config";
 import "./globals.css";
 
+const baseUrl = siteConfig.url;
+
 export const metadata: Metadata = {
-  metadataBase: new URL(siteConfig.url),
+  metadataBase: new URL(baseUrl),
   title: { default: "Claude Community — Field notes for Claude builders", template: "%s — Claude Community" },
   description: siteConfig.description,
   applicationName: siteConfig.name,
-  alternates: { canonical: "/" },
-  openGraph: { type: "website", siteName: siteConfig.name, title: "Claude Community — Build better with Claude", description: siteConfig.description, url: "/", images: [{ url: "/opengraph-image", width: 1200, height: 630, alt: "Claude Community" }] },
-  twitter: { card: "summary_large_image", title: "Claude Community — Build better with Claude", description: siteConfig.description, images: ["/opengraph-image"] },
+  alternates: {
+    canonical: "/",
+    languages: Object.fromEntries([
+      ...locales.map((l) => [l, `/${l}`] as const),
+      ["x-default", `/${defaultLocale}`] as const,
+    ]),
+  },
+  openGraph: {
+    type: "website",
+    siteName: siteConfig.name,
+    title: "Claude Community — Build better with Claude",
+    description: siteConfig.description,
+    url: "/",
+    images: [{ url: "/opengraph-image", width: 1200, height: 630, alt: "Claude Community" }],
+  },
+  twitter: {
+    card: "summary_large_image",
+    title: "Claude Community — Build better with Claude",
+    description: siteConfig.description,
+    images: ["/opengraph-image"],
+  },
   verification: {
     google: process.env.GOOGLE_SITE_VERIFICATION,
     other: {
@@ -25,14 +45,14 @@ export const metadata: Metadata = {
 
 export const viewport: Viewport = { themeColor: "#141412", colorScheme: "dark" };
 
-export default function RootLayout({ children }: Readonly<{ children: React.ReactNode }>) {
+export default async function RootLayout({ children }: Readonly<{ children: React.ReactNode }>) {
+  const h = await headers();
+  const localeHeader = h.get("x-locale") || "";
+  const locale: Locale = isLocale(localeHeader) ? localeHeader : defaultLocale;
   return (
-    <html lang="en">
+    <html lang={htmlLangAttr[locale]}>
       <body>
-        <a className="skip-link" href="#main">Skip to content</a>
-        <SiteHeader />
         {children}
-        <SiteFooter />
         <Analytics />
       </body>
     </html>

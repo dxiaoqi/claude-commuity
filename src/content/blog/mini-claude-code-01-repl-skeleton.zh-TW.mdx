@@ -1,0 +1,190 @@
+---
+title: "Mini Claude Code · 第 01 集：四十行、真的記得住話的 REPL"
+description: "動手做系列的開端——我們用 TypeScript 從零打造一個能跑的 coding agent。第一集先把最小可運作的迴圈跑起來：stdin、串流輸出，以及一段能跨回合活下來的對話。"
+date: "2026-07-03"
+tags: ["mini-claude-code", "series", "typescript", "agents"]
+readTime: "14 min"
+---
+
+歡迎來到 Mini Claude Code，這是一個六集的動手做系列，我們會用 TypeScript 從零打造一個真的能運作的 coding agent。不用框架、不用魔法、不用 LangChain。就只有 Anthropic SDK、一個終端機，加上「一次只加一項能力」的紀律。
+
+系列走完，你手上會有一個小巧但貨真價實的 Claude Code 山寨版：它能讀你的程式碼庫、用 unified diff 改檔案、管理自己的脈絡、生出一個 sub-agent，還能在一個迷你 eval 集上被評分。第一集要做的，是最小、但仍然配得上「agent」這個名字的東西：一個會跟模型對話、把回覆用串流方式吐回來、而且*記得剛才聊過什麼*的 REPL。
+
+如果你已經跑過十個 chat demo，卻還是搞不清楚為什麼你的東西每次都失憶，這一集就是為你寫的。
+
+## 今晚要做出什麼
+
+一個單檔程式 `agent.ts`，它會：
+
+1. 在終端機提示你輸入
+2. 把你的訊息加上所有先前的回合送給 Claude
+3. 把回覆以串流方式邊到邊印到終端機
+4. 一直迴圈，直到你打 `/exit`
+
+就這樣。沒有工具、不能碰檔案系統，也沒有超過行程生命週期的記憶體。大約 40 行 TypeScript。重點是把*回合結構*釘死——因為後面幾集要加的每一項能力，都是騎在這個迴圈之上。
+
+## 環境設定——三行指令
+
+假設你裝的是 Node 20+。如果是更舊的版本，先升級；SDK 裡的 fetch 與 `AbortController` 語意都依賴這一版。
+
+```bash
+mkdir mini-claude-code && cd mini-claude-code
+pnpm init && pnpm add @anthropic-ai/sdk
+pnpm add -D typescript tsx @types/node
+```
+
+建一個最小的 `tsconfig.json`：
+
+```json
+{
+  "compilerOptions": {
+    "target": "ES2022",
+    "module": "ESNext",
+    "moduleResolution": "Bundler",
+    "strict": true,
+    "esModuleInterop": true,
+    "skipLibCheck": true
+  }
+}
+```
+
+設定金鑰：
+
+```bash
+export ANTHROPIC_API_KEY=sk-ant-...
+```
+
+環境設定到此為止。接下來所有事都在一個檔案裡完成。
+
+## 四十行的 REPL
+
+建立 `agent.ts`：
+
+```typescript
+import Anthropic from "@anthropic-ai/sdk";
+import readline from "node:readline/promises";
+import { stdin as input, stdout as output } from "node:process";
+
+const client = new Anthropic();
+const MODEL = "claude-sonnet-4-5";
+const SYSTEM = "You are Mini Claude Code, a helpful engineering assistant. Keep answers concrete and short unless asked otherwise.";
+
+type Turn = { role: "user" | "assistant"; content: string };
+const history: Turn[] = [];
+
+const rl = readline.createInterface({ input, output });
+
+async function turn(userText: string) {
+  history.push({ role: "user", content: userText });
+
+  const stream = client.messages.stream({
+    model: MODEL,
+    max_tokens: 1024,
+    system: SYSTEM,
+    messages: history,
+  });
+
+  let assistantText = "";
+  for await (const event of stream) {
+    if (event.type === "content_block_delta" && event.delta.type === "text_delta") {
+      process.stdout.write(event.delta.text);
+      assistantText += event.delta.text;
+    }
+  }
+  process.stdout.write("\n");
+  history.push({ role: "assistant", content: assistantText });
+}
+
+async function main() {
+  console.log("Mini Claude Code · Ep.01 REPL. Type /exit to quit.\n");
+  while (true) {
+    const line = (await rl.question("you › ")).trim();
+    if (line === "/exit") break;
+    if (!line) continue;
+    process.stdout.write("cc  › ");
+    await turn(line);
+  }
+  rl.close();
+}
+
+main().catch((e) => { console.error(e); process.exit(1); });
+```
+
+跑起來：
+
+```bash
+pnpm tsx agent.ts
+```
+
+你應該會看到：
+
+```
+Mini Claude Code · Ep.01 REPL. Type /exit to quit.
+
+you › my name is Alice
+cc  › Hi Alice! How can I help?
+you › what did I just tell you my name was?
+cc  › Alice.
+```
+
+第二回合那個「Alice」不是什麼小勝利。它就是*這一集的全部意義*。我在 code review 裡看到的「我的 chatbot 沒記憶」的 bug，有一半以上都是因為當事人忘了把 assistant 上一輪的回覆也塞回下一次請求裡。模型是無狀態的。你才是那份記憶。
+
+## 四十行裡有三件事，比你以為的重要
+
+### 1. history 陣列*就是*那份狀態
+
+這個 REPL 裡 Claude 能「記得」的一切，全都住在 `history` 陣列裡。你清空它，記憶就沒了；你去改它，就是在重寫過去——沒錯，這在第 4 集會變得很重要，那時我們會刻意編輯 history 來省 token。現在先記住這個不變式：每一個回合都會 append 一筆 user 訊息，成功時再 append 一筆 assistant 訊息。如果請求跑到一半失敗，我們*不應該*留下一筆懸空的 user 訊息；這個問題會在第 02 集處理。
+
+### 2. 串流對 agent 來說不是可選項
+
+你可以把 `client.messages.stream` 換成 `client.messages.create`，一次拿到整團回覆。別這樣。之後要跑 tool use 的 agent 一定得用串流，理由有兩個：（a）你會希望輸出邊到邊顯示，這樣使用者才知道程式沒卡死；（b）tool 呼叫是以*內容區塊*（content block）的形式在串流裡送過來的，現在就把逐步解析的管線鋪好，遠比之後回頭補容易得多。從第 02 集起，我們會大量倚賴這些內容區塊。
+
+### 3. system prompt 是放個性的地方，不是拿來堆指令的
+
+`SYSTEM` 是一小段字串。忍住那股想把它塞滿「一定要做 X、永遠別做 Y、記得 Z」的衝動。lost-in-the-middle 那條研究（在 [context engineering 那篇](/en/blog/context-engineering-for-coding-agents) 裡有介紹）告訴我們，模型最會注意的是脈絡的開頭與結尾。在這個迴圈裡，system prompt 是開頭，*最近一則 user 訊息*是結尾。如果某條規則只對某一項具體任務重要，就把它重述在 user 回合裡，不要塞進 system prompt。
+
+## 我寫這集時踩到的坑
+
+**「assistant 文字是空的」bug。** 第一版初稿裡我忘了累積 `assistantText`，只把它印到 stdout。結果 history 被灌了一堆空的 assistant 回合，Claude 就會像上一輪根本沒發生過一樣重答一次。修法：把串流回來的文字累積成一個字串，等串流結束*之後*再 push 進 history。
+
+**`readline` 的提示字把回覆吃掉了。** 如果你在模型還在串流的時候就呼叫 `rl.question("you › ")`，提示字串會跟模型輸出交錯在一起。修法：完整 `await turn(line)` 之後再呼叫下一次 `rl.question`。上面的程式碼裡，`turn` 會 await 整個 `for await` 迴圈，所以已經是對的——但如果你把它改成 fire-and-forget，這個 bug 就會回來。
+
+**API 金鑰讀不到。** SDK 會自動從環境變數讀 `ANTHROPIC_API_KEY`。在 Windows PowerShell 上用 `$env:ANTHROPIC_API_KEY = "sk-ant-..."`；在 macOS/Linux 上用 `export ANTHROPIC_API_KEY=...`。如果你要用 `.env` 檔案，就裝 `dotenv/config`，或改用 SDK 的 `apiKey` 選項——別把它寫死在程式碼裡。
+
+## 下週那一集要修的東西
+
+目前這隻 agent 有一個很明顯的極限：它活在魚缸裡。不能讀檔案、不能列目錄、不能執行指令。你問的每一個問題，它都只能靠訓練資料，或你貼進終端機的內容來回答。
+
+第 02 集會改變這件事。我們會加上 *tool use*——三個工具：`read_file`、`list_dir`、`run_bash`，讓 Claude 真的能在一個專案目錄裡到處翻。那一集，我們今天鋪好的串流管線才會開始賺回它的成本，因為 tool 呼叫是以內容區塊回來的，得由我們去路由、去回應。
+
+我們也會補一個今晚偷懶跳過的問題：目前如果模型回覆被截掉（撞到 `max_tokens`），我們是靜靜地把它切掉的。第 02 集會把 stop reason 正經地處理好。
+
+## 快速參考——第 01 集
+
+| 項目 | 位置 |
+|---|---|
+| 模型 | `claude-sonnet-4-5` |
+| SDK | `@anthropic-ai/sdk` |
+| 迴圈形狀 | `while(true) { question → stream → push history }` |
+| 記憶體 | 記憶體內的 `history: Turn[]` |
+| 要盯的串流事件 | `content_block_delta`，且 `delta.type === "text_delta"` |
+| 中止開關 | `/exit` |
+
+**最小可行的一個回合：**
+
+```typescript
+history.push({ role: "user", content: userText });
+const stream = client.messages.stream({ model, system, messages: history, max_tokens: 1024 });
+let out = "";
+for await (const e of stream) {
+  if (e.type === "content_block_delta" && e.delta.type === "text_delta") out += e.delta.text;
+}
+history.push({ role: "assistant", content: out });
+```
+
+**活著撐到第 02 集的三條規則：**
+1. 永遠別忘了把 assistant 回合 push 回 history。
+2. 永遠別在串流還開著的時候呼叫 `question`。
+3. 永遠別把「每個任務都不一樣的動態指令」塞進 system prompt。
+
+今晚這隻 agent 的完整程式碼會放在 [github.com/claude-community/mini-claude-code](https://github.com/) 的 `ep-01` 底下。週一見，我們來加工具。

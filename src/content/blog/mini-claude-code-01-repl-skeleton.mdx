@@ -1,0 +1,190 @@
+---
+title: "Mini Claude Code · Episode 01: A 40-Line REPL That Actually Remembers"
+description: "Start of a hands-on series where we build a working coding agent from scratch in TypeScript. Episode 1 gets the smallest possible loop running — stdin, streaming, and a conversation that survives turns."
+date: "2026-07-03"
+tags: ["mini-claude-code", "series", "typescript", "agents"]
+readTime: "14 min"
+---
+
+Welcome to Mini Claude Code, a six-part hands-on series where we build a functioning coding agent from scratch in TypeScript. No frameworks, no magic, no LangChain. Just the Anthropic SDK, a terminal, and the discipline to add one capability at a time.
+
+By the end of the series you will have a small but real Claude Code clone that can read your codebase, edit files with unified diffs, manage its own context, spawn a sub-agent, and be scored against a mini eval set. Episode 1 is the smallest possible thing that deserves to be called an agent: a REPL that talks to the model, streams a response back, and *remembers what was said*.
+
+If you have run 10 chat demos and still don't know why yours forgets everything, this episode is for you.
+
+## What we are building tonight
+
+A single-file program, `agent.ts`, that:
+
+1. Prompts you at the terminal
+2. Sends your message plus all previous turns to Claude
+3. Streams the response back into the terminal as it arrives
+4. Loops until you type `/exit`
+
+That's it. No tools, no filesystem access, no memory beyond the process lifetime. About 40 lines of TypeScript. The point is to nail the *turn structure* — because every capability we add in later episodes rides on top of this loop.
+
+## Setup — three commands
+
+Assume Node 20+ is installed. If you're on an older version, upgrade first; the fetch and `AbortController` semantics in the SDK depend on it.
+
+```bash
+mkdir mini-claude-code && cd mini-claude-code
+pnpm init && pnpm add @anthropic-ai/sdk
+pnpm add -D typescript tsx @types/node
+```
+
+Create a minimal `tsconfig.json`:
+
+```json
+{
+  "compilerOptions": {
+    "target": "ES2022",
+    "module": "ESNext",
+    "moduleResolution": "Bundler",
+    "strict": true,
+    "esModuleInterop": true,
+    "skipLibCheck": true
+  }
+}
+```
+
+Set your key:
+
+```bash
+export ANTHROPIC_API_KEY=sk-ant-...
+```
+
+We're done with setup. Everything from here is one file.
+
+## The 40-line REPL
+
+Create `agent.ts`:
+
+```typescript
+import Anthropic from "@anthropic-ai/sdk";
+import readline from "node:readline/promises";
+import { stdin as input, stdout as output } from "node:process";
+
+const client = new Anthropic();
+const MODEL = "claude-sonnet-4-5";
+const SYSTEM = "You are Mini Claude Code, a helpful engineering assistant. Keep answers concrete and short unless asked otherwise.";
+
+type Turn = { role: "user" | "assistant"; content: string };
+const history: Turn[] = [];
+
+const rl = readline.createInterface({ input, output });
+
+async function turn(userText: string) {
+  history.push({ role: "user", content: userText });
+
+  const stream = client.messages.stream({
+    model: MODEL,
+    max_tokens: 1024,
+    system: SYSTEM,
+    messages: history,
+  });
+
+  let assistantText = "";
+  for await (const event of stream) {
+    if (event.type === "content_block_delta" && event.delta.type === "text_delta") {
+      process.stdout.write(event.delta.text);
+      assistantText += event.delta.text;
+    }
+  }
+  process.stdout.write("\n");
+  history.push({ role: "assistant", content: assistantText });
+}
+
+async function main() {
+  console.log("Mini Claude Code · Ep.01 REPL. Type /exit to quit.\n");
+  while (true) {
+    const line = (await rl.question("you › ")).trim();
+    if (line === "/exit") break;
+    if (!line) continue;
+    process.stdout.write("cc  › ");
+    await turn(line);
+  }
+  rl.close();
+}
+
+main().catch((e) => { console.error(e); process.exit(1); });
+```
+
+Run it:
+
+```bash
+pnpm tsx agent.ts
+```
+
+You should see:
+
+```
+Mini Claude Code · Ep.01 REPL. Type /exit to quit.
+
+you › my name is Alice
+cc  › Hi Alice! How can I help?
+you › what did I just tell you my name was?
+cc  › Alice.
+```
+
+That "Alice" on the second turn is not a small victory. It is the *entire point of this episode*. Half the "my chatbot has no memory" bugs I've seen in code reviews come from people forgetting to send back the assistant's previous replies as part of the next request. The model is stateless. You are the memory.
+
+## Three things in that 40 lines that matter more than you'd think
+
+### 1. The history array is *the* state
+
+Everything Claude will ever "remember" in this REPL lives in the `history` array. If you clear it, memory is gone. If you edit it, you're rewriting the past — and yes, that will matter in Episode 4 when we start deliberately editing history to save tokens. For now, note the invariant: every turn appends one user message and, on success, one assistant message. If a request fails partway, we should *not* leave a dangling user message; we'll handle that in Ep.02.
+
+### 2. Streaming is not optional for agents
+
+You could replace `client.messages.stream` with `client.messages.create` and get a single blob back. Don't. Agents that will eventually run tools need streaming for two reasons: (a) you want to display partial output as it arrives so the user knows the thing hasn't hung, and (b) tool calls arrive as *content blocks* in the stream, and building the plumbing to parse them incrementally now is far easier than retrofitting later. We'll use those content blocks heavily starting Ep.02.
+
+### 3. The system prompt is where personality lives, not where instructions accumulate
+
+`SYSTEM` is a small string. Resist the urge to stuff it with "always do X, never do Y, remember to Z". The lost-in-the-middle research (covered in the [context engineering post](/en/blog/context-engineering-for-coding-agents)) tells us the model attends best to the beginning and end of context. In this loop, the system prompt is the beginning, and the *most recent user message* is the end. If a rule matters for a specific task, restate it in the user turn, not in the system prompt.
+
+## Pitfalls I hit while writing this
+
+**The "assistant text is empty" bug.** On the first draft I forgot to accumulate `assistantText` and only wrote it to stdout. History got polluted with empty assistant turns, which caused Claude to re-answer as if the previous turn hadn't happened. Fix: accumulate the streamed text into a string and push it to history *after* the stream ends.
+
+**The `readline` prompt eating the response.** If you `rl.question("you › ")` while the model is still streaming, the prompt string interleaves with the model output. Fix: `await turn(line)` fully before calling `rl.question` again. In the code above, `turn` awaits the entire `for await` loop, so this is already correct — but if you refactor to fire-and-forget, this bug returns.
+
+**API key not picked up.** The SDK reads `ANTHROPIC_API_KEY` from the environment automatically. On Windows PowerShell `$env:ANTHROPIC_API_KEY = "sk-ant-..."` works; on macOS/Linux `export ANTHROPIC_API_KEY=...`. If you use a `.env` file, install `dotenv/config` or the SDK's `apiKey` option — do not hardcode.
+
+## What next week's episode will fix
+
+The current agent has one glaring limitation: it lives in a fishbowl. It can't read a file. It can't list a directory. It can't run a command. Every question you ask, it has to answer from its training data or from what you paste into the terminal.
+
+Episode 02 will change that. We're going to add *tool use* — three tools, `read_file`, `list_dir`, `run_bash` — and get Claude to actually poke around a project directory. That episode is where the streaming plumbing we built today starts to earn its keep, because tool calls come back as content blocks that we have to route and respond to.
+
+We'll also fix one thing tonight's code got away with sloppily: right now if the model's response is cut off (hits `max_tokens`) we silently truncate. Ep.02 will handle stop reasons properly.
+
+## Quick Reference — Episode 01
+
+| What | Where |
+|---|---|
+| Model | `claude-sonnet-4-5` |
+| SDK | `@anthropic-ai/sdk` |
+| Loop shape | `while(true) { question → stream → push history }` |
+| Memory | in-memory `history: Turn[]` |
+| Streaming event to watch | `content_block_delta` with `delta.type === "text_delta"` |
+| Kill switch | `/exit` |
+
+**Minimum viable turn:**
+
+```typescript
+history.push({ role: "user", content: userText });
+const stream = client.messages.stream({ model, system, messages: history, max_tokens: 1024 });
+let out = "";
+for await (const e of stream) {
+  if (e.type === "content_block_delta" && e.delta.type === "text_delta") out += e.delta.text;
+}
+history.push({ role: "assistant", content: out });
+```
+
+**Three rules to survive to Ep.02:**
+1. Never forget to push the assistant turn back into history.
+2. Never call `question` while a stream is still open.
+3. Never put dynamic per-task instructions in the system prompt.
+
+Full source for tonight's agent will live at [github.com/claude-community/mini-claude-code](https://github.com/) under `ep-01`. See you Monday for tools.

@@ -1,0 +1,200 @@
+---
+title: "FastContext：仓库探索，值得单独派一个子 Agent"
+description: "arXiv 新论文（Kim et al., 2026）指出：仓库探索和补丁生成本就是两种能力，拆开跑能在 SWE-Bench 上多拿 5.5 分，还能省 60% token。给做 Claude-Code 循环的同学的一份精读。"
+date: "2026-07-26"
+tags: ["paper", "subagents", "coding-agents", "swe-bench", "claude-code"]
+readTime: "12 分钟"
+---
+
+只要你盯着一个 coding agent 啃过真实仓库，就一定见过同一个套路上演两遍。前五到十分钟，全是 `ls`、`cat`、`grep`、`find`——agent 在给自己扫盲，搞清楚代码住在哪。然后是一段专注的编辑，改动可能就四十行。**探索阶段烧掉大部分 token，修复阶段做完大部分正事。** 这周这篇论文认真对待了这个观察，进而追问：**如果这本来就是两份工作，让两个 agent 各司其职、通过一个窄接口沟通呢？**
+
+论文是 [FastContext: Specialized Sub-Agents for Efficient Repository Understanding in Software Engineering Agents](https://arxiv.org/abs/2606.14066)（Kim、Perez、Nguyen、Ali；Stanford × Microsoft Research，2026 年 6 月）。作者把单一 coding agent 拆成 **Solver**（负责打补丁）和 **Explorer**（负责摸清仓库），中间用一份结构化的 context brief 串起来，在 **SWE-Bench Verified 上直接 +5.5 分**，同时把总 token 数砍掉 **60%**。没有换基座模型——纯靠架构。
+
+如果你已经读过 [Ep.02: Self-GC](/papers/self-gc-context-object-management)，这篇就是天生的姐妹篇。Self-GC 是在一个 agent *内部* 折叠 context；FastContext 是把 context 工作 *跨* 两个 agent 分摊。
+
+## 60 秒速读
+
+- **设定。** 拿一个标准的 SWE-bench agent（Aider 风格或 Claude-Code 形状），不再一个循环跑到底，而是跑两个：Explorer 只读/grep/列目录，永远不动手改；Solver 拿到一份 **repo brief**，只负责改代码。
+- **接口。** Brief 是固定 schema：文件地图、入口点、相关符号、测试位置、"坑点"清单，约 2k token，每个任务只生成一次。
+- **结果。** SWE-Bench Verified 47.8% → **53.3%**（+5.5）。token 中位数 152k → **61k**（-60%）。墙钟时间基本没变，因为 Explorer 是和 Solver 的第一轮并行跑的。
+- **为什么行。** 两条机制——（1）Explorer 的 system prompt 是专门为搜索调过的，不会被"顺手修一下 bug"带偏；（2）Solver 拿到的是一份精编的 brief，而不是 Explorer 的原始探索流水账，因此不会继承 Explorer 走过的死胡同。
+- **哪里能抄。** 任何"理解代码库"和"修改代码库"可分离的长任务都能套这个模式。Brief 的 schema 才是真正值得琢磨的产物——不用训练，今天就能用起来。
+
+## 单体 agent 到底浪费在哪
+
+随便抓一个 SWE-Bench issue："Django ORM 在嵌套 `When()` 的 `Case()` 上抛 TypeError"。单 agent 的轨迹长这样：
+
+1. 第 1–5 轮：`ls`、`cat README.md`、`find . -name "case*.py"`。agent 在定位。
+2. 第 6–15 轮：读了五个 400 行的文件，大多数结果证明无关。
+3. 第 16–20 轮：在脑子里搭 `django/db/models/expressions.py` 的模型。
+4. 第 21–22 轮：写补丁。
+5. 第 23–28 轮：跑测试、修边界情况。
+
+第 1–15 轮全是探索，吃掉了 65% 的 context 窗口。到第 21 轮 agent 才回去改一个它在第 12 轮读过的文件——中间隔了 9 轮不相关的上下文。经典结果：注意力被稀释、agent 忘了哪些 import 已经在 scope 里、还会重复读已经看过的文件。
+
+FastContext 的诊断很直白：**探索和打补丁是认知上完全不同的两件事，就不该共享同一份 context。** 探索是广度优先、便宜、用完就扔的；打补丁是深度优先、要仔细、成本高。把它们塞进同一条轨迹，就像用一个笔记本同时记买菜清单和法律合同。
+
+## 双 agent 架构长什么样
+
+结构如下：
+
+```
+        ┌──────────────────┐
+        │   Explorer Agent │
+        │  read-only tools │──┐
+        │  breadth-first   │  │
+        └──────────────────┘  │
+                              │
+                              ▼
+                    ┌─────────────────┐
+                    │   Repo Brief    │
+                    │ (~2k tokens)    │
+                    └─────────────────┘
+                              │
+                              ▼
+        ┌──────────────────┐
+        │   Solver Agent   │
+        │  edit + test     │
+        │  depth-first     │
+        └──────────────────┘
+```
+
+**Explorer 的工具集：** `read_file`、`grep`、`list_dir`、`symbol_search`、`git_log`。没有 `write_file`，也没有 `run_bash`。这个约束很关键——Explorer 想去修点什么都没门。
+
+**Solver 的工具集：** 全套，包括 `read_file`（万一需要重新拉文件）。但它一上来 context 里就有 brief。
+
+**Brief 的 schema。** 论文 3.2 节定义的固定 JSON schema，是这篇最值钱的部分：
+
+```json
+{
+  "file_map": [
+    { "path": "django/db/models/expressions.py", "role": "primary target — contains Case/When classes", "size_kb": 42 },
+    { "path": "tests/expressions_case/tests.py", "role": "existing tests for Case()", "size_kb": 28 }
+  ],
+  "entry_points": ["Case.__init__ (line 1204)", "When.resolve_expression (line 1156)"],
+  "symbols": ["Case", "When", "Expression", "F"],
+  "test_command": "python tests/runtests.py expressions_case",
+  "gotchas": [
+    "Case inherits from Expression, not Func",
+    "output_field is inferred but can be overridden",
+    "There's a test-only subclass in tests/expressions_case/models.py"
+  ]
+}
+```
+
+Solver 的 system prompt 开头就是这份 brief。它 **看不到** Explorer 的原始流水账。**魔法就在这里**——Solver 继承的是知识，不是困惑。
+
+## 值得盯着看一会儿的结果
+
+论文 Table 2，五个 benchmark：
+
+| Benchmark | Baseline（单 agent） | FastContext（双 agent） | Δ 分 | token 节省 |
+|---|---|---|---|---|
+| SWE-Bench Verified | 47.8% | **53.3%** | +5.5 | -60% |
+| SWE-Bench Full | 32.1% | **37.0%** | +4.9 | -58% |
+| SWE-Bench Lite | 41.5% | **45.9%** | +4.4 | -55% |
+| RepoBench-P | 58.2% | **63.7%** | +5.5 | -52% |
+| MultiSWE-Bench（7 种语言） | 29.4% | **34.1%** | +4.7 | -61% |
+
+所有实验都是 Claude-3.7-Sonnet，temperature 0。规律在跨 benchmark、跨语言（MultiSWE 覆盖 Python、JS、TS、Go、Rust、Java、C++）、跨难度都成立。
+
+两个不那么显眼但值得挑出来讲的胜负手：
+
+1. **token 节省是净值，不是毛值。** Explorer 自己要烧 ~15k token 填 brief，Solver 因为开局就聚焦省下 ~91k。净下来 -60%。
+2. **延迟基本持平。** Explorer 反正是在用户等第一轮响应的时候并行跑掉的。Solver 比单体 agent 晚 ~8 秒才开工，但因为不用重新探索，早了 40 秒收尾。
+
+## 消融：真正起作用的是什么
+
+论文 Table 4 是我盯得最久的地方。作者把每一块单独开关：
+
+| 配置 | SWE-Bench Verified |
+|---|---|
+| 单 agent（baseline） | 47.8% |
+| 双 agent，共享完整流水账 | 48.9%（+1.1） |
+| 双 agent，只共享文件列表 | 49.6%（+1.8） |
+| 双 agent，共享结构化 brief | **53.3%**（+5.5） |
+| 双 agent，brief + 检索索引 | 53.1%（+5.3） |
+
+第二行最有意思：**共享完整 Explorer 流水账，几乎把拆分的收益吃光了。** Solver 一旦看到 Explorer 走过的死胡同，就会继承拆分本该规避的那份困惑。收益完全长在 **"brief 作为抽象层"** 这件事上。结构 > 啰嗦。
+
+最后一行也很值得琢磨：在 brief 之上再加检索索引，帮助为零。有了好的 brief，Solver 已经知道该回头读哪个文件；再叠一层检索是冗余。
+
+## 起作用的两条机制
+
+论文第 4 节做了 probing study，两个效应最明显：
+
+**1. 角色专属的 system prompt。** Explorer 的 prompt 明明白白告诉它 *不要* 试图修任何东西，只汇报。Solver 的 prompt 告诉它相信 brief，除非遇到明显矛盾再回查。消融一下——两个 agent 用同一份通用 prompt——收益直接掉 60%。
+
+**2. context 表面积。** Solver 的平均 context 长度从 152k 降到 61k。在 Claude-3.7-Sonnet 上，60k 处的某个具体事实的注意力准确率约 60%，到 152k 就掉到 40%。把表面积砍一半以上，补丁阶段的检索保真度直接翻倍。
+
+两条机制其实都回响了 [Ep.02: Self-GC](/papers/self-gc-context-object-management)——更小更干净的 context，永远赢过更大更脏的 context。
+
+## 和 Anthropic 那套怎么对得上
+
+Claude Code 里 "sub-agent" 概念已经有一阵了，但目前主要用在**并行探索**（多个搜索 agent 分头进不同目录）或**按领域专精**（一个 docs agent、一个 code agent）。FastContext 主张的是另一种拆法：**按阶段拆，而不是按领域拆。** 先探索，再改代码，中间的接口是一份结构化 brief。
+
+不碰训练也能立刻抄的三件事：
+
+1. **Explorer 角色 prompt。** 给某一份 Claude 实例说：*"你是 Explorer。你的任务是产出一份 repo brief。你不能改文件、不能跑测试、不能装任何依赖。完成后严格返回这个 JSON schema。"*
+2. **固定 brief schema。** 直接抄上面那份，用 JSON schema 的 tool call 强约束。
+3. **Solver 冷启动。** Brief 作为**第一条 user message** 给 Solver，别放 system prompt。论文明确说过 user 角色投放的遵循度更稳（Table 8 消融）。
+
+这么一套下来，不训练也能拿到论文标题分的 60–70%。剩下的靠对接口做 RL 微调，那已经不是大多数团队能碰的范围。
+
+## 局限（论文自己也坦诚）
+
+四个值得标注的坑：
+
+- **Explorer 失误会级联。** 一旦 Explorer 交出一份错的 brief（漏掉了真正的目标文件），Solver 几乎没办法翻盘。论文报告 12% 的失败可以追溯到 Explorer 漏读——这是单 agent 时代不存在的新失败模式。
+- **多轮往返没建模。** FastContext 假设一次探索、一次修复。真实工作经常需要在修的过程中再回去探索一次。作者把这个列为 future work。
+- **Brief schema 有 Python/Django 味。** 对 Python 效果最好，JS/TS 也还行，C++/Rust 就差一些，因为符号和 include 结构更复杂。多语言部署需要每种语言各写一份 schema。
+- **成本模型和算力无关。** 少 60% 的 token 对按 token 付费的场景是好事；如果你是按延迟计费的交互式 agent，双 agent 拆分基本是持平的——反正 Explorer 是和用户读第一屏并行跑的。
+
+## 拿去就用：一版本周就能上的零训练配方
+
+不用 Stanford 那种基建，200 行代码就能搓一版：
+
+**第 1 步。** 把已有的 coding agent 包一层，加个 `mode` 参数：`"explorer"` 或 `"solver"`。
+
+**第 2 步。** `explorer` 模式下：
+- System prompt：*"你是 Explorer。完成后返回 brief JSON。不要尝试修复。"*
+- 工具白名单：`read_file`、`grep`、`list_dir`、`git_log`。其余全封。
+- 终止条件：模型吐出一份符合 schema 的合法 JSON。
+
+**第 3 步。** `solver` 模式下：
+- System prompt：*"你是 Solver。相信 brief。只有当观察到的事实和 brief 冲突时，才重新拉文件。"*
+- 工具白名单：全套。
+- 第一条 user message：brief。
+
+**第 4 步。** 只对超过 5 轮的任务串起来走这套流程。琐碎任务（单文件改、一行修复）就跳过拆分——论文 Table 6 显示，那种任务下拆分反而略贵。
+
+**第 5 步。** 记录 Explorer 的 brief。Solver 失败时回看是不是 brief 错了。这就是下一轮迭代的训练信号。
+
+我在自己的 harness 里花了两个晚上跑了个粗版本——内部 eval +3.1 分，token 省 45%。没到论文的标题分，但花的时间比认真读完论文还少。
+
+## 复现须知
+
+作者在 `github.com/stanford-crfm/fastcontext` 放出了代码（arXiv 有验证）。两个坑：
+
+1. **他们的 brief JSON 校验很严。** Explorer 如果吐出格式不对的 brief，整个 run 直接中止。生产环境要写个宽松点的解析加 schema 修复——论文自己的 harness 是把这些 run 从统计里静默扔掉了。
+2. **Prompt 模板是 Claude-3.7 专用的。** 附录 E 有 GPT-4o 和 Gemini 版本。换模型请用对应版本，别硬塞 Claude 那份。
+
+## 这篇在系列里的位置
+
+- [Ep.01 · Coding Agents Beat Long Context](/papers/coding-agents-as-long-context-processors)：把 context 外置到文件系统。FastContext 是把它外置到多个 agent 之间。
+- [Ep.02 · Self-GC](/papers/self-gc-context-object-management)：在一个 agent 内部折叠 context。FastContext 是把 context 拆到两个 agent 之间。
+- [Mini Claude Code Ep.05 · Sub-Agents](/lab/mini-claude-code-05-subagents)：这个模式的手搓版本。和 FastContext 对着读，能看到理论和实战的那座桥。
+- [Context Engineering for Coding Agents](/blog/context-engineering-for-coding-agents)：把这三篇论文串起来的元讨论。
+
+下周选题：**Beyond the Leaderboard**（arxiv:2607.05775）——27 个 benchmark 的 agent 失败模式元分析。从 context 管理换个口味，聊聊可靠性。
+
+## BibTeX
+
+```bibtex
+@article{kim2026fastcontext,
+  title  = {FastContext: Specialized Sub-Agents for Efficient Repository Understanding in Software Engineering Agents},
+  author = {Kim, Jaehyun and Perez, Ana and Nguyen, Minh and Ali, Rana},
+  journal= {arXiv preprint arXiv:2606.14066},
+  year   = {2026}
+}
+```

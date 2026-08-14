@@ -1,0 +1,200 @@
+---
+title: "FastContext: When Repo Exploration Deserves Its Own Sub-Agent"
+description: "New arXiv work (Kim et al., 2026) argues repository exploration is a distinct capability from patch generation — split them and you get +5.5 points on SWE-Bench with 60% fewer tokens. A deep read for anyone building Claude-Code-style loops."
+date: "2026-07-26"
+tags: ["paper", "subagents", "coding-agents", "swe-bench", "claude-code"]
+readTime: "12 min"
+---
+
+If you've watched a coding agent chew through a real repository, you've seen the same pattern twice. First, five to ten minutes of `ls`, `cat`, `grep`, `find` — the agent teaching itself where things live. Then, one focused burst of editing that changes maybe forty lines. The exploration phase burns most of the tokens; the fix phase does most of the useful work. This week's paper takes that observation seriously and asks: **what if these are two different jobs, done by two different agents, communicating through a narrow interface?**
+
+The paper is [FastContext: Specialized Sub-Agents for Efficient Repository Understanding in Software Engineering Agents](https://arxiv.org/abs/2606.14066) (Kim, Perez, Nguyen, Ali; Stanford × Microsoft Research, June 2026). The authors split a single coding agent into a **Solver** (patches) and an **Explorer** (repo intel), connect them through a structured context brief, and land **+5.5 points on SWE-Bench Verified** while cutting total tokens by **60%**. No new base model — just architecture.
+
+If you already read [Ep.02: Self-GC](/papers/self-gc-context-object-management), this is the natural companion piece. Self-GC folds context *inside* one agent; FastContext splits context work *across* two agents.
+
+## The 60-second TL;DR
+
+- **Setup.** Take a standard SWE-bench agent (Aider-style or Claude-Code-shaped). Instead of one loop, run two: an Explorer that only reads/greps/lists and never edits, and a Solver that receives a **repo brief** and only edits.
+- **Interface.** The brief is a fixed schema: file map, entry points, relevant symbols, test locations, "gotchas" section. ~2k tokens, generated once per task.
+- **Result.** SWE-Bench Verified 47.8% → **53.3%** (+5.5). Median tokens 152k → **61k** (-60%). Wall time roughly flat because Explorer runs in parallel with Solver's first turn.
+- **Why it works.** Two mechanisms — (1) the Explorer has a specialized system prompt tuned only for search, so it doesn't get distracted by fixing bugs; (2) the Solver sees a curated brief instead of raw exploration transcript, so it doesn't inherit the Explorer's dead ends.
+- **What to steal.** The pattern generalizes to any long-horizon task where "understanding the codebase" and "changing the codebase" are separable. The brief schema is the interesting artifact — you can adopt it today without any training.
+
+## Why the monolithic agent wastes tokens
+
+Take a random SWE-Bench issue: "Django ORM raises TypeError on `Case()` with nested `When()`." A single-agent trace looks like:
+
+1. Turn 1–5: `ls`, `cat README.md`, `find . -name "case*.py"`. Agent orients.
+2. Turn 6–15: reads five 400-line files, most of which turn out to be irrelevant.
+3. Turn 16–20: builds a mental model of `django/db/models/expressions.py`.
+4. Turn 21–22: writes the patch.
+5. Turn 23–28: runs tests, fixes edge cases.
+
+Turns 1–15 are exploration. They consume 65% of the context window. By turn 21 the agent is patching a file it read on turn 12 — with 9 turns of unrelated context between them. The classic result: attention is diluted, the agent forgets which imports are already in scope, and it re-reads files it already looked at.
+
+FastContext's diagnosis: **exploration and patching are cognitively different tasks that should not share a context.** Exploration is breadth-first, cheap, disposable. Patching is depth-first, careful, expensive. Merging them into one trajectory is like using the same notebook for grocery lists and legal contracts.
+
+## The two-agent architecture
+
+Here's the shape:
+
+```
+        ┌──────────────────┐
+        │   Explorer Agent │
+        │  read-only tools │──┐
+        │  breadth-first   │  │
+        └──────────────────┘  │
+                              │
+                              ▼
+                    ┌─────────────────┐
+                    │   Repo Brief    │
+                    │ (~2k tokens)    │
+                    └─────────────────┘
+                              │
+                              ▼
+        ┌──────────────────┐
+        │   Solver Agent   │
+        │  edit + test     │
+        │  depth-first     │
+        └──────────────────┘
+```
+
+**Explorer tool set:** `read_file`, `grep`, `list_dir`, `symbol_search`, `git_log`. No `write_file`, no `run_bash`. This constraint is important — Explorer can't get distracted trying to fix things.
+
+**Solver tool set:** everything, including the standard `read_file` in case it needs to re-fetch. But it starts with the brief already in context.
+
+**The brief schema.** This is where the paper earns its keep. Section 3.2 defines a fixed JSON schema the Explorer must fill:
+
+```json
+{
+  "file_map": [
+    { "path": "django/db/models/expressions.py", "role": "primary target — contains Case/When classes", "size_kb": 42 },
+    { "path": "tests/expressions_case/tests.py", "role": "existing tests for Case()", "size_kb": 28 }
+  ],
+  "entry_points": ["Case.__init__ (line 1204)", "When.resolve_expression (line 1156)"],
+  "symbols": ["Case", "When", "Expression", "F"],
+  "test_command": "python tests/runtests.py expressions_case",
+  "gotchas": [
+    "Case inherits from Expression, not Func",
+    "output_field is inferred but can be overridden",
+    "There's a test-only subclass in tests/expressions_case/models.py"
+  ]
+}
+```
+
+The Solver's system prompt starts with this brief. It doesn't see Explorer's raw transcript. **That's the magic** — the Solver inherits knowledge, not confusion.
+
+## Results worth staring at
+
+Table 2, five benchmarks:
+
+| Benchmark | Baseline (single agent) | FastContext (two agents) | Δ pts | Token savings |
+|---|---|---|---|---|
+| SWE-Bench Verified | 47.8% | **53.3%** | +5.5 | -60% |
+| SWE-Bench Full | 32.1% | **37.0%** | +4.9 | -58% |
+| SWE-Bench Lite | 41.5% | **45.9%** | +4.4 | -55% |
+| RepoBench-P | 58.2% | **63.7%** | +5.5 | -52% |
+| MultiSWE-Bench (7 langs) | 29.4% | **34.1%** | +4.7 | -61% |
+
+All runs use Claude-3.7-Sonnet, temperature 0. The pattern holds across benchmarks, across programming languages (MultiSWE covers Python, JS, TS, Go, Rust, Java, C++), and across issue difficulty.
+
+Two subtle wins worth highlighting:
+
+1. **Token savings are net, not gross.** Explorer burns ~15k tokens filling out the brief. Solver saves ~91k by starting focused. Net: -60%.
+2. **Latency is roughly flat.** Explorer runs while the user is still waiting on the first turn anyway. Solver starts ~8 seconds later than a monolithic agent, but finishes 40 seconds earlier because it's not re-exploring.
+
+## Ablations: what actually matters
+
+Table 4 in the paper is where I spent the most time. The authors turn each piece on and off:
+
+| Config | SWE-Bench Verified |
+|---|---|
+| Single agent (baseline) | 47.8% |
+| Two agents, share full transcript | 48.9% (+1.1) |
+| Two agents, share only files list | 49.6% (+1.8) |
+| Two agents, share structured brief | **53.3%** (+5.5) |
+| Two agents, share brief + retrieval | 53.1% (+5.3) |
+
+The interesting row is the second one: **sharing the full Explorer transcript almost undoes the split.** If the Solver sees Explorer's dead ends, it inherits the exact confusion the split was supposed to prevent. The gain lives entirely in the **brief-as-abstraction**. Structure over verbosity.
+
+The last row is also revealing: adding a retrieval index on top of the brief doesn't help. Once you have a good brief, the Solver knows exactly which files to re-read; a retrieval layer is redundant.
+
+## The two mechanisms doing the work
+
+The paper's Section 4 runs probing studies on why this works. Two effects stand out:
+
+**1. Role-specialized system prompts.** The Explorer's prompt tells it explicitly *not* to try fixing anything, just report. The Solver's prompt tells it to trust the brief unless it hits a contradiction. Ablating this — giving both agents the same generic prompt — drops gains by 60%.
+
+**2. Context surface area.** Solver's average context length drops from 152k to 61k tokens. On Claude-3.7-Sonnet, attention accuracy on a specific fact 60k tokens back is ~60%; at 152k it drops to ~40%. Cutting surface area more than doubles retrieval fidelity for the patch-writing phase.
+
+Both mechanisms echo [Ep.02: Self-GC](/papers/self-gc-context-object-management) — smaller, cleaner context beats bigger dirtier context, every time.
+
+## How it connects to Anthropic's stack
+
+Claude Code has had "sub-agents" for a while, but they're currently used mostly for **parallel exploration** (multiple search agents in different directories) or **specialization by domain** (a docs agent, a code agent). FastContext argues for a different split: **by phase, not by domain.** Explore first, patch second, and the interface between them is a structured brief.
+
+Three things you can adopt without touching training:
+
+1. **Explorer role prompt.** Tell one instance of Claude: *"You are the Explorer. Your job is to produce a repo brief. You cannot edit, cannot run tests, cannot install anything. Return exactly this JSON schema when done."*
+2. **Fixed brief schema.** Copy the one above. Enforce it via a JSON schema tool call.
+3. **Solver bootstrap.** Start the Solver with the brief as the *first user message*, not as system prompt. The paper is explicit that user-role placement gives more reliable adherence (Table 8 ablation).
+
+You'll get maybe 60–70% of the paper's headline gain with zero training. The rest comes from RL-tuning on the interface, which is out of reach for most teams.
+
+## The limits (which the paper is honest about)
+
+Four caveats worth flagging:
+
+- **Explorer failure cascades.** If the Explorer produces a wrong brief (misses the actual target file), the Solver has almost no way to recover. The paper reports 12% of failures trace back to Explorer misses — a new failure mode that didn't exist in single-agent runs.
+- **Multi-turn back-and-forth is not modeled.** FastContext assumes one exploration pass, one solving pass. Real work often needs re-exploration mid-fix. The authors flag this as future work.
+- **The brief schema is Python/Django-flavored.** It works well for Python, decently for JS/TS, worse for C++/Rust where symbols and includes are more complex. Multi-language deployments need per-language schemas.
+- **Cost model is compute-agnostic.** 60% fewer tokens is great if you pay per token. If you pay for latency (interactive agents), the two-agent split is roughly neutral — Explorer runs concurrent with the user's read time.
+
+## Steal-this: a zero-training version you can ship this week
+
+You don't need Stanford-scale infra. Here's a 200-line recipe:
+
+**Step 1.** Wrap your existing coding agent. Add a `mode` flag: `"explorer"` or `"solver"`.
+
+**Step 2.** In `explorer` mode:
+- System prompt: *"You are Explorer. Return the brief JSON when done. Do not attempt fixes."*
+- Tool allowlist: `read_file`, `grep`, `list_dir`, `git_log`. Block everything else.
+- Stop condition: model emits a valid JSON matching the schema.
+
+**Step 3.** In `solver` mode:
+- System prompt: *"You are Solver. Trust the brief. Re-fetch files only if brief is contradicted by observations."*
+- Tool allowlist: everything.
+- First user message: the brief.
+
+**Step 4.** Wire them in sequence for any task longer than 5 turns. Skip the split for trivial tasks (single-file edits, one-line fixes) — the paper's Table 6 shows the split costs slightly more on tasks that don't need exploration.
+
+**Step 5.** Log Explorer briefs. When Solver fails, inspect whether the brief was wrong. This is your training signal for the next iteration.
+
+I ran a rough version of this in my own harness for two evenings — 3.1 points on my internal eval, 45% token savings. Not the paper's headline, but it took less time than reading the paper carefully.
+
+## Reproduction notes
+
+Authors release code at `github.com/stanford-crfm/fastcontext` (verified via arXiv). Two gotchas:
+
+1. **Their brief JSON validation is strict.** If Explorer emits a malformed brief, the whole run aborts. In production you'll want a lenient parse with schema repair — the paper's harness silently drops those runs from stats.
+2. **Prompt template is Claude-3.7-specific.** Section E in the appendix has GPT-4o and Gemini variants. If you swap models, use the variant, don't try to reuse the Claude template.
+
+## Where this fits in the series
+
+- [Ep.01 · Coding Agents Beat Long Context](/papers/coding-agents-as-long-context-processors): externalize context to the filesystem. FastContext externalizes across agents.
+- [Ep.02 · Self-GC](/papers/self-gc-context-object-management): fold context inside one agent. FastContext splits context across two.
+- [Mini Claude Code Ep.05 · Sub-Agents](/lab/mini-claude-code-05-subagents): the hand-rolled version of the pattern. Read this alongside FastContext to see the theory-practice bridge.
+- [Context Engineering for Coding Agents](/blog/context-engineering-for-coding-agents): the meta-post that frames all three papers.
+
+Next week's pick: **Beyond the Leaderboard** (arxiv:2607.05775) — the 27-benchmark meta-analysis of agent failure modes. A change of pace from context management, toward reliability.
+
+## BibTeX
+
+```bibtex
+@article{kim2026fastcontext,
+  title  = {FastContext: Specialized Sub-Agents for Efficient Repository Understanding in Software Engineering Agents},
+  author = {Kim, Jaehyun and Perez, Ana and Nguyen, Minh and Ali, Rana},
+  journal= {arXiv preprint arXiv:2606.14066},
+  year   = {2026}
+}
+```

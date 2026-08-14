@@ -1,0 +1,298 @@
+---
+title: "Mini Claude Code · Episode 05: 独自のコンテキストを持つサブエージェントを起動する"
+description: "Episode 5 ではエージェントを二つに分割する。spawn_subagent ツールを追加し、独自のツールセットと独自のコンテキストウィンドウを持つ新しい Claude にスコープを絞ったタスクを委ね、コンパクトなサマリーを返してもらう。Anthropic の『トークン使用量は結果の品質分散の 80% を説明する』という発見の背後にあるパターンを、約 90 行で実装する。"
+date: "2026-07-05"
+tags: ["mini-claude-code", "series", "typescript", "agents"]
+readTime: "17 min"
+---
+
+四つのエピソードを経て、我々のエージェントは読み書きができ、選択的に記憶し、トランケーションを越えて継続できるようになった。まだできないのは、労働の分担だ。あらゆる観測、あらゆるツール呼び出し、あらゆる推論ステップが単一のコンテキストウィンドウに収まっている。「`src/lib/` 配下をすべてリファクタしろ」というタスクは、先週構築したマスク済みビューにさえ穴を開けてしまうだろう。
+
+今夜はこれをアーキテクチャ的に解決する。*sub-agent* を導入する——独自のシステムプロンプト、独自のツールセット、そして決定的に独自のコンテキストウィンドウを持つ新しい Claude だ。メインのエージェントはオーケストレーターとして振る舞う。サブエージェントはスコープを絞った一つの仕事をこなし、コンパクトなサマリーを返してくる。メインのエージェントはその後もプランを続行するが、サブエージェントが咀嚼したノイジーな生データを見ることは一度もない。
+
+これこそが、Anthropic の「トークン使用量は結果の品質分散の 80% を説明する」という発見の背後にあるパターンである。[コンテキストエンジニアリングの研究](/en/blog/context-engineering-for-coding-agents)が理論を提示するのに対し、今夜は約 90 行のコードでそれを実装する。
+
+## 今夜作るもの
+
+1. `runSubagent(brief, tools, model?)` 関数——独自のヒストリを持つ自己完結型のツール使用ループ
+2. メインエージェントに公開される `spawn_subagent` ツール
+3. 厳格なバジェット：サブエージェントには最大ターン数と最大出力サイズが与えられる
+4. 「返却契約」——サブエージェントの最終メッセージが、そのまま（キャップ付きで）メインエージェントに送り返される
+
+`agent.ts` はそのまま。新規に `subagent.ts` を追加する。
+
+## 正しいメンタルモデル
+
+メインのエージェントは *マネージャー* である。プランのように読めるべきだ：「まず認証がどこで組み込まれているかを見つけ、次にレートリミットのミドルウェアがすでにあるかをチェックし、それからパッチを提案する」。それぞれのサブステップが *タスク* であり、各タスクをそのサブステップだけを仕事とするサブエージェントに委ねられる。
+
+これを安価かつ安全にしているのは二つのことだ：
+
+- **サブエージェントごとのフレッシュなコンテキスト。** 継承されたノイズはない。タスク間で推論が誤って混ざり込むこともない。
+- **コンパクトな返信。** サブエージェントは *マネージャーに何を言うか* を判断しなければならない。この制約が品質を高める——二文のステータスアップデートを書くことを強いられた優秀なジュニアが、Slack に溺れているジュニアより深く考えるのと同じ理屈だ。
+
+トレードオフはオーケストレーションのレイテンシ（余分な往復が一回）と、デバッグがやや難しくなることだ。観測フットプリントが 4000 トークンを超えるタスクなら、どちらも許容できる。
+
+## `runSubagent` を作る
+
+`subagent.ts` を作成する：
+
+```typescript
+import Anthropic from "@anthropic-ai/sdk";
+import type { runTool } from "./agent.js";
+
+const client = new Anthropic();
+
+export interface SubagentOptions {
+  brief: string;
+  toolNames: string[];         // subset of the main agent's tools
+  model?: string;
+  maxTurns?: number;
+  maxOutputChars?: number;
+  systemHint?: string;
+}
+
+export interface SubagentResult {
+  finalText: string;
+  turnsUsed: number;
+  reason: "end_turn" | "max_turns" | "error";
+  errorMessage?: string;
+}
+
+const DEFAULT_MODEL = "claude-sonnet-4-5";
+const DEFAULT_MAX_TURNS = 8;
+const DEFAULT_MAX_OUTPUT = 2000;
+
+const SUBAGENT_SYSTEM = (hint?: string) => `
+You are a scoped sub-agent inside Mini Claude Code. You have a single brief. Complete it, then STOP.
+
+Rules:
+- Do the smallest amount of work that answers the brief.
+- Use tools only when needed. Do not explore.
+- Your final message will be sent back to the manager verbatim. Keep it under ~300 words and structured.
+- If the brief is infeasible, say so in one sentence and stop.
+${hint ? "\nManager hint: " + hint : ""}
+`.trim();
+
+export async function runSubagent(
+  opts: SubagentOptions,
+  runToolFn: typeof runTool,
+  allTools: readonly { name: string; description: string; input_schema: unknown }[],
+): Promise<SubagentResult> {
+  const model = opts.model ?? DEFAULT_MODEL;
+  const maxTurns = opts.maxTurns ?? DEFAULT_MAX_TURNS;
+  const maxOutput = opts.maxOutputChars ?? DEFAULT_MAX_OUTPUT;
+  const tools = allTools.filter((t) => opts.toolNames.includes(t.name));
+
+  const history: Anthropic.MessageParam[] = [
+    { role: "user", content: opts.brief },
+  ];
+
+  for (let turn = 0; turn < maxTurns; turn++) {
+    let response: Anthropic.Message;
+    try {
+      response = await client.messages.create({
+        model,
+        max_tokens: 1500,
+        system: SUBAGENT_SYSTEM(opts.systemHint),
+        tools,
+        messages: history,
+      });
+    } catch (e) {
+      return {
+        finalText: "",
+        turnsUsed: turn,
+        reason: "error",
+        errorMessage: e instanceof Error ? e.message : String(e),
+      };
+    }
+
+    history.push({ role: "assistant", content: response.content });
+
+    if (response.stop_reason !== "tool_use") {
+      const text = response.content
+        .filter((b): b is Anthropic.TextBlock => b.type === "text")
+        .map((b) => b.text)
+        .join("\n")
+        .trim();
+      const capped = text.length > maxOutput ? text.slice(0, maxOutput) + "\n…[truncated by sub-agent budget]" : text;
+      return { finalText: capped, turnsUsed: turn + 1, reason: "end_turn" };
+    }
+
+    const results = [];
+    for (const b of response.content) {
+      if (b.type === "tool_use") {
+        const out = await runToolFn(b.name, b.input as Record<string, unknown>);
+        results.push({ type: "tool_result" as const, tool_use_id: b.id, content: out });
+      }
+    }
+    history.push({ role: "user", content: results });
+  }
+
+  return { finalText: "(sub-agent hit turn cap without concluding)", turnsUsed: maxTurns, reason: "max_turns" };
+}
+```
+
+ここで注目すべき点は五つある：
+
+**削ぎ落とされたシステムプロンプト。** サブエージェントは異なる人格を与えられる：簡潔で、タスクに集中し、探索を禁止されている。これがサブエージェントを有用にするための単一で最も重要なレバーだ。おしゃべりなサブエージェントは壊れたサブエージェントである。
+
+**ツールのアロウリスト。** すべてのサブエージェントがすべてのツールを必要とするわけではない。決めるのはメインのエージェントだ。「関連ファイルを探す」サブエージェントには `list_dir` と `run_bash` だけを渡し、`apply_patch` は渡さない、というふうに。プロンプトに適用される最小権限の原則だ。
+
+**内側にマスクループはない。** サブエージェントのコンテキストは構造的に小さいままだ——数ターンで終わる。Ep.04 の仕組みはここではオーバーキルになる。
+
+**`apply_patch` に対する確認ゲートは設けない。** メインエージェントがサブエージェントに `apply_patch` を許可したら、サブエージェントは `runToolFn` を通じて同じ確認フローを継承する。ゲートはツールに属するのであってエージェントに属するのではない。`runToolFn` を渡している理由はここにある——サブエージェントは何も再実装しない。
+
+**出力に対する厳格な上限。** メインのエージェントが受け取るのは最大でも `maxOutputChars` までだ。サブエージェントがファイル全体をダンプしようとしたらトランケートする。マネージャーがもっと良い問いを立てるべきだったということだ。
+
+## メインエージェントにツールを公開する
+
+メインの `TOOLS` 配列に追加する：
+
+```typescript
+{
+  name: "spawn_subagent",
+  description:
+    "Dispatch a scoped task to a fresh sub-agent. Use for large searches, exploration, or focused refactors. The sub-agent has its own context window; you will only see its final summary. Prefer this over reading many files yourself.",
+  input_schema: {
+    type: "object",
+    properties: {
+      brief: {
+        type: "string",
+        description: "A single-paragraph task description. Be specific about what to return.",
+      },
+      tools: {
+        type: "array",
+        items: { type: "string" },
+        description: "Subset of tool names to grant. Never include spawn_subagent (no recursion).",
+      },
+    },
+    required: ["brief", "tools"],
+  },
+},
+```
+
+「リカージョン禁止」の明示的な注記に注目してほしい。Ep.05 ではサブエージェントはサブエージェントをスポーンできない。難しい問題ではないのだが、失敗モード（ファンアウト、バジェット爆発、デバッグの不透明さ）が難しいので、読者が推論できるバージョンを出したいのだ。
+
+## `runTool` への配線
+
+`agent.ts` の中で：
+
+```typescript
+import { runSubagent } from "./subagent.js";
+
+// inside runTool:
+if (name === "spawn_subagent") {
+  const brief = String(input.brief);
+  const requestedTools = (input.tools as string[]).filter((t) => t !== "spawn_subagent");
+  console.log(`[subagent] brief: ${brief.slice(0, 100)}${brief.length > 100 ? "…" : ""}`);
+  console.log(`[subagent] tools: ${requestedTools.join(", ")}`);
+
+  const result = await runSubagent(
+    { brief, toolNames: requestedTools },
+    runTool, // pass ourselves so the sub-agent reuses tool implementations
+    TOOLS,
+  );
+
+  console.log(`[subagent] done in ${result.turnsUsed} turns, ${result.reason}`);
+  return `SUBAGENT_RESULT (${result.turnsUsed} turns, ${result.reason}):\n\n${result.finalText}`;
+}
+```
+
+`runTool` を `runSubagent` に渡している。循環しているが無害だ——ツール実行器は、自分がメインエージェントに仕えているのかサブエージェントに仕えているのかを知る必要がない。
+
+## サブエージェントを使った実セッションはどう見えるか
+
+```
+you › are there any files under src/lib that don't have a matching test?
+
+cc  › I'll dispatch a sub-agent to enumerate this cleanly.
+
+[tool] spawn_subagent({"brief":"List every .ts file under src/lib recursively.
+For each, check whether a file with the same basename exists under
+tests/lib or under src/lib with a .test.ts suffix. Return a plain list
+of untested files, one per line. If everything is covered, say so.",
+"tools":["list_dir","run_bash"]})
+[subagent] brief: List every .ts file under src/lib recursively. For each, check…
+[subagent] tools: list_dir, run_bash
+[subagent] done in 4 turns, end_turn
+
+Files without tests:
+- src/lib/blog.ts
+- src/lib/mdx-renderer.ts
+- src/lib/i18n-utils.ts
+
+Everything else in src/lib has a matching *.test.ts.
+
+cc  › Three files lack tests: blog.ts, mdx-renderer.ts, i18n-utils.ts.
+Want me to draft skeleton tests for one of them?
+```
+
+メインエージェントのコンテキストが増えたのは：
+- ツール呼び出しに含めたブリーフの記述で約 200 トークン
+- サブエージェントの最終サマリーで約 150 トークン
+
+それだけである。サブエージェントは内部で 4 ターン回して複数の `list_dir` と `grep` の出力を処理したが、そのどれもメインエージェントのヒストリには触れていない。圧縮が生まれるのはここからだ。巧妙なテキスト圧縮からではなく、*生データを壁の向こう側に保っておく* ことから生まれる。
+
+## どのタスクをサブエージェントに任せるか
+
+すべてのタスクがサブエージェント化に値するわけではない。私のざっくりしたルール：
+
+- **サブエージェントにする**：タスクの想定ツール出力が 4000 トークンを超え、*かつ* マネージャーが必要とする答えが短い場合。
+- **インラインにする**：マネージャーがどのみち生データを必要とする場合（例：編集のために特定のファイルを一つ読む）。
+- **絶対にサブエージェントにしない**：対話的な決定を要するもの。ユーザーはメインの REPL を見ている。サブエージェントの内側に `y/N` プロンプトを隠すのは混乱を招く。
+
+マネージャーはプラン時に決める。実際のところ、ツールの記述（"Prefer this over reading many files yourself"）が正直であれば、Claude はこれをうまくやる。
+
+## 書きながらぶつかった落とし穴
+
+**サブエージェントが雑談できると思い込む。** 最初の実行では、サブエージェントのサマリーが「面白い質問ですね！見つけたのは…」という三段落のものだった。修正：構造化された簡潔な出力を要求するようにシステムプロンプトを強化する。長めのタスクだとまだ散文が入り込むことがあるので、「箇条書きで返答せよ」というより厳しい指示が効く。
+
+**ループ経由のファンアウト。** 初期のドラフトで、サブエージェントに名前の部分一致でツールを付与させていた。メインエージェントが `["*"]` と打って、`spawn_subagent` を含むすべてを手に入れてしまい、そこから再帰した。12 層の深さで止めるまでに約 0.60 ドル溶かした。修正：完全一致のみとし、アロウリストから無条件で `spawn_subagent` を除去する。
+
+**サブエージェントの `apply_patch` にも独自の確認が要る。** ツールコードは同じ `confirmPatch` を呼ぶので、ユーザーはサブエージェントの編集からくる `y/N` を目にする。それでよいのだが、自明ではない。どのエージェントが尋ねているのかを明確にログする。プロダクションの Claude Code においても、これは大抵オペレーターにとって最も嬉しくないサプライズだ。
+
+**コストの可視性。** サブエージェントはオペレーターに気づかれずに 8 ターン × 2K max_tokens を焼き切れる。サブエージェントごとにコスト行を追加する：`[subagent] tokens: in=… out=…`。長さの都合で今夜のコードでは省いたが、Ep.06 でちゃんとした計上パスと共に戻ってくる。
+
+## 次エピソードで直すこと
+
+これでアーキテクチャ的な能力は手に入ったが、それを測定する方法がまだない。Ep.06——第一部の最終エピソード——は評価がすべてだ：
+
+- 15 タスクからなる SWE-lite セット（小さく、実在し、検証可能）を `evals/` ディレクトリに置く。
+- 現在のエージェントをそのセットに対して走らせ、合格率、ターン数、コストを報告する `mcc eval` コマンド。
+- ピン留めされたベースライン。これで明日のシステムプロンプト変更が改善なのか悪化なのかがわかる。
+- ようやくプロンプトキャッシュを配線する——評価ループがキャッシュヒットを可視化してくれるからだ。
+
+Ep.05 がアーキテクチャを与えたなら、Ep.06 はそのアーキテクチャをリグレッションなしに反復するためのフィードバックループを与える。
+
+## クイックリファレンス — Episode 05
+
+| 何を | どこで |
+|---|---|
+| サブエージェントランナー | `runSubagent(opts, runTool, TOOLS)` |
+| メインエージェントのツール | `spawn_subagent` |
+| ターンの上限 | 8 |
+| 出力の上限 | 2000 文字 |
+| モデル | `claude-sonnet-4-5`（メインと同じ；異なるシステムプロンプト） |
+| ツールのアロウリスト | マネージャーが渡す、ただし `spawn_subagent` は除外 |
+| 返却フォーマット | `"SUBAGENT_RESULT (N turns, reason):\n\nTEXT"` |
+| リカージョン方針 | Ep.05 では無し |
+
+**最小のサブエージェントターン：**
+
+```typescript
+const result = await runSubagent(
+  { brief: "...", toolNames: ["list_dir", "run_bash"] },
+  runTool, TOOLS,
+);
+return `SUBAGENT_RESULT (${result.turnsUsed}, ${result.reason}):\n\n${result.finalText}`;
+```
+
+**Ep.06 まで生き延びるための六つのルール：**
+1. サブエージェントは *異なる* システムプロンプトを持つ——簡潔で、スコープが絞られ、探索禁止。
+2. サブエージェントには *サブセット* のツールを渡す、全部ではない。
+3. サブエージェントに `spawn_subagent` を絶対に付与しない。
+4. ターン数 *と* 出力の両方に上限を設ける。どちらかの上限に達したらそれは成功ではなくシグナルだ。
+5. どのエージェントが確認を求めているかをログする。
+6. サブエージェント化するタスクは「複雑そうだから」ではなく、観測フットプリントで選ぶ。
+
+次は Ep.06——ついにフィードバックループを構築する。

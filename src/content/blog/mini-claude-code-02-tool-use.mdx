@@ -1,0 +1,243 @@
+---
+title: "Mini Claude Code · Episode 02: Teaching the Agent to Use Tools"
+description: "Episode 2 gives our REPL its first three tools — read_file, list_dir, run_bash — and walks through the tool-use loop with the Anthropic SDK. We handle stop reasons, tool errors, and the surprisingly tricky part of what to put back in the conversation."
+date: "2026-07-04"
+tags: ["mini-claude-code", "series", "typescript", "agents"]
+readTime: "16 min"
+---
+
+Last week we built a REPL that could talk to Claude and remember previous turns. Nice, but useless for coding — the agent can't see your project. This episode we fix that. By the end of tonight, our agent will list directories, read files, and run shell commands, all under Claude's control.
+
+If you take one thing away from this episode, let it be this: **tool use is not a special mode of the model, it's a specific loop we build around it**. The SDK does not "run" your tools. It reports what Claude wants to run; we execute; we report back. Getting this loop right is 80% of building an agent.
+
+## What we are building tonight
+
+Extending `agent.ts` from Ep.01 with:
+
+1. Three tool definitions: `read_file`, `list_dir`, `run_bash`
+2. A tool-execution router
+3. A while-loop that keeps talking to the model until it stops asking for tools
+4. Proper `stop_reason` handling (no more silent truncation)
+
+Same file, roughly doubled in size — about 100 lines.
+
+## The tool-use loop in one paragraph
+
+Send messages → model responds with either a final answer *or* one-to-many `tool_use` content blocks → we execute each tool → we send the results back as `tool_result` blocks in a new user message → model responds again → repeat until the model returns `stop_reason: "end_turn"`. That's it. Any complexity in an agent framework you have ever seen is bells hung on this exact loop.
+
+## Defining the three tools
+
+At the top of `agent.ts`, add:
+
+```typescript
+import fs from "node:fs/promises";
+import path from "node:path";
+import { execFile } from "node:child_process";
+import { promisify } from "node:util";
+
+const execFileP = promisify(execFile);
+const CWD = process.cwd();
+
+const TOOLS = [
+  {
+    name: "read_file",
+    description: "Read a UTF-8 text file from the workspace. Path is relative to the workspace root.",
+    input_schema: {
+      type: "object",
+      properties: { path: { type: "string" } },
+      required: ["path"],
+    },
+  },
+  {
+    name: "list_dir",
+    description: "List entries in a directory relative to the workspace root. Returns one entry per line, directories suffixed with '/'.",
+    input_schema: {
+      type: "object",
+      properties: { path: { type: "string", default: "." } },
+      required: [],
+    },
+  },
+  {
+    name: "run_bash",
+    description: "Run a short shell command in the workspace. Use for grep, find, git status, npm test, etc. Do NOT use for long-running processes.",
+    input_schema: {
+      type: "object",
+      properties: { command: { type: "string" } },
+      required: ["command"],
+    },
+  },
+] as const;
+```
+
+Two decisions worth calling out:
+
+**Relative paths only.** The tools reject absolute paths. In a real Claude Code you would sandbox this properly; for us a `path.resolve(CWD, p)` plus a `startsWith(CWD)` check is enough to keep the agent from wandering into `/etc/passwd` while we're learning. Sandbox strictness scales with how many people you let run your agent.
+
+**`run_bash` uses `execFile` with `shell: true` explicitly avoided at first draft, then flipped on.** For a demo agent, shell semantics (pipes, globs) matter more than the last 5% of safety. We'll add an allow-list in a later episode.
+
+## The tool executor
+
+```typescript
+async function safeResolve(p: string): Promise<string> {
+  if (path.isAbsolute(p)) throw new Error("absolute paths not allowed");
+  const resolved = path.resolve(CWD, p);
+  if (!resolved.startsWith(CWD)) throw new Error("path escapes workspace");
+  return resolved;
+}
+
+async function runTool(name: string, input: Record<string, unknown>): Promise<string> {
+  try {
+    if (name === "read_file") {
+      const p = await safeResolve(String(input.path));
+      const buf = await fs.readFile(p, "utf-8");
+      return buf.length > 20_000 ? buf.slice(0, 20_000) + "\n…[truncated]" : buf;
+    }
+    if (name === "list_dir") {
+      const p = await safeResolve(String(input.path ?? "."));
+      const entries = await fs.readdir(p, { withFileTypes: true });
+      return entries.map((e) => (e.isDirectory() ? e.name + "/" : e.name)).join("\n");
+    }
+    if (name === "run_bash") {
+      const cmd = String(input.command);
+      const { stdout, stderr } = await execFileP("bash", ["-c", cmd], { cwd: CWD, timeout: 15_000, maxBuffer: 200_000 });
+      return (stdout + (stderr ? "\n[stderr]\n" + stderr : "")).slice(0, 20_000) || "(empty)";
+    }
+    return `Unknown tool: ${name}`;
+  } catch (e: unknown) {
+    const msg = e instanceof Error ? e.message : String(e);
+    return `TOOL_ERROR: ${msg}`;
+  }
+}
+```
+
+Three details:
+
+- **All tool errors are returned as strings, not thrown.** The model needs to see the error to reason about the next step. Throwing kills the loop.
+- **Every output is truncated at 20 KB.** Long tool outputs are the #1 cause of context blow-up. See [context engineering](/en/blog/context-engineering-for-coding-agents) — 84% of an agent's turn is often tool observations. Truncate at the source.
+- **Bash has a 15-second timeout and 200 KB stdout cap.** These numbers should feel arbitrary — they are. They exist to catch obvious footguns, not to be correct in all cases.
+
+## The tool-use loop, replacing our previous `turn`
+
+```typescript
+async function turn(userText: string) {
+  history.push({ role: "user", content: userText });
+
+  while (true) {
+    const response = await client.messages.create({
+      model: MODEL,
+      max_tokens: 2048,
+      system: SYSTEM,
+      tools: TOOLS,
+      messages: history,
+    });
+
+    // Push the raw content blocks back — Claude expects them exactly.
+    history.push({ role: "assistant", content: response.content });
+
+    // Print any text blocks for the user.
+    for (const block of response.content) {
+      if (block.type === "text") process.stdout.write(block.text);
+    }
+    process.stdout.write("\n");
+
+    if (response.stop_reason !== "tool_use") {
+      if (response.stop_reason === "max_tokens") {
+        console.warn("[warn] response truncated — consider asking Claude to continue or raising max_tokens");
+      }
+      return;
+    }
+
+    // Execute every tool_use block and collect tool_result blocks.
+    const toolResults = [];
+    for (const block of response.content) {
+      if (block.type === "tool_use") {
+        console.log(`\n[tool] ${block.name}(${JSON.stringify(block.input)})`);
+        const result = await runTool(block.name, block.input as Record<string, unknown>);
+        console.log(`[tool] → ${result.slice(0, 200)}${result.length > 200 ? "…" : ""}\n`);
+        toolResults.push({
+          type: "tool_result" as const,
+          tool_use_id: block.id,
+          content: result,
+        });
+      }
+    }
+    history.push({ role: "user", content: toolResults });
+    // Loop continues — Claude gets to react to the tool results.
+  }
+}
+```
+
+Notice I switched from `messages.stream` to `messages.create` for this episode. Streaming tool calls works, but the incremental content-block assembly is fiddly and orthogonal to what we're teaching tonight. We'll revisit streaming in Ep.05 when it starts to matter for latency.
+
+## What a real conversation looks like
+
+Fire it up in a project directory:
+
+```
+you › what test frameworks does this project use?
+[tool] read_file({"path":"package.json"})
+[tool] → {"name":"my-app","scripts":{"test":"vitest run"},"devDependencies":{"vitest":"^1.3…
+cc  › This project uses Vitest. The test script runs `vitest run`, and Vitest 1.3+ is listed in devDependencies.
+```
+
+Two calls, one tool, one final answer. Now watch what happens when it needs to poke around:
+
+```
+you › does this project have any TODO comments?
+[tool] run_bash({"command":"grep -rn 'TODO' src --include='*.ts' | head -20"})
+[tool] → src/lib/blog.ts:47: // TODO: cache getAllPosts result…
+cc  › Yes — 4 TODOs in src/lib/blog.ts and 1 in src/app/api/upload/route.ts. Want the specifics?
+```
+
+The model chose the right tool without being told which one to use. That's the whole payoff.
+
+## Pitfalls I hit while writing this
+
+**Forgetting to push `response.content` back into history verbatim.** The tool_result blocks I send in the next user message *reference* the `tool_use_id` from the assistant's message. If I strip out the assistant's tool_use blocks (e.g. by only pushing text back), the API rejects the next request with a "tool_result without matching tool_use" error. Fix: push `response.content` as-is; let the SDK types carry.
+
+**The infinite loop.** In my first draft I forgot the `if (response.stop_reason !== "tool_use") return;` guard. The model finished, gave a text answer, `stop_reason` was `"end_turn"`, and my loop kept going, sending the same history back for a re-generation. Cost me about $0.20 before I hit Ctrl+C. Add a hard cap in production — say, 20 iterations per user turn.
+
+**Tool output blowing up the context.** First time I let it run `find .` in a large repo, the tool_result was ~800 KB of paths. Context exhausted, next request returned an error. Fix: truncate at the source (the 20 KB cap above). Do not rely on the model to "just ignore" long tool outputs.
+
+**Silent `max_tokens` truncation.** In Ep.01 our REPL just ended the turn. Now that the model might be mid-plan when it truncates, silent cutoff means broken tool sequences. The `console.warn` above is a placeholder; in Ep.06 we'll add a "continue" auto-prompt.
+
+## What next episode will fix
+
+Right now the agent can *read* your project. It cannot *change* your project. That's the next capability — and it's where things get spicy, because changing files with an LLM is where the majority of production agent failures happen. Ep.03 will add a fourth tool, `apply_patch`, that accepts unified diffs, validates them, dry-runs them, and only then writes to disk. We'll also introduce the pattern of "confirm before destructive action" — every edit gets a preview in the terminal.
+
+Watch also for a subtle thing in tonight's code: `history` is growing linearly with tool outputs. A 10-turn session with a few `run_bash` calls easily hits 30 KB of history. That's fine now; it becomes a problem around Ep.04, which is entirely about squeezing context back down.
+
+## Quick Reference — Episode 02
+
+| What | Where |
+|---|---|
+| Tools declared | `read_file`, `list_dir`, `run_bash` |
+| Stop reason to loop on | `stop_reason === "tool_use"` |
+| Stop reason to warn on | `stop_reason === "max_tokens"` |
+| Push assistant content | `response.content` verbatim, not just text |
+| Push tool results | new user message with `type: "tool_result"` blocks |
+| Truncate tool output | 20 KB hard cap at the executor |
+| Bash safety net | `execFile` with `timeout` + `maxBuffer` + relative-path check |
+
+**Minimum viable tool-use turn:**
+
+```typescript
+while (true) {
+  const r = await client.messages.create({ model, system, tools, messages: history, max_tokens: 2048 });
+  history.push({ role: "assistant", content: r.content });
+  if (r.stop_reason !== "tool_use") return;
+  const results = [];
+  for (const b of r.content) if (b.type === "tool_use") {
+    results.push({ type: "tool_result", tool_use_id: b.id, content: await runTool(b.name, b.input) });
+  }
+  history.push({ role: "user", content: results });
+}
+```
+
+**Four rules to survive to Ep.03:**
+1. Never throw from a tool — return the error string.
+2. Never trust tool output length — truncate at the source.
+3. Never strip `tool_use` blocks from history before sending tool_results.
+4. Never let the loop run without an iteration cap.
+
+Ep.03 next week — where we finally let Claude *edit* files, without destroying your git history.

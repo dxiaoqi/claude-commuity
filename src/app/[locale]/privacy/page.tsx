@@ -1,8 +1,30 @@
 import type { Metadata } from "next";
+import { notFound } from "next/navigation";
+import { defaultLocale, isLocale, locales, type Locale } from "@/i18n/config";
 
-export const metadata: Metadata = { title: "Privacy", description: "How Claude Community collects and uses website and newsletter data.", alternates: { canonical: "/privacy" } };
+interface Props {
+  params: Promise<{ locale: string }>;
+}
 
-export default function PrivacyPage() {
+export async function generateMetadata({ params }: Props): Promise<Metadata> {
+  const { locale: rawLocale } = await params;
+  const locale: Locale = isLocale(rawLocale) ? rawLocale : defaultLocale;
+  return {
+    title: "Privacy",
+    description: "How Claude Community collects and uses website and newsletter data.",
+    alternates: {
+      canonical: `/${locale}/privacy`,
+      languages: Object.fromEntries([
+        ...locales.map((l) => [l, `/${l}/privacy`] as const),
+        ["x-default", `/${defaultLocale}/privacy`] as const,
+      ]),
+    },
+  };
+}
+
+export default async function PrivacyPage({ params }: Props) {
+  const { locale: rawLocale } = await params;
+  if (!isLocale(rawLocale)) notFound();
   return <main id="main" className="article-shell shell-width"><header className="article-hero"><p className="section-label">{"// PLAIN-LANGUAGE POLICY"}</p><h1>Privacy,<br /><span>without fog.</span></h1><p>Last updated June 20, 2026.</p></header><article className="prose" style={{ maxWidth: 760 }}>
     <section><h2>What we collect</h2><p>We collect privacy-friendly page analytics, campaign attribution, and interaction events to understand which guides are useful. If you join the newsletter, we store your email, consent time, signup page, referral data, language, and an anonymized IP fingerprint used for abuse prevention.</p></section>
     <section><h2>Why we collect it</h2><p>We use this data to operate the waitlist, send requested field notes, prevent automated abuse, and learn which search and content experiments help readers.</p></section>

@@ -1,0 +1,317 @@
+---
+title: "Mini Claude Code · 第 06 集：一套終於能告訴你「是不是變糟了」的評測迴圈"
+description: "本季完結。我們建一套 15 個任務的 SWE-lite 測試骨架，讓代理人端到端地跑過一組可驗證的程式碼任務，並接上 prompt caching 讓迭代變得便宜。通過率、平均回合數、每個任務的成本——釘成一份你可以回歸比較的 baseline。"
+date: "2026-07-05"
+tags: ["mini-claude-code", "series", "typescript", "agents"]
+readTime: "18 min"
+---
+
+蓋了五集，到目前為止每一項改進都是憑感覺調的。「遮罩有幫助。」「子代理人感覺比較乾淨。」感覺怎樣，具體來說？跟什麼比？今晚我們用一件我如果一開始更有紀律就該先寫的東西為本季收尾：一套帶有釘住 baseline 的評測骨架，好讓我下次調整 system prompt 時，能在三十分鐘內判斷出代理人是變好還是變壞。
+
+今晚另一件事：prompt caching。自從第 02 集之後，我們每一回合都在對同一份 system prompt 和工具定義付全額的輸入 token 費用。在探索階段那樣沒關係。一旦要跑一個連續 15 次啟動代理人的評測，那就荒謬了。這兩件事共用同一次 commit，因為你沒辦法在無法便宜迭代的情況下迭代 prompt。
+
+## 今晚要做什麼
+
+1. `evals/tasks/` — 15 個可驗證的 SWE-lite 風格任務，每一個是一個資料夾，內含 `setup.sh`、`task.md` 和 `verify.sh`
+2. `evals/runner.ts` — 一個 `mcc eval` 指令，會拿代理人去跑每個任務，並記錄通過 / 失敗 / 回合 / token / 成本
+3. 把 prompt caching 接進 `client.messages.create` — 在 system 區塊與工具上加 `cache_control`
+4. 一份 `baseline.json` — 首次釘在 commit 上的執行結果，讓之後的執行回報 *差量*，而不是原始數字
+
+## 為什麼是 15 個任務，為什麼是「SWE-lite」
+
+十五夠小，可以在約 15 分鐘內跑完；也夠大，能有訊號——在 15 個任務上 80% 的通過率跟 60% 的通過率之間差距，並不是統計雜訊。再大就會讓評測不再是「每次改完 prompt 就重跑」的那種東西。
+
+「SWE-lite」的意思是：小、真實、可驗證：
+
+- 每個任務住在自己的資料夾裡。`setup.sh` 負責準備檔案。`task.md` 是代理人看到的內容。`verify.sh` 通過時回傳 exit 0。
+- 任務取材自 Claude Code 平常一天裡真的會做的事：「修好這個失敗的測試」、「加上一個 null check」、「把這個函式在所有用到的地方改名」、「把這段程式碼抽成 helper」。
+- 沒有任務會需要網路或真實資料庫。全都在一個新建立的暫存資料夾裡跑。
+
+一個任務長這樣：
+
+```
+evals/tasks/03-fix-off-by-one/
+├── setup.sh       # writes buggy code + failing test into $WORK_DIR
+├── task.md        # "The test in sum_test.ts fails. Fix sum.ts so it passes."
+└── verify.sh      # cd $WORK_DIR && npm test -- sum_test.ts
+```
+
+十五個這樣的任務會給你一條訊號通道。再少就是軼事。
+
+## Runner
+
+建立 `evals/runner.ts`：
+
+```typescript
+import { readdir, readFile, mkdtemp, rm } from "node:fs/promises";
+import { join } from "node:path";
+import { tmpdir } from "node:os";
+import { execFile } from "node:child_process";
+import { promisify } from "node:util";
+import Anthropic from "@anthropic-ai/sdk";
+import { TOOLS, runTool } from "../src/agent.js";
+
+const execFileP = promisify(execFile);
+const client = new Anthropic();
+const MODEL = "claude-sonnet-4-5";
+const MAX_TURNS = 30;
+
+interface TaskResult {
+  id: string;
+  passed: boolean;
+  turns: number;
+  inputTokens: number;
+  outputTokens: number;
+  cacheReadTokens: number;
+  cacheWriteTokens: number;
+  costUsd: number;
+  durationMs: number;
+  error?: string;
+}
+
+async function runOneTask(taskDir: string, taskId: string): Promise<TaskResult> {
+  const t0 = Date.now();
+  const workDir = await mkdtemp(join(tmpdir(), `mcc-eval-${taskId}-`));
+  process.env.WORK_DIR = workDir;
+  process.env.MCC_AUTO_APPROVE = "1"; // no y/N inside eval
+
+  try {
+    await execFileP("sh", [join(taskDir, "setup.sh")], { env: process.env });
+    const brief = await readFile(join(taskDir, "task.md"), "utf8");
+
+    const history: Anthropic.MessageParam[] = [
+      { role: "user", content: `Working directory: ${workDir}\n\n${brief}` },
+    ];
+
+    let totIn = 0, totOut = 0, totCacheR = 0, totCacheW = 0;
+    let turns = 0;
+
+    for (; turns < MAX_TURNS; turns++) {
+      const response = await client.messages.create({
+        model: MODEL,
+        max_tokens: 4096,
+        system: [
+          {
+            type: "text",
+            text: "You are Mini Claude Code, running inside an eval harness. Complete the task and stop. Use tools decisively.",
+            cache_control: { type: "ephemeral" },
+          },
+        ],
+        tools: TOOLS.map((t, i) =>
+          i === TOOLS.length - 1 ? { ...t, cache_control: { type: "ephemeral" } } : t
+        ),
+        messages: history,
+      });
+
+      totIn += response.usage.input_tokens;
+      totOut += response.usage.output_tokens;
+      totCacheR += response.usage.cache_read_input_tokens ?? 0;
+      totCacheW += response.usage.cache_creation_input_tokens ?? 0;
+      history.push({ role: "assistant", content: response.content });
+
+      if (response.stop_reason !== "tool_use") break;
+
+      const results = [];
+      for (const b of response.content) {
+        if (b.type === "tool_use") {
+          const out = await runTool(b.name, b.input as Record<string, unknown>);
+          results.push({ type: "tool_result" as const, tool_use_id: b.id, content: out });
+        }
+      }
+      history.push({ role: "user", content: results });
+    }
+
+    let passed = false;
+    try {
+      await execFileP("sh", [join(taskDir, "verify.sh")], { env: process.env, timeout: 30_000 });
+      passed = true;
+    } catch { /* verify script exited non-zero */ }
+
+    // Sonnet 4.5 pricing (USD per 1M tokens)
+    const cost =
+      (totIn - totCacheR - totCacheW) * 3 / 1e6 +
+      totCacheW * 3.75 / 1e6 +
+      totCacheR * 0.30 / 1e6 +
+      totOut * 15 / 1e6;
+
+    return {
+      id: taskId, passed, turns,
+      inputTokens: totIn, outputTokens: totOut,
+      cacheReadTokens: totCacheR, cacheWriteTokens: totCacheW,
+      costUsd: Number(cost.toFixed(4)),
+      durationMs: Date.now() - t0,
+    };
+  } catch (e) {
+    return {
+      id: taskId, passed: false, turns: 0,
+      inputTokens: 0, outputTokens: 0, cacheReadTokens: 0, cacheWriteTokens: 0,
+      costUsd: 0, durationMs: Date.now() - t0,
+      error: e instanceof Error ? e.message : String(e),
+    };
+  } finally {
+    await rm(workDir, { recursive: true, force: true });
+  }
+}
+
+export async function runEval() {
+  const tasksRoot = new URL("./tasks/", import.meta.url).pathname;
+  const dirs = (await readdir(tasksRoot)).sort();
+  const results: TaskResult[] = [];
+
+  for (const d of dirs) {
+    process.stdout.write(`[${d}] `);
+    const r = await runOneTask(join(tasksRoot, d), d);
+    results.push(r);
+    process.stdout.write(`${r.passed ? "PASS" : "FAIL"}  ${r.turns}t  $${r.costUsd}\n`);
+  }
+
+  const passed = results.filter((r) => r.passed).length;
+  const cost = results.reduce((s, r) => s + r.costUsd, 0);
+  const cacheHitRate = results.reduce((s, r) => s + r.cacheReadTokens, 0) /
+    Math.max(1, results.reduce((s, r) => s + r.inputTokens, 0));
+
+  console.log(`\n=== ${passed}/${results.length} passed ===`);
+  console.log(`Mean turns: ${(results.reduce((s, r) => s + r.turns, 0) / results.length).toFixed(1)}`);
+  console.log(`Total cost: $${cost.toFixed(2)}`);
+  console.log(`Cache hit rate: ${(cacheHitRate * 100).toFixed(1)}%`);
+
+  return results;
+}
+```
+
+有五個地方值得停下來看：
+
+**用 `WORK_DIR` 環境變數，而不是 `process.chdir`。** 代理人的工具本來就會遵守一個 base path。在平行批次中改整個 Node 行程的 cwd 是我踩過兩次的地雷。
+
+**評測期間 `MCC_AUTO_APPROVE=1`。** 沿用第 03 集的確認關卡。評測不能停下來等 `y/N`。如果你不想 auto-approve，就別在評測模式的工具集裡放 `apply_patch`——但你幾乎一定會想放它，因為打 patch 才是最有趣的那條軸。
+
+**完整擷取 `usage`。** `input_tokens`、`output_tokens`、`cache_read_input_tokens`、`cache_creation_input_tokens`——四個都要。這是你判斷 prompt caching 是不是真的在動的方法。第一回合會看到 `cache_creation`；之後每一回合都應該看到 `cache_read`。如果沒有，代表快取的斷點放錯位置。
+
+**成本用算的，不用猜的。** Sonnet 4.5 定價直接寫進去。快取讀取比新鮮讀取便宜 10 倍，比快取寫入便宜 12.5 倍。跑一個 30 回合的任務時，這種差距會迅速累積。
+
+**verify 腳本最多 30 秒，多一秒都不給。** `verify.sh` 卡住的話，你會在第 3 個任務時發現，然後憤而放棄。給它一個逾時。
+
+## Prompt caching：真正重要的兩件事
+
+兩個 `cache_control: { type: "ephemeral" }` 標記，就放在這兩個位置：
+
+1. `system` 的最後一個 text 區塊。到這個區塊為止（含）的內容都會被快取。
+2. `tools` 陣列裡的最後一個工具。同樣的道理——到那個標記為止的整個工具清單都是可快取的。
+
+就這樣。Anthropic 會快取前綴。之後每一回合只要在約 5 分鐘內，就會走讀取而不是寫入。
+
+有兩件事會悄悄讓你前功盡棄：
+
+**你在回合之間動了 tools 陣列。** 任何結構性的改動（新增工具、重新排序、改描述）都會讓快取失效。tools 陣列要保持字面上穩定不變。如果你需要動態工具，把它們拆出來，放到快取斷點 *之後*。
+
+**你的 system prompt 裡有時間戳。** 別笑；我幹過。system 區塊裡的 `"Current time: 2026-07-05T18:59:12Z"` 會讓快取每回合都失效。把會變動的資料搬到 user 訊息裡。
+
+## 第一份 baseline
+
+跑一次，把 `baseline.json` commit 進去：
+
+```json
+{
+  "timestamp": "2026-07-05T19:14:22Z",
+  "model": "claude-sonnet-4-5",
+  "commit": "abc12345",
+  "passed": 11,
+  "total": 15,
+  "meanTurns": 6.4,
+  "totalCostUsd": 0.87,
+  "cacheHitRate": 0.71,
+  "byTask": [
+    { "id": "01-add-null-check", "passed": true, "turns": 3, "costUsd": 0.031 },
+    { "id": "02-rename-function", "passed": true, "turns": 5, "costUsd": 0.048 },
+    { "id": "03-fix-off-by-one", "passed": true, "turns": 4, "costUsd": 0.041 },
+    { "id": "04-extract-helper", "passed": false, "turns": 30, "costUsd": 0.152 }
+  ]
+}
+```
+
+上面的數字是我第一次真的跑出來的結果——11/15、平均 6.4 回合、共 $0.87。任務 04 撞到了回合上限，因為代理人一直在重讀檔案而不是記住檔案的內容；第 04 集的遮罩有幫上忙，但那裡還是個軟肋。
+
+下一次我只要動了任何東西——system prompt、子代理人預算、新工具——就跑 `mcc eval` 比較。通過率掉了，我就回滾。平均回合數上升但通過率守住，我就去看是 *哪些* 任務變慢了。這就是我從第 01 集開始就該有的那個迴圈。
+
+## 這 15 個任務的樣貌
+
+老實說的比例大致是：
+
+- **6 個簡單題**（改一個檔案讓一個測試通過）——這裡代理人應該接近 100%。如果沒有，代表工具接線的某處退步了。
+- **6 個中等題**（跨檔案改名、抽 helper、接一個新的 export）——這裡是 prompt / 遮罩 / 子代理人設計會顯現效果的地方。
+- **3 個困難題**（多檔案重構、需求含糊、沒有測試套件）——這裡沒人打得到 3/3。三題中兩題已經是好日子。
+
+我故意把幾道困難題寫得不夠清楚。真實的使用者本來就會寫得不夠清楚。只在題目描述完美時才能運作的代理人是沒用的。
+
+## 我在寫這集時踩到的坑
+
+**快取斷點放在動態區塊之後。** 我第一版把 `cache_control` 放在 *system 訊息字串本身*，同時又在最上方塞了當天的日期。零命中率，首次執行的成本跟沒開快取一模一樣。把會變動的資料搬到 user 回合，或者放到斷點以下。
+
+**任務不夠密封（non-hermetic）。** 我草稿裡的任務 07 依賴一個全域安裝的 `jq`。在同事的機器上沒有 `jq`，任務永遠失敗，baseline 是錯的。`setup.sh` 必須把它需要的一切都裝好，否則任務就不能依賴它。到一個乾淨的 shell 裡本地驗證一次。
+
+**verify.sh 回傳誤判為通過。** 任務 12 的 `verify.sh` 是 `grep -q pattern file`。如果檔案不存在，`grep` 還是會 exit 0，因為我在某處管線接了個 `|| true`。代理人什麼都沒做就得了分。把所有 `|| true` 都刪掉；讓它爆給你看。
+
+**成本那一行說謊了。** 我一開始把 `cache_read_input_tokens` 加到 `input_tokens` 上算總輸入。Anthropic 的 SDK 是把它們分開回傳的——`input_tokens` 只算 *非快取* 的部分。看 SDK 的型別，不要憑印象。
+
+## 這次會 ship 什麼，不會 ship 什麼
+
+會 ship：這套評測骨架、這份 baseline、prompt caching、`mcc eval` 指令。
+
+第 06 集不會 ship：平行化（同時跑多個任務）、暫時性錯誤的重試、模型比較模式（同一份任務集上 Sonnet vs Haiku）、Web 儀表板。每一項都是一個好的週末專案。但沒有一項在「我可以在不盲飛的狀態下迭代 prompt」這條關鍵路徑上。
+
+## 整個系列，一頁看完
+
+六集、一個代理人、總計約 500 行 TypeScript：
+
+| 集 | 我們加了什麼 | 動到的檔案 |
+|---|---|---|
+| 01 | 40 行的 REPL，帶 streaming 和歷史紀錄 | `agent.ts` |
+| 02 | 三個工具 + tool-use 迴圈 | `agent.ts` |
+| 03 | `apply_patch`，帶 dry-run 與確認 | `agent.ts`、`patch.ts` |
+| 04 | 觀察遮罩 + 自動續行 | `agent.ts` |
+| 05 | 擁有獨立上下文的子代理人 | `agent.ts`、`subagent.ts` |
+| 06 | 評測骨架 + prompt caching + baseline | `evals/runner.ts`、`evals/tasks/*` |
+
+如果你一路跟著蓋下來，現在你手上有一個看起來、行為都很像一個小巧、範圍清晰的 code agent 的東西。它 *不是* Claude Code——Claude Code 有多年的加固、幾十個工具、真正的終端 UI、MCP、sandboxing，還有一整套我用手輕輕帶過的權限模型。但它是一個能動的代理人，而且它每一項設計決策你都懂、都可以今晚就改。
+
+你現在擁有的最有用的東西，不是那些程式碼。是那套評測骨架。從這裡開始你蓋的每一樣——新工具、新的子代理人型態、新的遮罩啟發式、換模型——要嘛通過第 06 集，要嘛就別 ship。
+
+## 快速查閱 — 第 06 集
+
+| 是什麼 | 在哪裡 |
+|---|---|
+| Runner 入口 | `evals/runner.ts` 中的 `runEval()` |
+| 任務結構 | `setup.sh` + `task.md` + `verify.sh` |
+| 回合上限 | 30（困難題要有喘息空間）|
+| 自動核准 | runner 設定 `MCC_AUTO_APPROVE=1` |
+| 快取斷點 | 最後一個 `system` text 區塊、`tools` 中的最後一個工具 |
+| 紀錄的指標 | 通過、回合、輸入/輸出/cache-r/cache-w token、成本、毫秒 |
+| Baseline 位置 | `evals/baseline.json`，要 commit 進去 |
+| CLI 指令 | `mcc eval`（薄薄包住 `runEval` 的一層）|
+
+**最小可行的帶快取請求：**
+
+```typescript
+await client.messages.create({
+  model: "claude-sonnet-4-5",
+  max_tokens: 4096,
+  system: [{ type: "text", text: SYSTEM, cache_control: { type: "ephemeral" } }],
+  tools: TOOLS.map((t, i) =>
+    i === TOOLS.length - 1 ? { ...t, cache_control: { type: "ephemeral" } } : t
+  ),
+  messages: history,
+});
+```
+
+**超越本系列也還適用的七條規則：**
+1. 動任何東西之前先釘一份 baseline。
+2. 十五個任務是能給你訊號的最小數量。
+3. 要嘛是密封的任務，要嘛就別當任務。
+4. `verify.sh` 一定要大聲失敗；把每個 `|| true` 都拔掉。
+5. 快取斷點放在穩定前綴 *之後*，不要放在會變動的區塊上。
+6. 四個 `usage` 欄位全都要記；少一個都是在猜。
+7. 之後每一次對代理人的改動，落地前都要跑過評測。
+
+這就是整條弧線。第一季在這裡收尾。這個代理人小、誠實、而且今晚起——第一次——是可量測的。如果你要繼續延伸它，就順手把評測一起延伸。這才是全部的紀律所在。
+
+謝謝你一路蓋到這裡。

@@ -1,0 +1,243 @@
+---
+title: "Mini Claude Code · 第 02 集：教會 Agent 使用工具"
+description: "第 2 集為我們的 REPL 加上前三個工具——read_file、list_dir、run_bash——並帶你走過使用 Anthropic SDK 的 tool use 迴圈。我們會處理 stop reason、工具錯誤，以及那個出乎意料棘手的部分：到底要把什麼東西塞回對話裡。"
+date: "2026-07-04"
+tags: ["mini-claude-code", "series", "typescript", "agents"]
+readTime: "16 min"
+---
+
+上週我們打造了一個可以跟 Claude 對話、也記得住先前輪次的 REPL。不錯，但對寫程式來說沒什麼用——這個 agent 看不到你的專案。這一集我們就來修好這件事。今晚結束前，我們的 agent 就能列出目錄、讀取檔案、執行 shell 指令，一切都由 Claude 操控。
+
+如果這一集你只想帶走一件事，那就是這一件：**tool use 並不是模型的某種特殊模式，而是我們在它周圍打造的一個特定迴圈**。SDK 不會幫你「執行」工具。它只是回報 Claude 想執行什麼；我們去執行；我們把結果回報回去。把這個迴圈做對，就完成了打造一個 agent 的 80%。
+
+## 今晚我們要做的事
+
+沿用第 01 集的 `agent.ts`，補上：
+
+1. 三個工具定義：`read_file`、`list_dir`、`run_bash`
+2. 一個工具執行路由
+3. 一個 while 迴圈，持續跟模型對話，直到它不再要求使用工具
+4. 妥善的 `stop_reason` 處理（不再讓訊息被無聲截斷）
+
+同一個檔案，程式碼份量大約翻倍——約莫 100 行。
+
+## 一段話講完 tool use 迴圈
+
+送出訊息 → 模型回傳最終答案*或*一到多個 `tool_use` 內容區塊 → 我們執行每個工具 → 把結果以 `tool_result` 區塊包成新的 user 訊息送回去 → 模型再次回應 → 重複直到模型回傳 `stop_reason: "end_turn"`。就這樣。你在任何 agent 框架看過的複雜度，都只是掛在這個迴圈上的裝飾品。
+
+## 定義三個工具
+
+在 `agent.ts` 檔案最上方加上：
+
+```typescript
+import fs from "node:fs/promises";
+import path from "node:path";
+import { execFile } from "node:child_process";
+import { promisify } from "node:util";
+
+const execFileP = promisify(execFile);
+const CWD = process.cwd();
+
+const TOOLS = [
+  {
+    name: "read_file",
+    description: "Read a UTF-8 text file from the workspace. Path is relative to the workspace root.",
+    input_schema: {
+      type: "object",
+      properties: { path: { type: "string" } },
+      required: ["path"],
+    },
+  },
+  {
+    name: "list_dir",
+    description: "List entries in a directory relative to the workspace root. Returns one entry per line, directories suffixed with '/'.",
+    input_schema: {
+      type: "object",
+      properties: { path: { type: "string", default: "." } },
+      required: [],
+    },
+  },
+  {
+    name: "run_bash",
+    description: "Run a short shell command in the workspace. Use for grep, find, git status, npm test, etc. Do NOT use for long-running processes.",
+    input_schema: {
+      type: "object",
+      properties: { command: { type: "string" } },
+      required: ["command"],
+    },
+  },
+] as const;
+```
+
+有兩個決策值得特別點出來：
+
+**只接受相對路徑。** 這些工具會拒絕絕對路徑。在真正的 Claude Code 裡你會把它做成一個嚴謹的沙盒；對我們來說，一個 `path.resolve(CWD, p)` 加上 `startsWith(CWD)` 的檢查，就足以阻止 agent 在學習過程中亂晃到 `/etc/passwd`。沙盒的嚴格度會隨著你放進來的使用者人數而擴張。
+
+**`run_bash` 使用 `execFile`，第一版刻意不開 `shell: true`，之後再打開。** 對一個示範用的 agent 而言，shell 語意（管線、glob）比最後那 5% 的安全性更重要。之後的集數會補上白名單。
+
+## 工具執行器
+
+```typescript
+async function safeResolve(p: string): Promise<string> {
+  if (path.isAbsolute(p)) throw new Error("absolute paths not allowed");
+  const resolved = path.resolve(CWD, p);
+  if (!resolved.startsWith(CWD)) throw new Error("path escapes workspace");
+  return resolved;
+}
+
+async function runTool(name: string, input: Record<string, unknown>): Promise<string> {
+  try {
+    if (name === "read_file") {
+      const p = await safeResolve(String(input.path));
+      const buf = await fs.readFile(p, "utf-8");
+      return buf.length > 20_000 ? buf.slice(0, 20_000) + "\n…[truncated]" : buf;
+    }
+    if (name === "list_dir") {
+      const p = await safeResolve(String(input.path ?? "."));
+      const entries = await fs.readdir(p, { withFileTypes: true });
+      return entries.map((e) => (e.isDirectory() ? e.name + "/" : e.name)).join("\n");
+    }
+    if (name === "run_bash") {
+      const cmd = String(input.command);
+      const { stdout, stderr } = await execFileP("bash", ["-c", cmd], { cwd: CWD, timeout: 15_000, maxBuffer: 200_000 });
+      return (stdout + (stderr ? "\n[stderr]\n" + stderr : "")).slice(0, 20_000) || "(empty)";
+    }
+    return `Unknown tool: ${name}`;
+  } catch (e: unknown) {
+    const msg = e instanceof Error ? e.message : String(e);
+    return `TOOL_ERROR: ${msg}`;
+  }
+}
+```
+
+三個細節：
+
+- **所有工具錯誤都以字串形式回傳，而不是 throw。** 模型必須看到錯誤，才能推理下一步該怎麼走。throw 出去就把迴圈打死了。
+- **每一個輸出都在 20 KB 的地方截斷。** 過長的工具輸出，是把上下文撐爆的頭號元兇。可以參考 [context engineering](/en/blog/context-engineering-for-coding-agents)——一個 agent 的輪次裡，往往有 84% 的內容是工具觀察結果。要在源頭就截斷。
+- **Bash 有 15 秒逾時，以及 200 KB 的 stdout 上限。** 這些數字看起來應該就是很隨便——它們就是很隨便。存在的目的是接住明顯的地雷，而不是在所有情況下都「正確」。
+
+## tool use 迴圈，取代我們先前的 `turn`
+
+```typescript
+async function turn(userText: string) {
+  history.push({ role: "user", content: userText });
+
+  while (true) {
+    const response = await client.messages.create({
+      model: MODEL,
+      max_tokens: 2048,
+      system: SYSTEM,
+      tools: TOOLS,
+      messages: history,
+    });
+
+    // Push the raw content blocks back — Claude expects them exactly.
+    history.push({ role: "assistant", content: response.content });
+
+    // Print any text blocks for the user.
+    for (const block of response.content) {
+      if (block.type === "text") process.stdout.write(block.text);
+    }
+    process.stdout.write("\n");
+
+    if (response.stop_reason !== "tool_use") {
+      if (response.stop_reason === "max_tokens") {
+        console.warn("[warn] response truncated — consider asking Claude to continue or raising max_tokens");
+      }
+      return;
+    }
+
+    // Execute every tool_use block and collect tool_result blocks.
+    const toolResults = [];
+    for (const block of response.content) {
+      if (block.type === "tool_use") {
+        console.log(`\n[tool] ${block.name}(${JSON.stringify(block.input)})`);
+        const result = await runTool(block.name, block.input as Record<string, unknown>);
+        console.log(`[tool] → ${result.slice(0, 200)}${result.length > 200 ? "…" : ""}\n`);
+        toolResults.push({
+          type: "tool_result" as const,
+          tool_use_id: block.id,
+          content: result,
+        });
+      }
+    }
+    history.push({ role: "user", content: toolResults });
+    // Loop continues — Claude gets to react to the tool results.
+  }
+}
+```
+
+注意我這一集把 `messages.stream` 換成了 `messages.create`。串流化的工具呼叫也能運作，但要一塊一塊組裝內容區塊很囉唆，而且跟今晚要教的東西沒什麼關係。我們會在第 05 集延遲開始重要時，再回頭處理串流。
+
+## 一段真正的對話長什麼樣
+
+在專案目錄裡跑起來：
+
+```
+you › what test frameworks does this project use?
+[tool] read_file({"path":"package.json"})
+[tool] → {"name":"my-app","scripts":{"test":"vitest run"},"devDependencies":{"vitest":"^1.3…
+cc  › This project uses Vitest. The test script runs `vitest run`, and Vitest 1.3+ is listed in devDependencies.
+```
+
+兩次呼叫，一個工具，一個最終答案。接著看看它需要四處翻找時會發生什麼事：
+
+```
+you › does this project have any TODO comments?
+[tool] run_bash({"command":"grep -rn 'TODO' src --include='*.ts' | head -20"})
+[tool] → src/lib/blog.ts:47: // TODO: cache getAllPosts result…
+cc  › Yes — 4 TODOs in src/lib/blog.ts and 1 in src/app/api/upload/route.ts. Want the specifics?
+```
+
+模型自己選對了工具，我們沒告訴它該用哪個。這就是全部的回報。
+
+## 寫這篇時我踩到的坑
+
+**忘了把 `response.content` 原封不動塞回 history。** 我在下一則 user 訊息中送出的 tool_result 區塊，會用 `tool_use_id` *參照*到 assistant 訊息裡對應的 tool_use。如果我把 assistant 的 tool_use 區塊剝掉（例如只把 text 塞回去），API 就會用「tool_result without matching tool_use」的錯誤把下一個請求打回票。修法：`response.content` 原樣塞回去，型別交給 SDK 處理。
+
+**無窮迴圈。** 我第一版忘了寫 `if (response.stop_reason !== "tool_use") return;` 的守衛。模型講完了，給了純文字答案，`stop_reason` 是 `"end_turn"`，但我的迴圈還在跑，把同一份 history 又送出去讓它重新生成一次。在我按下 Ctrl+C 之前燒掉了大約 0.20 美元。上線前記得加個硬上限——例如每個使用者輪次最多 20 次迭代。
+
+**工具輸出把上下文撐爆。** 我第一次讓它在一個大 repo 裡跑 `find .`，tool_result 大約有 800 KB 的路徑。上下文吃光光，下一個請求直接錯誤。修法：在源頭就截斷（上面那個 20 KB 上限）。不要指望模型會「識相地忽略」過長的工具輸出。
+
+**無聲的 `max_tokens` 截斷。** 在第 01 集裡我們的 REPL 就只是結束該輪。但現在模型在被截斷時可能正處於計畫中途，無聲的切斷會讓整段工具序列崩掉。上面那句 `console.warn` 只是佔位；第 06 集我們會加上「continue」自動 prompt。
+
+## 下一集會修掉的事
+
+現在這個 agent 可以*讀*你的專案，但沒辦法*改*你的專案。那就是下一個要加上的能力——而且是事情開始變刺激的地方，因為用 LLM 去改檔案，正是生產環境中大多數 agent 出包的地方。第 03 集會加上第四個工具 `apply_patch`，接受 unified diff、驗證它、以 dry run 試跑一次，確認沒問題才寫回磁碟。我們也會引進「在破壞性動作之前先確認」的模式——每一次編輯，都會在終端機裡先給你看一份預覽。
+
+也留意今晚程式碼裡一個微妙的問題：`history` 會隨著工具輸出線性成長。一個包含幾次 `run_bash` 呼叫的 10 輪對話，history 很輕易就會來到 30 KB。目前還好；到第 04 集就會變成問題，而那一集整集就是在講怎麼把上下文擠回去。
+
+## 快速查閱 · 第 02 集
+
+| 項目 | 位置／值 |
+|---|---|
+| 已宣告的工具 | `read_file`、`list_dir`、`run_bash` |
+| 要繼續迴圈的 stop reason | `stop_reason === "tool_use"` |
+| 要發出警告的 stop reason | `stop_reason === "max_tokens"` |
+| Push assistant 內容 | `response.content` 原樣塞回，不要只塞 text |
+| Push 工具結果 | 用新的 user 訊息，裝著 `type: "tool_result"` 區塊 |
+| 截斷工具輸出 | 在執行器層做 20 KB 硬上限 |
+| Bash 安全網 | `execFile` 加上 `timeout` + `maxBuffer` + 相對路徑檢查 |
+
+**最小可行的 tool use 輪次：**
+
+```typescript
+while (true) {
+  const r = await client.messages.create({ model, system, tools, messages: history, max_tokens: 2048 });
+  history.push({ role: "assistant", content: r.content });
+  if (r.stop_reason !== "tool_use") return;
+  const results = [];
+  for (const b of r.content) if (b.type === "tool_use") {
+    results.push({ type: "tool_result", tool_use_id: b.id, content: await runTool(b.name, b.input) });
+  }
+  history.push({ role: "user", content: results });
+}
+```
+
+**撐到第 03 集的四條守則：**
+1. 工具裡絕不要 throw——把錯誤字串回傳出去。
+2. 絕不要相信工具輸出的長度——在源頭截斷。
+3. 絕不要在送出 tool_result 之前，把 `tool_use` 區塊從 history 裡剝掉。
+4. 絕不要讓迴圈在沒有迭代上限的情況下跑。
+
+第 03 集下週見——我們終於要讓 Claude *編輯*檔案，而且不會毀掉你的 git 歷史。

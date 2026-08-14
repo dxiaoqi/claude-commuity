@@ -1,0 +1,341 @@
+---
+title: "Mini Claude Code · Episode 03: Editing Files Without Wrecking the Repo"
+description: "Episode 3 adds the apply_patch tool — the one where most agents quietly destroy your work. We build a strict unified-diff applier with dry-run preview, workspace guardrails, and a confirmation gate that survives a Claude in a bad mood."
+date: "2026-07-04"
+tags: ["mini-claude-code", "series", "typescript", "agents"]
+readTime: "17 min"
+---
+
+Last week our agent learned to read files, list directories, and run bash. It can now form opinions about your code. Tonight it earns the right to change it — carefully.
+
+If Ep.02 was the fun episode, Ep.03 is the *scary* one. This is where 90% of self-built agents silently corrupt a file, overwrite an unrelated function, or drop a semicolon into the middle of a JSON config and only discover it three commits later. We are going to build one tool — `apply_patch` — and we're going to put more guardrails on it than on the previous three combined.
+
+**Rule of the night**: every write must be reversible, previewable, and refusable.
+
+## What we are building tonight
+
+Extending `agent.ts` with:
+
+1. A fourth tool: `apply_patch` that accepts a strict unified diff
+2. A validator that rejects malformed or ambiguous diffs *before* touching disk
+3. A dry-run pass that shows the exact `before → after` for every hunk
+4. A confirmation gate (interactive by default; auto-approve behind a flag)
+5. A backup step so every write leaves a `.bak` next to the file
+
+That is a lot for one tool. It's still under 150 lines. It is worth every one.
+
+## Why unified diff and not `write_file`?
+
+The obvious alternative is a `write_file(path, content)` tool: agent generates the whole new file, we overwrite. Do not do this. Three reasons:
+
+1. **Cost.** For a 500-line file with a 3-line change, `write_file` costs you 500 lines of output tokens. `apply_patch` costs ~15.
+2. **Reasoning.** Diffs force the model to think in terms of *change*, not in terms of *restatement*. The failure mode of restatement is silent drift — the model rewrites unrelated lines "while it's there" and you don't notice.
+3. **Reviewability.** A diff is human-readable. A blob of 500 lines is not. When we add the confirmation gate below, the operator (you) needs to scan the change in two seconds.
+
+The tradeoff: diffs are fussy. Line numbers must match; context lines must match; whitespace matters. This is why the validator is the biggest piece of tonight's code.
+
+## The diff format we accept
+
+We accept the *unified diff* format, the same thing `git diff` outputs:
+
+```
+--- a/src/lib/blog.ts
++++ b/src/lib/blog.ts
+@@ -46,3 +46,4 @@ export function getAllPosts(...) {
+   if (!fs.existsSync(CONTENT_DIR)) return [];
+   const files = fs.readdirSync(CONTENT_DIR).filter((f) => /\.mdx?$/.test(f));
++  const cache = new Map<string, PostMeta>();
+   const bySlug = new Map<string, { file: string; locale: Locale }[]>();
+```
+
+Rules we enforce, strictly:
+
+- Exactly one file per patch (the `--- a/…` / `+++ b/…` header pair).
+- Every hunk starts with `@@ -oldStart,oldCount +newStart,newCount @@`.
+- Every non-header line begins with ` ` (context), `-` (removal), or `+` (addition).
+- Context and removal lines must match the current file byte-for-byte at the given line range.
+- No binary files, no rename, no mode changes. Ep.03 keeps the surface small on purpose.
+
+If any rule fails, we reject with a specific error string. The model reads the error and tries again. This is the exact loop pattern we set up in Ep.02.
+
+## Add the tool declaration
+
+At the top of `agent.ts`, append to the `TOOLS` array:
+
+```typescript
+{
+  name: "apply_patch",
+  description:
+    "Apply a unified diff to a single file in the workspace. The diff must include --- a/PATH / +++ b/PATH headers and one or more @@ hunks. Context lines must match the current file exactly.",
+  input_schema: {
+    type: "object",
+    properties: {
+      diff: { type: "string", description: "A unified diff, exactly one file." },
+    },
+    required: ["diff"],
+  },
+},
+```
+
+Do *not* include a `dry_run` flag. The tool always dry-runs first internally and reports the preview back to the model; the actual write happens after human confirmation, gated by a separate mechanism.
+
+## The parser and applier
+
+Add a new file `patch.ts` — this keeps `agent.ts` readable:
+
+```typescript
+import fs from "node:fs/promises";
+import path from "node:path";
+
+export interface Hunk {
+  oldStart: number;
+  oldCount: number;
+  newStart: number;
+  newCount: number;
+  lines: string[]; // includes leading " ", "-", "+"
+}
+
+export interface ParsedPatch {
+  filePath: string;
+  hunks: Hunk[];
+}
+
+const HUNK_RE = /^@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@/;
+
+export function parsePatch(diff: string): ParsedPatch {
+  const lines = diff.split("\n");
+  let filePath: string | null = null;
+
+  const hunks: Hunk[] = [];
+  let current: Hunk | null = null;
+
+  for (let i = 0; i < lines.length; i++) {
+    const line = lines[i];
+    if (line.startsWith("--- a/")) continue;
+    if (line.startsWith("+++ b/")) {
+      if (filePath !== null) throw new Error("multiple files in patch not supported");
+      filePath = line.slice(6).trim();
+      continue;
+    }
+    const m = line.match(HUNK_RE);
+    if (m) {
+      if (current) hunks.push(current);
+      current = {
+        oldStart: parseInt(m[1], 10),
+        oldCount: m[2] ? parseInt(m[2], 10) : 1,
+        newStart: parseInt(m[3], 10),
+        newCount: m[4] ? parseInt(m[4], 10) : 1,
+        lines: [],
+      };
+      continue;
+    }
+    if (current) {
+      if (line === "" && i === lines.length - 1) continue; // trailing newline
+      if (line[0] !== " " && line[0] !== "-" && line[0] !== "+" && line[0] !== "\\") {
+        throw new Error(`invalid hunk line: ${JSON.stringify(line)}`);
+      }
+      current.lines.push(line);
+    }
+  }
+  if (current) hunks.push(current);
+  if (!filePath) throw new Error("missing +++ b/PATH header");
+  if (hunks.length === 0) throw new Error("no hunks in patch");
+  return { filePath, hunks };
+}
+
+export interface DryRunResult {
+  filePath: string;
+  before: string;
+  after: string;
+  hunkSummaries: { header: string; added: number; removed: number }[];
+}
+
+export async function dryRun(cwd: string, patch: ParsedPatch): Promise<DryRunResult> {
+  const absPath = path.resolve(cwd, patch.filePath);
+  if (!absPath.startsWith(cwd)) throw new Error("path escapes workspace");
+  const before = await fs.readFile(absPath, "utf-8");
+  const beforeLines = before.split("\n");
+
+  // Apply hunks in reverse so line numbers stay valid.
+  const workLines = [...beforeLines];
+  const hunkSummaries = [];
+  const sortedHunks = [...patch.hunks].sort((a, b) => b.oldStart - a.oldStart);
+
+  for (const h of sortedHunks) {
+    let added = 0;
+    let removed = 0;
+    const replacement: string[] = [];
+    let cursor = h.oldStart - 1;
+
+    for (const l of h.lines) {
+      const tag = l[0];
+      const body = l.slice(1);
+      if (tag === " ") {
+        if (workLines[cursor] !== body) {
+          throw new Error(
+            `context mismatch at line ${cursor + 1}: expected ${JSON.stringify(body)}, got ${JSON.stringify(workLines[cursor])}`,
+          );
+        }
+        replacement.push(body);
+        cursor++;
+      } else if (tag === "-") {
+        if (workLines[cursor] !== body) {
+          throw new Error(
+            `removal mismatch at line ${cursor + 1}: expected ${JSON.stringify(body)}, got ${JSON.stringify(workLines[cursor])}`,
+          );
+        }
+        removed++;
+        cursor++;
+      } else if (tag === "+") {
+        replacement.push(body);
+        added++;
+      }
+    }
+    workLines.splice(h.oldStart - 1, cursor - (h.oldStart - 1), ...replacement);
+    hunkSummaries.push({ header: `@@ -${h.oldStart},${h.oldCount} +${h.newStart},${h.newCount} @@`, added, removed });
+  }
+
+  return { filePath: patch.filePath, before, after: workLines.join("\n"), hunkSummaries };
+}
+
+export async function commit(cwd: string, patch: ParsedPatch, after: string): Promise<void> {
+  const absPath = path.resolve(cwd, patch.filePath);
+  // Backup first.
+  const original = await fs.readFile(absPath, "utf-8");
+  await fs.writeFile(absPath + ".bak", original, "utf-8");
+  await fs.writeFile(absPath, after, "utf-8");
+}
+```
+
+Three details worth pausing on:
+
+**Applying hunks in reverse order** avoids the classic bug where the second hunk's line numbers are stale because the first hunk changed the file's length. Sort descending by `oldStart` before applying.
+
+**Byte-exact context matching.** No whitespace normalization, no fuzzy matching, no "close enough". Whitespace bugs in diffs are the single most common failure mode; treating them as errors forces the model to be precise and forces you to notice when the file on disk drifted from what the model expected.
+
+**`.bak` next to the file** is a lazy but effective undo. In a real Claude Code we'd stage in git; for a mini we just want the ability to `mv file.bak file` and recover. Every episode from Ep.04 on can rely on this.
+
+## Wiring the tool into the executor
+
+Back in `agent.ts`, add to the `runTool` switch:
+
+```typescript
+import { parsePatch, dryRun, commit } from "./patch.js";
+import readline from "node:readline/promises";
+import { stdin as input, stdout as output } from "node:process";
+
+const AUTO_APPROVE = process.env.MCC_AUTO_APPROVE === "1";
+const confirmRl = readline.createInterface({ input, output });
+
+async function confirmPatch(result: Awaited<ReturnType<typeof dryRun>>): Promise<boolean> {
+  console.log(`\n[patch preview] ${result.filePath}`);
+  for (const h of result.hunkSummaries) {
+    console.log(`  ${h.header}   +${h.added} -${h.removed}`);
+  }
+  console.log("--- before ---");
+  console.log(result.before.split("\n").slice(0, 3).join("\n") + "\n…");
+  console.log("--- after ----");
+  console.log(result.after.split("\n").slice(0, 3).join("\n") + "\n…");
+  if (AUTO_APPROVE) {
+    console.log("[patch] auto-approved (MCC_AUTO_APPROVE=1)");
+    return true;
+  }
+  const ans = (await confirmRl.question("apply? [y/N] ")).trim().toLowerCase();
+  return ans === "y" || ans === "yes";
+}
+
+// inside runTool switch:
+if (name === "apply_patch") {
+  const diff = String(input.diff);
+  const parsed = parsePatch(diff);
+  const result = await dryRun(CWD, parsed);
+  const ok = await confirmPatch(result);
+  if (!ok) return "PATCH_REJECTED: user declined";
+  await commit(CWD, parsed, result.after);
+  return `APPLIED to ${result.filePath}: ${result.hunkSummaries.map((h) => `+${h.added}/-${h.removed}`).join(", ")}. Backup at ${result.filePath}.bak`;
+}
+```
+
+Read that carefully. The tool result string that goes back to Claude contains:
+
+- Success: which file changed, hunk-level `+X/-Y` counts, where the backup is.
+- Rejection: the literal `PATCH_REJECTED: user declined`.
+
+Both are short. Both are informative. Neither dumps 500 lines of new file content back into the context — Claude already knows what it wrote, we don't need to re-tell it.
+
+## What a real edit session looks like
+
+```
+you › the getAllPosts function should cache its result — add a module-level Map<string, PostMeta[]> keyed by locale
+[tool] read_file({"path":"src/lib/blog.ts"})
+[tool] → import fs from "fs"; …
+[tool] apply_patch({"diff":"--- a/src/lib/blog.ts\n+++ b/src/lib/blog.ts\n@@ -44,6 +44,10 @@…"})
+
+[patch preview] src/lib/blog.ts
+  @@ -44,6 +44,10 @@   +4 -0
+--- before ---
+export function getAllPosts(options: ReadOptions…
+…
+--- after ----
+const cache = new Map<string, PostMeta[]>();
+…
+apply? [y/N] y
+
+cc  › Added a module-level Map cache keyed by locale. First call still walks the directory; subsequent calls return the cached slice. Backup left at src/lib/blog.ts.bak.
+```
+
+Watch what did *not* happen:
+
+- The model did not rewrite the file. It sent a 15-line patch.
+- I got to see the change before it hit disk.
+- The tool_result the model sees back is 20 tokens, not 2000.
+
+## Pitfalls I hit while writing this
+
+**The trailing-newline bug.** Files usually end with a newline. `split("\n")` on such a file produces a final empty string, which is easy to accidentally drop when you rejoin. If you rejoin without that empty string, you've silently stripped the trailing newline from every file the agent touches. Git will show the change; your linter might not. Fix: preserve the trailing empty element and `.join("\n")` restores it.
+
+**Context lines the model "helpfully" reflowed.** More than once Claude sent me a patch where a context line had extra trailing whitespace stripped, because the model's tokenizer treated trailing spaces as insignificant. The `context mismatch` error surfaces this immediately. Do not add whitespace-tolerant matching to hide the problem — the model can correct itself when the error is specific.
+
+**Two hunks that touch the same range.** If the model generates two overlapping hunks in one patch, reverse-order application will corrupt the file. My parser doesn't detect this yet; the byte-exact context check will usually catch it via a mismatch on the second hunk. Ep.06 (hardening) will add an overlap check.
+
+**Auto-approve in a demo.** I hit `y` fifty times in a row during testing and stopped reading the previews. That's exactly how people delete their own repos. If you set `MCC_AUTO_APPROVE=1`, do it in a scratch directory or a fresh git branch, never in a directory you care about.
+
+## What next episode will fix
+
+Two problems that are now unavoidable:
+
+**Context is bloating.** After a dozen tool calls, `history` easily exceeds 40 KB. Half of it is tool_result blocks the model has already reasoned about. Ep.04 introduces observation masking — the technique from the JetBrains "Complexity Trap" paper — which replaces old tool outputs with `[N lines omitted]` while keeping the reasoning intact. It's the highest impact per line of code you'll add in the series.
+
+**`max_tokens` truncation is still silent-ish.** We `console.warn` but don't recover. Ep.04 will add an auto-continue prompt when the model hits the ceiling mid-plan.
+
+## Quick Reference — Episode 03
+
+| What | Where |
+|---|---|
+| Tool declared | `apply_patch` |
+| Diff format | unified diff, one file, strict context match |
+| Order of application | descending `oldStart`, so line numbers stay valid |
+| Preview | first 3 lines of `before` and `after`, plus `+X/-Y` per hunk |
+| Approval | interactive `y/N` (auto with `MCC_AUTO_APPROVE=1`) |
+| Backup | `path.bak` written before overwrite |
+| Rejection payload | `"PATCH_REJECTED: user declined"` back to Claude |
+| Success payload | file path + hunk counts + backup location |
+
+**Minimum viable patch flow:**
+
+```typescript
+const parsed = parsePatch(diff);
+const preview = await dryRun(CWD, parsed);
+if (!await confirmPatch(preview)) return "PATCH_REJECTED: user declined";
+await commit(CWD, parsed, preview.after);
+return `APPLIED to ${parsed.filePath}`;
+```
+
+**Five rules to survive to Ep.04:**
+1. Never write without a dry-run.
+2. Never dry-run without byte-exact context matching.
+3. Never apply without a `.bak`.
+4. Never auto-approve outside a scratch directory.
+5. Never send the full new file back to the model as a tool result — the model already produced it.
+
+Ep.04 next — where we finally teach the agent to forget the parts of the conversation that don't matter anymore.

@@ -1,0 +1,190 @@
+---
+title: "Mini Claude Code · Episode 01: ちゃんと記憶する 40 行の REPL"
+description: "TypeScript でゼロから動くコーディングエージェントを組み上げるハンズオン連載の第 1 回。まずは最小限のループを動かす——stdin、ストリーミング、そしてターンをまたいで生き残る会話。"
+date: "2026-07-03"
+tags: ["mini-claude-code", "series", "typescript", "agents"]
+readTime: "14 min"
+---
+
+Mini Claude Code へようこそ。TypeScript でゼロから動くコーディングエージェントを組み上げる、全 6 回のハンズオン連載だ。フレームワークも魔法も LangChain もなし。あるのは Anthropic SDK と、ターミナルと、一度に一つずつ機能を積み上げる規律だけである。
+
+連載の終わりには、コードベースを読み、unified diff でファイルを編集し、自分のコンテキストを管理し、サブエージェントを起動し、ミニ eval セットで採点される——小さいが本物の Claude Code クローンが手元にできあがる。Episode 1 は、エージェントと呼んでいい最小のもの、すなわちモデルと話し、ストリーミングで応答を返し、*何を話したか覚えている* REPL だ。
+
+チャットデモを 10 個作ってきたのに「なぜ自分のは何も覚えていないのか」がまだわからない人向けの回である。
+
+## 今夜つくるもの
+
+`agent.ts` という単一ファイルのプログラムで、以下を行う。
+
+1. ターミナルでプロンプトを出す
+2. あなたのメッセージと過去のターンすべてを Claude に送る
+3. 応答を届いた端からストリーミングでターミナルに流す
+4. `/exit` と打つまでループする
+
+以上。ツールもファイルシステムアクセスも、プロセスの寿命を超えるメモリもない。TypeScript でおよそ 40 行。狙いは *ターン構造* をきっちり固めることだ——後の回で追加していく機能はすべて、このループの上に乗ることになるからである。
+
+## セットアップ——3 コマンド
+
+Node 20+ が入っている前提。古いバージョンならまず上げてほしい。SDK 内の fetch と `AbortController` のセマンティクスはそれに依存している。
+
+```bash
+mkdir mini-claude-code && cd mini-claude-code
+pnpm init && pnpm add @anthropic-ai/sdk
+pnpm add -D typescript tsx @types/node
+```
+
+最小限の `tsconfig.json` を作る。
+
+```json
+{
+  "compilerOptions": {
+    "target": "ES2022",
+    "module": "ESNext",
+    "moduleResolution": "Bundler",
+    "strict": true,
+    "esModuleInterop": true,
+    "skipLibCheck": true
+  }
+}
+```
+
+API キーを設定する。
+
+```bash
+export ANTHROPIC_API_KEY=sk-ant-...
+```
+
+セットアップはここまで。ここから先はすべて 1 ファイルで完結する。
+
+## 40 行の REPL
+
+`agent.ts` を作る。
+
+```typescript
+import Anthropic from "@anthropic-ai/sdk";
+import readline from "node:readline/promises";
+import { stdin as input, stdout as output } from "node:process";
+
+const client = new Anthropic();
+const MODEL = "claude-sonnet-4-5";
+const SYSTEM = "You are Mini Claude Code, a helpful engineering assistant. Keep answers concrete and short unless asked otherwise.";
+
+type Turn = { role: "user" | "assistant"; content: string };
+const history: Turn[] = [];
+
+const rl = readline.createInterface({ input, output });
+
+async function turn(userText: string) {
+  history.push({ role: "user", content: userText });
+
+  const stream = client.messages.stream({
+    model: MODEL,
+    max_tokens: 1024,
+    system: SYSTEM,
+    messages: history,
+  });
+
+  let assistantText = "";
+  for await (const event of stream) {
+    if (event.type === "content_block_delta" && event.delta.type === "text_delta") {
+      process.stdout.write(event.delta.text);
+      assistantText += event.delta.text;
+    }
+  }
+  process.stdout.write("\n");
+  history.push({ role: "assistant", content: assistantText });
+}
+
+async function main() {
+  console.log("Mini Claude Code · Ep.01 REPL. Type /exit to quit.\n");
+  while (true) {
+    const line = (await rl.question("you › ")).trim();
+    if (line === "/exit") break;
+    if (!line) continue;
+    process.stdout.write("cc  › ");
+    await turn(line);
+  }
+  rl.close();
+}
+
+main().catch((e) => { console.error(e); process.exit(1); });
+```
+
+実行する。
+
+```bash
+pnpm tsx agent.ts
+```
+
+こう見えるはずだ。
+
+```
+Mini Claude Code · Ep.01 REPL. Type /exit to quit.
+
+you › my name is Alice
+cc  › Hi Alice! How can I help?
+you › what did I just tell you my name was?
+cc  › Alice.
+```
+
+2 ターン目のこの "Alice" は些細な勝利ではない。*この回の全目的* そのものである。コードレビューで見てきた「うちのチャットボットには記憶がない」バグの半分は、次のリクエストの一部として assistant の直前の応答を送り返すのを忘れている人たちのせいだ。モデルはステートレスである。メモリはあなたの側にある。
+
+## この 40 行で、思っている以上に大事な 3 つのこと
+
+### 1. history 配列こそが *唯一の* 状態
+
+この REPL で Claude が「覚えて」いられるものはすべて `history` 配列に住んでいる。クリアすればメモリは消える。編集すれば、それは過去の書き換えである——そう、Episode 4 でトークンを節約するために意図的に history を書き換え始めるとき、これが効いてくる。今のところは不変条件だけ押さえておこう：ターンごとに 1 件の user メッセージを append し、成功時に 1 件の assistant メッセージを append する。途中でリクエストが失敗した場合、user メッセージが宙ぶらりんで残ってはいけない——これは Ep.02 で扱う。
+
+### 2. エージェントにとってストリーミングはオプションではない
+
+`client.messages.stream` を `client.messages.create` に置き換えて 1 塊で受け取ることもできる。やめておこう。将来ツールを走らせるエージェントには、2 つの理由でストリーミングが要る。(a) 途中出力を届いた順に見せて、固まっていないことをユーザーに示したい。(b) tool use の呼び出しはストリーム中の *content block* として届く。逐次パースする配管は、今のうちに組んでおくほうが後から後付けするより圧倒的に楽である。この content block を、Ep.02 以降で大量に使うことになる。
+
+### 3. system prompt はキャラを宿す場所であって、指示を溜め込む場所ではない
+
+`SYSTEM` は小さな文字列だ。「常に X しろ、決して Y するな、Z を忘れるな」と詰め込みたくなる衝動に抗おう。lost-in-the-middle の研究（[コンテキストエンジニアリングの記事](/en/blog/context-engineering-for-coding-agents)で扱った）が示すのは、モデルはコンテキストの先頭と末尾に最もよく注意を向けるということだ。このループにおいて、system prompt は先頭で、*直近の user メッセージ* が末尾である。特定のタスクにとって重要なルールは、system prompt ではなくその user ターンの中で言い直そう。
+
+## 書きながら踏んだ落とし穴
+
+**「assistant のテキストが空になる」バグ。** 最初のドラフトでは `assistantText` を蓄積し忘れ、stdout に書くだけにしていた。history が空の assistant ターンで汚染され、直前のターンがなかったかのように Claude が再回答してしまった。対処：ストリームしたテキストを文字列に蓄積し、ストリームが *終わってから* history に push する。
+
+**`readline` のプロンプトが応答を食う問題。** モデルがまだストリーミング中に `rl.question("you › ")` を呼ぶと、プロンプト文字列がモデル出力に交錯する。対処：次の `rl.question` を呼ぶ前に `await turn(line)` を最後まで待つ。上のコードでは `turn` が `for await` ループ全体を await しているので既に正しい——ただし fire-and-forget にリファクタしたらこのバグは戻ってくる。
+
+**API キーが読まれない。** SDK は `ANTHROPIC_API_KEY` を環境変数から自動で読む。Windows PowerShell なら `$env:ANTHROPIC_API_KEY = "sk-ant-..."`、macOS/Linux なら `export ANTHROPIC_API_KEY=...`。`.env` を使うなら `dotenv/config` を入れるか、SDK の `apiKey` オプションを使うこと——ハードコードは避ける。
+
+## 来週の回で直すこと
+
+今のエージェントには明白な限界が一つある。金魚鉢の中に住んでいることだ。ファイルを読めない。ディレクトリを一覧できない。コマンドを走らせられない。あなたが質問するたびに、モデルは自分の学習データか、あなたがターミナルに貼り付けたものからしか答えられない。
+
+Episode 02 でここを変える。*tool use* を追加する——`read_file`、`list_dir`、`run_bash` の 3 ツール——そして Claude に実際にプロジェクトディレクトリを覗きに行かせる。今日組んだストリーミングの配管が本領を発揮し始める回だ。tool の呼び出しは content block として返ってくるので、それをルーティングして応答してやらねばならないからである。
+
+もう一つ、今夜のコードが雑に済ませてしまった箇所も直す。今のところ、モデルの応答が途切れた場合（`max_tokens` に達した場合）は黙って切り捨てている。Ep.02 では stop reason をきちんと扱う。
+
+## Quick Reference — Episode 01
+
+| 何を | どこで |
+|---|---|
+| Model | `claude-sonnet-4-5` |
+| SDK | `@anthropic-ai/sdk` |
+| ループの形 | `while(true) { question → stream → push history }` |
+| メモリ | メモリ上の `history: Turn[]` |
+| 見るべきストリーミングイベント | `delta.type === "text_delta"` を伴う `content_block_delta` |
+| Kill switch | `/exit` |
+
+**最小構成のターン：**
+
+```typescript
+history.push({ role: "user", content: userText });
+const stream = client.messages.stream({ model, system, messages: history, max_tokens: 1024 });
+let out = "";
+for await (const e of stream) {
+  if (e.type === "content_block_delta" && e.delta.type === "text_delta") out += e.delta.text;
+}
+history.push({ role: "assistant", content: out });
+```
+
+**Ep.02 まで生き残るための 3 つのルール：**
+1. assistant のターンを history に push し戻すのを絶対に忘れない。
+2. ストリームが開いている間は絶対に `question` を呼ばない。
+3. タスク固有の動的な指示を system prompt に絶対に置かない。
+
+今夜のエージェントの完全なソースは [github.com/claude-community/mini-claude-code](https://github.com/) の `ep-01` に置く。ツールの回は月曜に。

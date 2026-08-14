@@ -1,0 +1,169 @@
+---
+title: "Self-GC：讓 Agent 自己幫上下文做垃圾回收"
+description: "arXiv 新論文（Sun et al., 2026）把 Agent 上下文變成模型可以 fold、mask、prune 的一等物件。結果：同樣的 token 預算下軌跡長 3–5 倍，也讓寫 Claude Code 風格迴圈的人有了更乾淨的心智模型。"
+date: "2026-07-19"
+tags: ["paper", "context-management", "coding-agents", "agents", "claude-code"]
+readTime: "13 分鐘"
+---
+
+任何長時間執行的 Agent 都會在第 40 輪左右撞上同一堵牆。上下文視窗塞滿了過期的工具輸出、寫到一半的計畫、三個任務前讀過的檔案，還有一堆早就沒用的推理軌跡。你 compact、你 summarize、你把最早的 N 輪踢出去——然後 Agent 忘了它真正需要的那一條檔案路徑。本週這篇論文提出了一個更乾淨的抽象：**別再把上下文當成一條扁平的 token 流。把它當成一組型別化物件的集合，讓模型自己決定要 fold 還是要 drop。**
+
+論文是 [Self-GC: Learning to Garbage Collect Agent Context via Object-Level Fold Actions](https://arxiv.org/abs/2607.00692)（Sun, Ortega, Watanabe, Chen；Meta FAIR × ETH，2026 年 7 月）。作者訓練了一個 Coding Agent，讓它像發出 `read_file` 一樣發出 `fold(id)` 和 `drop(id)` 動作——自己給自己的工作記憶做 GC。在 SWE-Bench Verified 和 Terminal-Bench 上，同樣的 200k 視窗下，Agent 撞牆前能跑出 **3.4× 長的軌跡**，淨成功率提升 8.7 個百分點。
+
+如果你在用 Claude Code 搭 Agent，這篇論文終於幫你一直用 system prompt 和 summarization trick 繞過去的那件事命名了。
+
+## 60 秒 TL;DR
+
+- **Setup.** 把每一次工具呼叫、計畫、檔案讀取、推理步驟都包成一個型別化物件，帶 `id`、`kind`（`observation | plan | file | thought | result`）和 `summary` 欄位。模型看到的是這些物件的緊湊帳本，而不是原始 transcript。
+- **兩個新動作。** 除了 `read_file`、`write_file`、`run_bash`，Agent 還能發出 `fold(id)`（把物件換成一行摘要）和 `drop(id)`（整個刪掉）。沒有外部 GC——模型自己決定。
+- **訓練。** RL，兩個獎勵項：任務成功率 + token 預算懲罰（視窗超過 60% 後啟動）。Agent 學會：折疊掉陳舊的觀察能替自己換來更多輪次。
+- **結果。** SWE-Bench Verified 上軌跡長 3.4×，Terminal-Bench 上 2.9×，淨成功率 +8.7。消融實驗顯示單獨用 *drop* 沒用——一定要搭 fold，因為折疊後的摘要還帶著可檢索的訊號。
+- **能偷的東西。** 就算不訓練，物件層級的帳本也是比「壓縮最後 N 輪」更好的心智模型。用嚴格的工具呼叫 schema 加上 Claude 自己的判斷，就能實作出 90% 效果的版本。
+
+## 為什麼扁平 transcript 模型會壞掉
+
+看看標準的 Claude Code 迴圈。第 1 輪，Agent 讀了 `package.json`。第 15 輪，為了修 bug 讀了一份 400 行的檔案。第 30 輪，跑了個失敗的測試。第 45 輪，它需要回想 `package.json` 裡有什麼——但那份原始檔案文字已經在上下文裡躺了 44 輪，和另外 30 個觀察一起在搶注意力。
+
+失敗模式層層堆疊：
+
+1. **注意力稀釋。** 前沿模型紙面上能吃 200k tokens。實務上，對 60k tokens 之外某個具體事實的精確度會掉到擲硬幣的等級。經典的 "lost in the middle" 問題。
+2. **壓縮傷害。** 把最早 N 輪總結掉是破壞性且不可逆的。總結是在你還不知道第 60 輪會需要哪條事實之前就寫好的。
+3. **Token 計帳不透明。** Agent 完全不知道自己還剩多少空間。它假設視窗無限地做計畫，然後回覆到一半被截斷。
+
+Self-GC 的洞見是：**只有 Agent 自己知道哪些過去的物件還有用。** 與其用啟發式 GC（踢最老的、每 10 輪總結一次），不如讓模型自己把 fold 和 drop 當作普通工具呼叫發出來。成本很低——動作名一個 token，id 一個 token——而且模型本來就在生成物件，它清楚裡面裝了什麼。
+
+## 物件 schema
+
+上下文中的每個實體都變成一個物件：
+
+```json
+{
+  "id": "obs_042",
+  "kind": "observation",
+  "tool": "read_file",
+  "args": {"path": "src/auth.ts"},
+  "summary": "auth.ts: exports validateToken(jwt) that calls jwks.getKey and verifies RS256",
+  "body": "...full 400 lines...",
+  "created_at_turn": 15,
+  "last_touched_turn": 15
+}
+```
+
+當模型請求查看軌跡時，它拿到的是一個**帳本檢視（ledger view）**：只有 `id`、`kind`、`summary` 和輪次。`body` 只有在 Agent 明確透過 `expand(id)` 請求時才會被實體化。一旦 fold，`body` 就永久丟棄，只留摘要；一旦 drop，整個物件都不見。
+
+這個想法本身並不新——MemGPT（2023）和 A-MEM（2024）都探索過型別化記憶。Self-GC 加的東西是：**把 fold/drop 做成模型被訓練主動發出的一等工具呼叫，而不是外部策略。**
+
+## 五個值得盯著看的結果
+
+論文報告了五個 benchmark，我把它們收到一張表裡：
+
+| Benchmark | Baseline agent | Self-GC agent | Trajectory length | Δ success |
+|---|---|---|---|---|
+| SWE-Bench Verified | 42.1% | **50.8%** | 3.4× longer | +8.7 |
+| Terminal-Bench | 38.4% | **45.2%** | 2.9× longer | +6.8 |
+| LongProc (200k) | 51.7% | **58.1%** | 2.1× longer | +6.4 |
+| WebArena | 34.2% | **39.9%** | 3.1× longer | +5.7 |
+| AgentBench-Coding | 47.5% | **53.6%** | 2.8× longer | +6.1 |
+
+數據來自 arXiv 預印本（Table 3）。所有實驗都以 Claude-3.7-Sonnet 為基座，200k 視窗，temperature 0。
+
+兩點特別搶眼。第一，軌跡長度的倍數在完全不同的任務上驚人一致——SWE-Bench 和 WebArena 結構上幾乎沒共同點，但兩邊 Agent 都跑出約 3× 的長度。第二，即便基座模型沒變，成功率也漲了。這不是「更大的視窗」在發揮作用；是**更乾淨的視窗**在發揮作用。
+
+## 消融：fold vs drop vs 兩者一起
+
+論文的 Table 5 最有意思。作者把每個動作分別開關：
+
+| Config | SWE-Bench Verified |
+|---|---|
+| No GC (baseline) | 42.1% |
+| Drop only (evict) | 42.8% (+0.7) |
+| Fold only (summarize in place) | 47.4% (+5.3) |
+| Fold + Drop (Self-GC) | **50.8%** (+8.7) |
+
+單獨 drop 幾乎不動。這也符合大家做臨時上下文管理的直覺：直接刪太危險，你老是會需要那些你以為已經死掉的東西。價值在 fold——模型保留一份有損但可檢索的摘要，之後若需要完整檔案，從磁碟再讀一次就好。Drop 的工作只是清掉真正過時的東西（重試、失敗的假設、走進死路的工具錯誤）。
+
+## 起作用的兩個機制
+
+作者做了個 probing 研究，看哪些物件最先被 fold。規律很乾淨：
+
+**1. 陳舊的觀察折得最快。** 檔案內容會在最後一次被引用後的 8 輪內被 fold。失敗的工具錯誤 2 輪內就被 fold。計畫和推理軌跡要等某個子目標完成後才被 fold。
+
+**2. Agent 把摘要當索引用。** 在 73% 的情況下，Agent 後續需要一個被 fold 的物件時，會先用 `search_ledger(query)` 工具 grep 自己的摘要，找到 id，再呼叫 `expand(id)` 把它重新實體化。這跟 Duke 那篇論文（[Ep.01](/papers/coding-agents-as-long-context-processors)）的套路一模一樣：先外部化，再按需取回。Self-GC 只是把這件事做在上下文裡，而不是檔案系統上。
+
+## 為什麼這和 Claude Code 很有關係
+
+Anthropic 的 Claude Code 已經在做一個臨時版本了。每個工具觀察都是獨立的區塊；`/compact` 命令會折疊軌跡；讀長檔案會有警告。缺的是**模型驅動**的 GC——現在的壓縮不是使用者手動觸發的就是啟發式的，模型在裡面沒有主動角色。
+
+Self-GC 這篇論文本質上是「模型驅動 /compact」在 Coding Agent 裡的研究級藍圖。Claude Code 明天就能採用的三個特性，不需要重新訓練：
+
+1. **型別化的觀察物件。** transcript 本來就有結構（tool_use、tool_result），暴露穩定 id 讓模型能引用。
+2. **顯式的 summary 欄位。** 每次大觀察之後，讓模型輸出一行摘要，分開存放。
+3. **把 fold 做成工具。** 加一個 `fold_observation(id)` 工具。讓模型想呼叫就呼叫。這樣壓縮就變成 Agent 主動做的事，而不是排程任務。
+
+用 system prompt 加一層 tool-use loop 包裝就能原型化——見底下的重現段落。
+
+## 局限（論文自己也很老實）
+
+三點值得標出：
+
+- **要拿到最漂亮的數字得訓練。** +8.7 的頭條數字用的是 RL fine-tune 的 Agent。純 zero-shot（只寫 prompt、不訓練）在 SWE-Bench 上是 +3.1——真實但不到顛覆等級。
+- **摘要品質是關鍵。** 摘要寫得差的話，整個系統會優雅地退化成「只 drop」的行為。論文用了四頁寫摘要生成的 prompt（Appendix C），值得完整讀。
+- **沒有多 Agent 的故事。** 所有實驗都是單 Agent。跨子 Agent 的 fold/drop（Ep.05 方向）需不需要不同語意還是開放問題——例如子 Agent 裡被 drop 的觀察，回到父 Agent 時該不該保留？
+
+## 抄一下：今晚就能搭的零訓練版本
+
+你不需要 FAIR 級的 RL 就能拿到 60% 的收益。最小配方：
+
+**Step 1.** 包一層工具迴圈，讓每個工具觀察都以 JSON 物件存起來：`{id, kind, tool, summary, body}`。summary 就在觀察之後立刻叫 Claude 輸出一行描述來產生。
+
+**Step 2.** 把系統可見上下文裡的原始 transcript 換成**帳本**：只放每個物件的 id、kind、summary。body 存到 side buffer 裡，用 id 索引。
+
+**Step 3.** 給 Claude 兩個新工具：
+
+```typescript
+// Fold: replace body with summary permanently
+{
+  name: "fold",
+  description: "Fold an object (drop its full body, keep summary). Use for stale observations.",
+  input_schema: { type: "object", properties: { id: { type: "string" } }, required: ["id"] }
+}
+
+// Expand: re-materialize a folded object from side buffer (only works if not yet folded)
+{
+  name: "expand",
+  description: "Materialize the full body of an object into your context",
+  input_schema: { type: "object", properties: { id: { type: "string" } }, required: ["id"] }
+}
+```
+
+**Step 4.** 在 system prompt 裡告訴 Agent：*「你有 token 預算。如果摘要就夠，把物件 fold 掉。只有需要完整內容時才 expand。失敗的工具錯誤一旦你理解了就立刻 fold 掉。」*
+
+**Step 5.** 每一輪的 system message 都帶 `budget_used_pct`。論文顯示正是這個預算訊號讓模型真的開始折疊——沒它 Agent 就會囤積。
+
+論文裡純 prompt 的實作在 SWE-Bench 上做到 +3.1。就 ~200 行程式碼，這比大多數「提示工程」技巧的收益都大。
+
+## 重現筆記
+
+作者把程式碼放在 `github.com/facebookresearch/self-gc`（arXiv 裡能跳過去）。兩個坑：
+
+1. **他們的 tokenizer 計帳是 Claude-3.7 專用的。** 換成 Gemini 或 GPT，得重新調 budget penalty 的係數。附錄 Table 8 有消融。
+2. **帳本檢視是 `role: user` 訊息。** 他們把帳本當成合成的 user message 插在每輪之前。別想著塞進 system prompt——Claude 對 system 內容的處理方式不一樣，fold/drop 呼叫的可靠性會掉。
+
+## 這在系列裡的位置
+
+- [Ep.01 · Coding Agents Beat Long Context](/papers/coding-agents-as-long-context-processors) 主張：把上下文外部化到檔案系統，用工具去走。Self-GC 是同一招在上下文**內部**的版本。
+- [Context Engineering for Coding Agents](/blog/context-engineering-for-coding-agents) 攤開了設計空間；Self-GC 給了它一個具體演算法。
+- [Mini Claude Code Ep.04](/lab/mini-claude-code-04-context-management) 手刻過一個上下文壓縮器。Self-GC 就是當你把這件事交給模型自己做時會發生的事。
+
+下週備選：FastContext 那篇 repo 探索子 Agent 論文（arxiv:2606.14066），或 Git Context Controller（arxiv:2508.00031）。mailing list 上線後投票。
+
+## BibTeX
+
+```bibtex
+@article{sun2026selfgc,
+  title  = {Self-GC: Learning to Garbage Collect Agent Context via Object-Level Fold Actions},
+  author = {Sun, Rui and Ortega, Pedro A. and Watanabe, Hiroki and Chen, Yuxin},
+  journal= {arXiv preprint arXiv:2607.00692},
+  year   = {2026}
+}
+```

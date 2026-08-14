@@ -1,0 +1,298 @@
+---
+title: "Mini Claude Code · 第 05 集：孵化擁有獨立上下文視窗的子代理人"
+description: "第 5 集把代理人一分為二。我們加入一個 spawn_subagent 工具，把有範圍的任務派給一個全新的 Claude，讓它擁有自己的工具集與自己的上下文視窗，最後回傳一段精簡的摘要。這正是 Anthropic 那句「token 使用量能解釋 80% 成果品質變異」背後的模式，用約 90 行程式碼實現。"
+date: "2026-07-05"
+tags: ["mini-claude-code", "series", "typescript", "agents"]
+readTime: "17 min"
+---
+
+四集下來，我們的代理人已經會讀、會寫、會有選擇地記住，也能在被截斷之後繼續往前走。它還做不到的：分工。每一次觀察、每一次工具呼叫、每一個推理步驟，全都塞在同一個上下文視窗裡。像「重構 `src/lib/` 底下的所有東西」這種任務，會把我們上週建起來的遮罩檢視也戳出一個大洞。
+
+今晚我們從架構層面把它修好。我們引入一個 *sub-agent*——一個全新的 Claude，擁有自己的 system prompt、自己的工具集，最關鍵的是，自己的上下文視窗。主代理人負責調度，子代理人負責做一件有範圍的事並回報一段精簡的摘要。主代理人接著繼續它的計畫，從頭到尾都沒看過子代理人啃過的那堆吵雜原始資料。
+
+這就是 Anthropic 那個發現背後的模式：「token 使用量可以解釋 80% 的成果品質變異。」[脈絡工程研究](/en/blog/context-engineering-for-coding-agents) 提供了理論；今晚我們補上大約 90 行程式碼。
+
+## 今晚要做什麼
+
+1. 一個 `runSubagent(brief, tools, model?)` 函式——自成一體的 tool-use 迴圈，擁有自己的訊息歷史
+2. 一個對主代理人公開的 `spawn_subagent` 工具
+3. 一個硬性預算：子代理人有最大回合數上限與最大輸出長度上限
+4. 一份「回傳契約」——子代理人的最後一則訊息就是原封不動（在上限之內）送回主代理人的內容
+
+`agent.ts` 不變。新增一個 `subagent.ts`。
+
+## 正確的心智模型
+
+主代理人是一位 *經理*。它讀起來應該像一份計畫：「先找出 auth 是在哪裡接上的，然後確認我們有沒有現成的 rate-limit middleware，最後提出一個 patch。」上面每一個子步驟都是一個 *任務*，而每個任務都可以交給一位子代理人——它的全部工作就是那個子步驟，別的都不管。
+
+有兩件事讓這個做法既便宜又安全：
+
+- **每個子代理人都有全新的上下文。** 沒有承接進來的雜訊，也不會有跨任務推理不小心互相滲透。
+- **精簡的回覆。** 子代理人必須 *決定要對經理說什麼*。這個約束會提升品質——就像一個好的新人被迫用兩句話寫狀態更新時，會比在 Slack 裡淹沒的那位思考得更用力。
+
+代價是調度會多一趟往返延遲，除錯也會稍微難一點。對於觀察量 > 4000 tokens 的任務，這兩個代價都可以接受。
+
+## 動手寫 `runSubagent`
+
+建立 `subagent.ts`：
+
+```typescript
+import Anthropic from "@anthropic-ai/sdk";
+import type { runTool } from "./agent.js";
+
+const client = new Anthropic();
+
+export interface SubagentOptions {
+  brief: string;
+  toolNames: string[];         // subset of the main agent's tools
+  model?: string;
+  maxTurns?: number;
+  maxOutputChars?: number;
+  systemHint?: string;
+}
+
+export interface SubagentResult {
+  finalText: string;
+  turnsUsed: number;
+  reason: "end_turn" | "max_turns" | "error";
+  errorMessage?: string;
+}
+
+const DEFAULT_MODEL = "claude-sonnet-4-5";
+const DEFAULT_MAX_TURNS = 8;
+const DEFAULT_MAX_OUTPUT = 2000;
+
+const SUBAGENT_SYSTEM = (hint?: string) => `
+You are a scoped sub-agent inside Mini Claude Code. You have a single brief. Complete it, then STOP.
+
+Rules:
+- Do the smallest amount of work that answers the brief.
+- Use tools only when needed. Do not explore.
+- Your final message will be sent back to the manager verbatim. Keep it under ~300 words and structured.
+- If the brief is infeasible, say so in one sentence and stop.
+${hint ? "\nManager hint: " + hint : ""}
+`.trim();
+
+export async function runSubagent(
+  opts: SubagentOptions,
+  runToolFn: typeof runTool,
+  allTools: readonly { name: string; description: string; input_schema: unknown }[],
+): Promise<SubagentResult> {
+  const model = opts.model ?? DEFAULT_MODEL;
+  const maxTurns = opts.maxTurns ?? DEFAULT_MAX_TURNS;
+  const maxOutput = opts.maxOutputChars ?? DEFAULT_MAX_OUTPUT;
+  const tools = allTools.filter((t) => opts.toolNames.includes(t.name));
+
+  const history: Anthropic.MessageParam[] = [
+    { role: "user", content: opts.brief },
+  ];
+
+  for (let turn = 0; turn < maxTurns; turn++) {
+    let response: Anthropic.Message;
+    try {
+      response = await client.messages.create({
+        model,
+        max_tokens: 1500,
+        system: SUBAGENT_SYSTEM(opts.systemHint),
+        tools,
+        messages: history,
+      });
+    } catch (e) {
+      return {
+        finalText: "",
+        turnsUsed: turn,
+        reason: "error",
+        errorMessage: e instanceof Error ? e.message : String(e),
+      };
+    }
+
+    history.push({ role: "assistant", content: response.content });
+
+    if (response.stop_reason !== "tool_use") {
+      const text = response.content
+        .filter((b): b is Anthropic.TextBlock => b.type === "text")
+        .map((b) => b.text)
+        .join("\n")
+        .trim();
+      const capped = text.length > maxOutput ? text.slice(0, maxOutput) + "\n…[truncated by sub-agent budget]" : text;
+      return { finalText: capped, turnsUsed: turn + 1, reason: "end_turn" };
+    }
+
+    const results = [];
+    for (const b of response.content) {
+      if (b.type === "tool_use") {
+        const out = await runToolFn(b.name, b.input as Record<string, unknown>);
+        results.push({ type: "tool_result" as const, tool_use_id: b.id, content: out });
+      }
+    }
+    history.push({ role: "user", content: results });
+  }
+
+  return { finalText: "(sub-agent hit turn cap without concluding)", turnsUsed: maxTurns, reason: "max_turns" };
+}
+```
+
+裡面有五件事值得留意：
+
+**精簡版的 system prompt。** 子代理人得到的是另一種人格：話少、專注在任務上、禁止四處探索。這是讓子代理人真正有用的最關鍵那條槓桿。一個愛講話的子代理人就是一個壞掉的子代理人。
+
+**工具允許清單。** 不是每個子代理人都需要每個工具。這由主代理人決定。一個「找相關檔案」的子代理人可能只拿到 `list_dir` 和 `run_bash`，沒有 `apply_patch`。把最小權限原則套用到 prompt 上。
+
+**內部沒有遮罩迴圈。** 子代理人的上下文視窗在設計上就是小的——它會在幾個回合之內結束。第 04 集那套機器在這裡是殺雞用牛刀。
+
+**`apply_patch` 沒有另外的確認關卡。** 如果主代理人把 `apply_patch` 授權給了子代理人，子代理人會透過 `runToolFn` 承接同一套確認流程。關卡屬於工具，不屬於代理人。這就是我們把 `runToolFn` 傳進來的原因——子代理人什麼都不用重寫。
+
+**輸出的硬性上限。** 主代理人最多拿回 `maxOutputChars` 個字元。如果子代理人試圖把整個檔案倒出來，我們就截斷。經理原本就該問一個更好的問題。
+
+## 把工具公開給主代理人
+
+加到主要的 `TOOLS` 陣列裡：
+
+```typescript
+{
+  name: "spawn_subagent",
+  description:
+    "Dispatch a scoped task to a fresh sub-agent. Use for large searches, exploration, or focused refactors. The sub-agent has its own context window; you will only see its final summary. Prefer this over reading many files yourself.",
+  input_schema: {
+    type: "object",
+    properties: {
+      brief: {
+        type: "string",
+        description: "A single-paragraph task description. Be specific about what to return.",
+      },
+      tools: {
+        type: "array",
+        items: { type: "string" },
+        description: "Subset of tool names to grant. Never include spawn_subagent (no recursion).",
+      },
+    },
+    required: ["brief", "tools"],
+  },
+},
+```
+
+注意那條明確的「no recursion」註解。子代理人在第 05 集裡不能孵化子代理人。這不是什麼難題，但它的失敗模式（無限扇出、預算爆掉、除錯不透明）確實是難題，我寧可先出一個讀者可以推理得清楚的版本。
+
+## 接進 `runTool`
+
+在 `agent.ts` 裡：
+
+```typescript
+import { runSubagent } from "./subagent.js";
+
+// inside runTool:
+if (name === "spawn_subagent") {
+  const brief = String(input.brief);
+  const requestedTools = (input.tools as string[]).filter((t) => t !== "spawn_subagent");
+  console.log(`[subagent] brief: ${brief.slice(0, 100)}${brief.length > 100 ? "…" : ""}`);
+  console.log(`[subagent] tools: ${requestedTools.join(", ")}`);
+
+  const result = await runSubagent(
+    { brief, toolNames: requestedTools },
+    runTool, // pass ourselves so the sub-agent reuses tool implementations
+    TOOLS,
+  );
+
+  console.log(`[subagent] done in ${result.turnsUsed} turns, ${result.reason}`);
+  return `SUBAGENT_RESULT (${result.turnsUsed} turns, ${result.reason}):\n\n${result.finalText}`;
+}
+```
+
+我們把 `runTool` 傳進 `runSubagent`。循環引用但無害——工具執行器不需要知道自己現在是在服務主代理人還是子代理人。
+
+## 一次帶子代理人的真實 session 長什麼樣子
+
+```
+you › are there any files under src/lib that don't have a matching test?
+
+cc  › I'll dispatch a sub-agent to enumerate this cleanly.
+
+[tool] spawn_subagent({"brief":"List every .ts file under src/lib recursively.
+For each, check whether a file with the same basename exists under
+tests/lib or under src/lib with a .test.ts suffix. Return a plain list
+of untested files, one per line. If everything is covered, say so.",
+"tools":["list_dir","run_bash"]})
+[subagent] brief: List every .ts file under src/lib recursively. For each, check…
+[subagent] tools: list_dir, run_bash
+[subagent] done in 4 turns, end_turn
+
+Files without tests:
+- src/lib/blog.ts
+- src/lib/mdx-renderer.ts
+- src/lib/i18n-utils.ts
+
+Everything else in src/lib has a matching *.test.ts.
+
+cc  › Three files lack tests: blog.ts, mdx-renderer.ts, i18n-utils.ts.
+Want me to draft skeleton tests for one of them?
+```
+
+主代理人的上下文只增加了：
+- 大約 200 tokens 給那段工具呼叫裡的 brief 描述
+- 大約 150 tokens 給子代理人回傳的最終摘要
+
+就這樣。子代理人內部走了 4 個回合，處理過好幾份 `list_dir` 和 grep 的輸出——這些全都沒進到主代理人的訊息歷史。這就是壓縮發生的地方。不是靠什麼聰明的文字瘦身，而是靠 *把原始資料留在牆的另一邊*。
+
+## 怎麼挑該給子代理人做的任務
+
+不是每個任務都值得動用子代理人。我大致的規則是：
+
+- **給子代理人**：如果任務預期的工具輸出 > 4000 tokens，*而且* 經理真正需要的答案很短。
+- **內聯處理**：如果經理反正都會用到原始資料（例如要編輯的那個特定檔案就是要讀的那個）。
+- **絕對不要用子代理人**：處理需要跟使用者互動的決策時。使用者正盯著主 REPL；把 `y/N` 提示藏在子代理人裡面會讓人一頭霧水。
+
+經理是在規劃時就決定的。實務上，只要工具描述夠誠實（「Prefer this over reading many files yourself」），Claude 這件事做得很好。
+
+## 我在寫這集時踩到的坑
+
+**子代理人以為它可以閒聊。** 第一次跑，子代理人的摘要是三段的「這問題真有意思！我發現的是……」。修法：加強 system prompt，強制要求結構化、簡潔的輸出。在比較長的任務上偶爾還是會看到散文式的內容偷偷冒出來；一條更嚴格的「請以項目清單回覆」指示會有幫助。
+
+**透過迴圈變成無限扇出。** 早期草稿裡我讓子代理人以工具名稱的子字串比對來授權工具。主代理人打了個 `["*"]`，結果拿到了所有東西，包括 `spawn_subagent`。它就開始遞迴。我在 12 層深、燒掉大約 $0.60 之後把它殺掉。修法：只做完全比對；並且無條件把 `spawn_subagent` 從允許清單裡剝掉。
+
+**子代理人的 `apply_patch` 需要自己的確認關卡。** 因為工具程式碼呼叫的是同一個 `confirmPatch`，使用者會看到來自子代理人編輯動作的 `y/N`。這樣沒問題，但不夠明顯。日誌裡要清楚寫是「哪個代理人在請求確認」。在正式版 Claude Code 裡，這通常是操作者最不喜歡遇到的驚喜。
+
+**成本可見性。** 一個子代理人可以在操作者沒察覺的情況下燒掉 8 回合 × 2K max_tokens。加一行每個子代理人的成本紀錄：`[subagent] tokens: in=… out=…`。今晚的程式碼為了篇幅省掉了它，但第 06 集會把它補回來，順便做一次比較正式的計費盤點。
+
+## 下一集要修的東西
+
+我們現在有架構能力了，但沒有辦法衡量它。第 06 集——第一段弧線的最終集——完全是關於評估：
+
+- 一份 15 個任務的 SWE-lite 集合（小、真實、可驗證），放在 `evals/` 資料夾裡。
+- 一個 `mcc eval` 指令，會拿目前的代理人去跑整套集合，並回報通過率、回合數與成本。
+- 一份釘住的基準，讓你可以判斷明天改了 system prompt 之後到底是變好了還是變差了。
+- 終於把 prompt caching 接進來，因為評估迴圈會讓 cache 命中變得看得見。
+
+如果第 05 集給了我們架構，第 06 集就會給我們那個 feedback 迴圈，讓我們可以在不退步的前提下反覆迭代。
+
+## 快速查閱 — 第 05 集
+
+| 是什麼 | 在哪裡 |
+|---|---|
+| 子代理人執行器 | `runSubagent(opts, runTool, TOOLS)` |
+| 主代理人的工具 | `spawn_subagent` |
+| 回合上限 | 8 |
+| 輸出上限 | 2000 字元 |
+| 模型 | `claude-sonnet-4-5`（跟主代理人一樣；system prompt 不同）|
+| 工具允許清單 | 由經理傳入，且要扣掉 `spawn_subagent` |
+| 回傳格式 | `"SUBAGENT_RESULT (N turns, reason):\n\nTEXT"` |
+| 遞迴政策 | 第 05 集不允許 |
+
+**最小可行的子代理人一回合：**
+
+```typescript
+const result = await runSubagent(
+  { brief: "...", toolNames: ["list_dir", "run_bash"] },
+  runTool, TOOLS,
+);
+return `SUBAGENT_RESULT (${result.turnsUsed}, ${result.reason}):\n\n${result.finalText}`;
+```
+
+**撐到第 06 集的六條規則：**
+1. 子代理人有一份 *不一樣* 的 system prompt——話少、有範圍、禁止探索。
+2. 子代理人拿到的是工具的 *子集*，永遠不是全部。
+3. 絕對不要把 `spawn_subagent` 授權給子代理人。
+4. 回合數 *和* 輸出量都要設上限；任一個撞到上限都是訊號，不是成功。
+5. 日誌要清楚寫是哪個代理人在請求確認。
+6. 挑子代理人任務的依據是「觀察量的體積」，不是「看起來很複雜」。
+
+下一站是第 06 集——我們終於要建起那個 feedback 迴圈。

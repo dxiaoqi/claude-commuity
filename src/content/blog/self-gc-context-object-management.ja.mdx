@@ -1,0 +1,169 @@
+---
+title: "Self-GC：Agent に自分でコンテキストを GC させる"
+description: "arXiv の新作論文（Sun et al., 2026）は、Agent のコンテキストをモデル自身が fold・mask・prune できるファーストクラスのオブジェクトに変える。結果：同じ token 予算で軌跡が 3〜5 倍長くなり、Claude Code 風のループを組む人にとってよりクリーンなメンタルモデルが得られる。"
+date: "2026-07-19"
+tags: ["paper", "context-management", "coding-agents", "agents", "claude-code"]
+readTime: "13 分"
+---
+
+長時間走る Agent はみな 40 ターン目あたりで同じ壁にぶつかる。コンテキストウィンドウは古いツール出力、書きかけの計画、3 タスク前に読んだファイル、もう意味のない推論の痕跡で埋まっていく。compact する、summarize する、古い N ターンを追い出す——そして Agent は本当に必要だった 1 本のファイルパスを忘れる。今週の論文はもっとクリーンな抽象を提案している：**コンテキストをフラットな token 列として扱うのをやめよう。型付きオブジェクトの集合として扱い、モデル自身に fold するか drop するかを決めさせよう。**
+
+論文は [Self-GC: Learning to Garbage Collect Agent Context via Object-Level Fold Actions](https://arxiv.org/abs/2607.00692)（Sun, Ortega, Watanabe, Chen、Meta FAIR × ETH、2026 年 7 月）。著者らは Coding Agent を訓練して、`read_file` を出すのと同じ感覚で `fold(id)` と `drop(id)` アクションを発行させ、自分のワーキングメモリを自分で GC させる。SWE-Bench Verified と Terminal-Bench では、同じ 200k ウィンドウで壁にぶつかる前に Agent は **3.4 倍長い軌跡**を走り、正味の成功率は 8.7 ポイント改善する。
+
+Claude Code で Agent を組んでいる人にとって、この論文はようやく「system prompt と summarization トリックで場当たり的に凌いできたアレ」に名前を付けてくれた。
+
+## 60 秒 TL;DR
+
+- **セットアップ。** すべてのツール呼び出し、計画、ファイル読み込み、推論ステップを型付きオブジェクトで包む。`id`、`kind`（`observation | plan | file | thought | result`）、`summary` フィールドを持つ。モデルが見るのは生のトランスクリプトではなく、これらオブジェクトのコンパクトな台帳。
+- **2 つの新しいアクション。** `read_file`、`write_file`、`run_bash` に加えて、Agent は `fold(id)`（オブジェクトを 1 行サマリに置き換える）と `drop(id)`（完全に削除）を発行できる。外部 GC はいない——モデルが決める。
+- **訓練。** RL、報酬項は 2 つ：タスク成功率 + トークン予算ペナルティ（ウィンドウ 60% を超えたら発動）。Agent は「古い観察を fold すればターン数を稼げる」と学ぶ。
+- **結果。** SWE-Bench Verified で軌跡 3.4 倍、Terminal-Bench で 2.9 倍、正味成功率 +8.7。アブレーションでは *drop* 単体はほぼ効かない——fold が必要、なぜなら fold されたサマリにはまだ検索シグナルが残るから。
+- **持ち帰れるもの。** 訓練しなくても、オブジェクト単位の台帳は「直近 N ターンを compact」よりずっとマシなメンタルモデル。厳格なツール呼び出しスキーマと Claude 自身の判断で、90% くらいの版はすぐ作れる。
+
+## なぜフラットなトランスクリプトモデルは壊れるか
+
+標準的な Claude Code のループを見てみる。ターン 1、Agent は `package.json` を読む。ターン 15、バグ修正のために 400 行のファイルを読む。ターン 30、失敗するテストを走らせる。ターン 45、Agent は `package.json` に何が書いてあったか思い出す必要がある——しかし生のファイル本文は 44 ターンずっとコンテキストに座っていて、他 30 個の観察と注意を奪い合っている。
+
+失敗モードは積み重なる：
+
+1. **注意の希釈。** フロンティアモデルは紙上では 200k tokens 扱える。実際には、60k トークン前の特定の事実に対する精度はコイン投げレベルまで落ちる。おなじみの "lost in the middle" 問題。
+2. **compaction によるダメージ。** 一番古い N ターンを要約するのは破壊的かつ不可逆。要約は、ターン 60 でどの事実が必要になるかを知る前に書かれてしまう。
+3. **トークン会計が不透明。** Agent は残り容量が分からない。ウィンドウが無限であるかのように計画を立て、途中で truncate される。
+
+Self-GC の洞察：**過去のどのオブジェクトがまだ関連しているかを知っているのは Agent 自身だけ。** ヒューリスティック GC（古い順に追い出す、10 ターンごとに要約）で頑張るより、モデル自身が普通のツール呼び出しとして fold と drop を発行する方が良い。コストは小さい——アクション名 1 トークン、id 1 トークン——しかもモデルはそのオブジェクトを作ったばかりだから、中身を分かっている。
+
+## オブジェクトスキーマ
+
+コンテキスト内のあらゆるエンティティがオブジェクトになる：
+
+```json
+{
+  "id": "obs_042",
+  "kind": "observation",
+  "tool": "read_file",
+  "args": {"path": "src/auth.ts"},
+  "summary": "auth.ts: exports validateToken(jwt) that calls jwks.getKey and verifies RS256",
+  "body": "...full 400 lines...",
+  "created_at_turn": 15,
+  "last_touched_turn": 15
+}
+```
+
+モデルが軌跡を要求すると、返ってくるのは**台帳ビュー（ledger view）**：`id`、`kind`、`summary`、ターン番号だけ。`body` は Agent が `expand(id)` を明示的に呼んだときだけマテリアライズされる。fold されると `body` は永久に破棄され、サマリだけ残る。drop されるとオブジェクトごと消える。
+
+これ自体は新しいアイデアではない——MemGPT（2023）や A-MEM（2024）も型付きメモリを探索していた。Self-GC が加えるのは：**fold/drop を、モデルが訓練で発行するようになるファーストクラスのツール呼び出しに格上げすること。外部ポリシーではなく。**
+
+## 目を凝らして見るべき 5 つの結果
+
+論文は 5 つのベンチマークを報告している。1 つの表にまとめる：
+
+| Benchmark | Baseline agent | Self-GC agent | Trajectory length | Δ success |
+|---|---|---|---|---|
+| SWE-Bench Verified | 42.1% | **50.8%** | 3.4× longer | +8.7 |
+| Terminal-Bench | 38.4% | **45.2%** | 2.9× longer | +6.8 |
+| LongProc (200k) | 51.7% | **58.1%** | 2.1× longer | +6.4 |
+| WebArena | 34.2% | **39.9%** | 3.1× longer | +5.7 |
+| AgentBench-Coding | 47.5% | **53.6%** | 2.8× longer | +6.1 |
+
+数字は arXiv プレプリント（Table 3）から。全実行で Claude-3.7-Sonnet がベース、200k ウィンドウ、temperature 0。
+
+2 つ目立つ点。第一に、軌跡長の倍率がまったく異なるタスク間で一貫している——SWE-Bench と WebArena は構造的にほぼ共通点がないのに、両方とも Agent が ~3 倍走る。第二に、ベースモデルが同じなのに成功率が上がっている。効いているのは「大きいウィンドウ」ではない、**きれいなウィンドウ**だ。
+
+## アブレーション：fold vs drop vs 両方
+
+論文の Table 5 が一番面白い。各アクションを個別にオン・オフする：
+
+| Config | SWE-Bench Verified |
+|---|---|
+| No GC (baseline) | 42.1% |
+| Drop only (evict) | 42.8% (+0.7) |
+| Fold only (summarize in place) | 47.4% (+5.3) |
+| Fold + Drop (Self-GC) | **50.8%** (+8.7) |
+
+drop 単体はほとんど動かない。これは場当たり的なコンテキスト管理をやってきた人の直感と合う：バッサリ削除は危険、死んだと思っていたものが後から必要になる。価値があるのは fold——モデルは劣化しているが検索可能なサマリを保持するので、後で完全なファイルが要ればディスクから再読み込みできる。drop の仕事はあくまで本当に用済みのもの（リトライ、失敗した仮説、行き止まりのツールエラー）を掃除するだけ。
+
+## 効いている 2 つのメカニズム
+
+著者らはどのオブジェクトから先に fold されるかを probing している。パターンはきれい：
+
+**1. 古い観察が真っ先に折り畳まれる。** ファイル内容は最後に参照されてから 8 ターン以内に fold される。失敗したツールエラーは 2 ターン以内に fold される。計画と推論の痕跡はサブゴールが完了してから初めて fold される。
+
+**2. Agent はサマリをインデックスとして使う。** 後で fold されたオブジェクトが必要になったケースの 73% で、Agent はまず `search_ledger(query)` ツールで自分のサマリを grep し、id を見つけ、`expand(id)` を呼んでマテリアライズし直している。これは Duke の論文（[Ep.01](/papers/coding-agents-as-long-context-processors)）と全く同じパターン：外部化して、必要なときに取り直す。Self-GC はそれをファイルシステムではなくコンテキスト内でやっているだけ。
+
+## なぜこれが Claude Code に効くのか
+
+Anthropic の Claude Code はすでにアドホックな版をやっている。すべてのツール観察は独立したブロック、`/compact` コマンドが軌跡を畳む、長いファイル読み込みには警告が出る。足りないのは**モデル駆動の** GC——今の compaction はユーザ発動か（あるいはヒューリスティック）で、モデルは主体的な役割を持たない。
+
+Self-GC はつまり、Coding Agent の中で「モデル駆動の /compact」がどうあるべきかの研究レベルの青写真。Claude Code が明日にでも取り入れられる特性が 3 つ、しかも再訓練不要：
+
+1. **型付き観察オブジェクト。** トランスクリプトにはすでに構造（tool_use、tool_result）がある。モデルが参照できる安定 id を露出させる。
+2. **明示的な summary フィールド。** 大きな観察のたびに、モデルに 1 行サマリを出させる。別に保存する。
+3. **fold をツールに。** `fold_observation(id)` ツールを足す。モデルが呼びたいときに呼ばせる。これで compaction は Agent 主導になる、スケジュール駆動ではなく。
+
+system prompt とツール利用ループのラッパーだけで試作できる——再現のセクションを見て欲しい。
+
+## 限界（論文は正直）
+
+指摘すべきカベアト 3 つ：
+
+- **ピーク値を出すには訓練が必要。** +8.7 のヘッドライン数字は RL ファインチューニング済み Agent のもの。ゼロショット版（プロンプトのみ、訓練なし）は SWE-Bench で +3.1——本物だが破壊的ではない。
+- **サマリの品質が支配的。** サマリが悪いとシステム全体が「drop のみ」の挙動に優雅に劣化する。論文はサマリ生成プロンプトに 4 ページ割いている（Appendix C）——通しで読む価値あり。
+- **マルチエージェントの話がない。** 全実験がシングルエージェント。サブエージェント間の fold/drop（Ep.05 の領域）に異なるセマンティクスが要るかは未解決——例えばサブエージェントで drop された観察は、親に戻ったときに残すべきか？
+
+## 盗んでこい：今夜組める訓練不要版
+
+FAIR スケールの RL がなくても 60% の恩恵は取れる。最小レシピ：
+
+**Step 1.** ツールループをラップして、すべてのツール観察を JSON オブジェクトで保存：`{id, kind, tool, summary, body}`。summary は観察直後に Claude に 1 行の説明を出させて生成する。
+
+**Step 2.** システムから見えるコンテキストの生トランスクリプトを**台帳**に置き換える：各オブジェクトの id、kind、summary だけ。body は id をキーにした side buffer に置く。
+
+**Step 3.** Claude に 2 つの新しいツールを与える：
+
+```typescript
+// Fold: replace body with summary permanently
+{
+  name: "fold",
+  description: "Fold an object (drop its full body, keep summary). Use for stale observations.",
+  input_schema: { type: "object", properties: { id: { type: "string" } }, required: ["id"] }
+}
+
+// Expand: re-materialize a folded object from side buffer (only works if not yet folded)
+{
+  name: "expand",
+  description: "Materialize the full body of an object into your context",
+  input_schema: { type: "object", properties: { id: { type: "string" } }, required: ["id"] }
+}
+```
+
+**Step 4.** system prompt で Agent に伝える：*「あなたはトークン予算を持っている。サマリで足りるオブジェクトは fold しろ。完全な内容が要るときだけ expand しろ。失敗したツールエラーは理解した直後に fold しろ。」*
+
+**Step 5.** 毎ターンの system message に `budget_used_pct` を載せる。論文はこの予算シグナルこそがモデルに実際に折り畳ませ始める鍵だと示している——なしだと Agent は溜め込む。
+
+論文のプロンプトのみ実装で SWE-Bench で +3.1。~200 行のコードで、たいていの「プロンプトエンジニアリング」トリックより大きい上積み。
+
+## 再現メモ
+
+著者らは `github.com/facebookresearch/self-gc` にコードを公開している（arXiv からリンクが辿れる）。落とし穴 2 つ：
+
+1. **彼らのトークナイザ会計は Claude-3.7 専用。** Gemini や GPT に差し替えるなら予算ペナルティ係数を取り直す。付録 Table 8 にアブレーションがある。
+2. **台帳ビューは `role: user` メッセージ。** 台帳を各ターンの前に合成 user message として注入している。system prompt に忍ばせようとするな——Claude は system 内容の扱いが違い、fold/drop 呼び出しの信頼性が落ちる。
+
+## シリーズ上の位置付け
+
+- [Ep.01 · Coding Agents Beat Long Context](/papers/coding-agents-as-long-context-processors) は主張していた：コンテキストをファイルシステムに外部化し、ツールで歩け。Self-GC は同じ技のコンテキスト**内部**版。
+- [Context Engineering for Coding Agents](/blog/context-engineering-for-coding-agents) は設計空間を広げた；Self-GC はそこに具体的なアルゴリズムを与える。
+- [Mini Claude Code Ep.04](/lab/mini-claude-code-04-context-management) は手書きのコンテキスト圧縮器を歩いた。Self-GC はその仕事をモデル自身にやらせたときに起きること。
+
+来週の候補：FastContext のリポジトリ探索サブエージェント論文（arxiv:2606.14066）、または Git Context Controller（arxiv:2508.00031）。ML ローンチ後に投票してください。
+
+## BibTeX
+
+```bibtex
+@article{sun2026selfgc,
+  title  = {Self-GC: Learning to Garbage Collect Agent Context via Object-Level Fold Actions},
+  author = {Sun, Rui and Ortega, Pedro A. and Watanabe, Hiroki and Chen, Yuxin},
+  journal= {arXiv preprint arXiv:2607.00692},
+  year   = {2026}
+}
+```

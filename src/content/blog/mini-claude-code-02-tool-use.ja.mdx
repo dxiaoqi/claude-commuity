@@ -1,0 +1,243 @@
+---
+title: "Mini Claude Code · Episode 02: エージェントにツールの使い方を教える"
+description: "Episode 2 では REPL に最初の 3 つのツール——read_file、list_dir、run_bash——を与え、Anthropic SDK を使ったツールユースのループを一通り見ていく。ストップリーズン、ツールのエラー、そして会話に何を戻すべきかという意外に厄介な部分まで扱う。"
+date: "2026-07-04"
+tags: ["mini-claude-code", "series", "typescript", "agents"]
+readTime: "16 min"
+---
+
+先週は Claude と会話でき、過去のターンを覚えていられる REPL を作った。悪くはないが、コーディング用途では役に立たない——エージェントがあなたのプロジェクトを見られないからだ。今回はそこを直す。今夜が終わるころには、我々のエージェントはディレクトリを列挙し、ファイルを読み、シェルコマンドを実行するようになる。すべて Claude の制御下でだ。
+
+このエピソードから 1 つだけ持ち帰るとしたら、これにしてほしい：**ツールユースはモデルの特別なモードではなく、我々がその周りに組み立てる特定のループである**。SDK があなたのツールを「実行してくれる」わけではない。Claude が何を実行したがっているかを報告してくれるだけで、実行するのは我々であり、結果を返すのも我々だ。このループを正しく組めるかどうかが、エージェント構築の 8 割である。
+
+## 今夜作るもの
+
+Ep.01 の `agent.ts` を次のように拡張する：
+
+1. 3 つのツール定義：`read_file`、`list_dir`、`run_bash`
+2. ツール実行のルーター
+3. モデルがツールを要求しなくなるまで対話を続ける while ループ
+4. まともな `stop_reason` の処理（サイレントなトランケートはもうやめる）
+
+同じファイルで、規模はおおよそ倍——100 行ほどになる。
+
+## ツールユースのループを一段落で
+
+メッセージを送る → モデルは最終回答 *か* 1 個以上の `tool_use` コンテンツブロックで応答する → 我々は各ツールを実行する → 結果を `tool_result` ブロックとして新しい user メッセージで返す → モデルが再度応答する → `stop_reason: "end_turn"` を返すまで繰り返す。以上だ。あなたが今まで見てきたエージェントフレームワークの複雑さは、このループにぶら下がった飾りに過ぎない。
+
+## 3 つのツールを定義する
+
+`agent.ts` の先頭に、次を追加する：
+
+```typescript
+import fs from "node:fs/promises";
+import path from "node:path";
+import { execFile } from "node:child_process";
+import { promisify } from "node:util";
+
+const execFileP = promisify(execFile);
+const CWD = process.cwd();
+
+const TOOLS = [
+  {
+    name: "read_file",
+    description: "Read a UTF-8 text file from the workspace. Path is relative to the workspace root.",
+    input_schema: {
+      type: "object",
+      properties: { path: { type: "string" } },
+      required: ["path"],
+    },
+  },
+  {
+    name: "list_dir",
+    description: "List entries in a directory relative to the workspace root. Returns one entry per line, directories suffixed with '/'.",
+    input_schema: {
+      type: "object",
+      properties: { path: { type: "string", default: "." } },
+      required: [],
+    },
+  },
+  {
+    name: "run_bash",
+    description: "Run a short shell command in the workspace. Use for grep, find, git status, npm test, etc. Do NOT use for long-running processes.",
+    input_schema: {
+      type: "object",
+      properties: { command: { type: "string" } },
+      required: ["command"],
+    },
+  },
+] as const;
+```
+
+明示しておくべき判断が 2 つある：
+
+**相対パスのみ許可。** ツール側で絶対パスは弾く。本物の Claude Code なら、ここはきちんとサンドボックスで隔離するところだ。今の我々には `path.resolve(CWD, p)` に `startsWith(CWD)` のチェックを添えるだけで、学習中のエージェントが `/etc/passwd` にさまよい込むのを防ぐには十分だ。サンドボックスの厳密さは、そのエージェントを何人に触らせるかに比例してスケールさせればいい。
+
+**`run_bash` は `execFile` を使い、`shell: true` は最初は明示的に避け、その後オンにした。** デモ用エージェントでは、シェルのセマンティクス（パイプ、glob）のほうが、最後の 5% の安全性より重要だ。allow-list は後のエピソードで足す。
+
+## ツールの実行系
+
+```typescript
+async function safeResolve(p: string): Promise<string> {
+  if (path.isAbsolute(p)) throw new Error("absolute paths not allowed");
+  const resolved = path.resolve(CWD, p);
+  if (!resolved.startsWith(CWD)) throw new Error("path escapes workspace");
+  return resolved;
+}
+
+async function runTool(name: string, input: Record<string, unknown>): Promise<string> {
+  try {
+    if (name === "read_file") {
+      const p = await safeResolve(String(input.path));
+      const buf = await fs.readFile(p, "utf-8");
+      return buf.length > 20_000 ? buf.slice(0, 20_000) + "\n…[truncated]" : buf;
+    }
+    if (name === "list_dir") {
+      const p = await safeResolve(String(input.path ?? "."));
+      const entries = await fs.readdir(p, { withFileTypes: true });
+      return entries.map((e) => (e.isDirectory() ? e.name + "/" : e.name)).join("\n");
+    }
+    if (name === "run_bash") {
+      const cmd = String(input.command);
+      const { stdout, stderr } = await execFileP("bash", ["-c", cmd], { cwd: CWD, timeout: 15_000, maxBuffer: 200_000 });
+      return (stdout + (stderr ? "\n[stderr]\n" + stderr : "")).slice(0, 20_000) || "(empty)";
+    }
+    return `Unknown tool: ${name}`;
+  } catch (e: unknown) {
+    const msg = e instanceof Error ? e.message : String(e);
+    return `TOOL_ERROR: ${msg}`;
+  }
+}
+```
+
+3 つポイントがある：
+
+- **ツールのエラーはすべて throw せず、文字列として返す。** モデルは次のステップを考えるためにエラーを見る必要がある。throw してしまえばループが死ぬ。
+- **どの出力も 20 KB でトランケートする。** ツール出力の肥大化はコンテキスト爆発の第 1 原因だ。[context engineering](/en/blog/context-engineering-for-coding-agents) を参照——エージェントの 1 ターンの 84% はツール観測が占めることも多い。ソースの側でトランケートしよう。
+- **bash には 15 秒のタイムアウトと 200 KB の stdout キャップを設定。** これらの数字は恣意的に見えて当然だ——実際に恣意的だ。明白な地雷を踏まないためのもので、あらゆるケースで正しいことを狙ったものではない。
+
+## 従来の `turn` を差し替えるツールユースのループ
+
+```typescript
+async function turn(userText: string) {
+  history.push({ role: "user", content: userText });
+
+  while (true) {
+    const response = await client.messages.create({
+      model: MODEL,
+      max_tokens: 2048,
+      system: SYSTEM,
+      tools: TOOLS,
+      messages: history,
+    });
+
+    // Push the raw content blocks back — Claude expects them exactly.
+    history.push({ role: "assistant", content: response.content });
+
+    // Print any text blocks for the user.
+    for (const block of response.content) {
+      if (block.type === "text") process.stdout.write(block.text);
+    }
+    process.stdout.write("\n");
+
+    if (response.stop_reason !== "tool_use") {
+      if (response.stop_reason === "max_tokens") {
+        console.warn("[warn] response truncated — consider asking Claude to continue or raising max_tokens");
+      }
+      return;
+    }
+
+    // Execute every tool_use block and collect tool_result blocks.
+    const toolResults = [];
+    for (const block of response.content) {
+      if (block.type === "tool_use") {
+        console.log(`\n[tool] ${block.name}(${JSON.stringify(block.input)})`);
+        const result = await runTool(block.name, block.input as Record<string, unknown>);
+        console.log(`[tool] → ${result.slice(0, 200)}${result.length > 200 ? "…" : ""}\n`);
+        toolResults.push({
+          type: "tool_result" as const,
+          tool_use_id: block.id,
+          content: result,
+        });
+      }
+    }
+    history.push({ role: "user", content: toolResults });
+    // Loop continues — Claude gets to react to the tool results.
+  }
+}
+```
+
+今回は `messages.stream` から `messages.create` に切り替えていることに注意。ストリーミングでもツール呼び出しは機能するが、コンテンツブロックを差分で組み立てる部分は面倒で、今夜の主題とは直交する。ストリーミングは Ep.05 で、レイテンシが効いてくるあたりで再訪する。
+
+## 実際の会話はこう見える
+
+適当なプロジェクトディレクトリで起動する：
+
+```
+you › what test frameworks does this project use?
+[tool] read_file({"path":"package.json"})
+[tool] → {"name":"my-app","scripts":{"test":"vitest run"},"devDependencies":{"vitest":"^1.3…
+cc  › This project uses Vitest. The test script runs `vitest run`, and Vitest 1.3+ is listed in devDependencies.
+```
+
+2 回のやりとり、1 つのツール、1 つの最終回答。次はもう少し探索が要る例を見よう：
+
+```
+you › does this project have any TODO comments?
+[tool] run_bash({"command":"grep -rn 'TODO' src --include='*.ts' | head -20"})
+[tool] → src/lib/blog.ts:47: // TODO: cache getAllPosts result…
+cc  › Yes — 4 TODOs in src/lib/blog.ts and 1 in src/app/api/upload/route.ts. Want the specifics?
+```
+
+どのツールを使うかを指示されなくても、モデルは正しいツールを選んだ。これがまさに狙いだ。
+
+## 執筆中に踏み抜いた落とし穴
+
+**`response.content` をそのまま履歴に積み戻すのを忘れる。** 次の user メッセージで送る tool_result ブロックは、assistant メッセージの `tool_use_id` を *参照* している。もし assistant の tool_use ブロックを取り除いてしまうと（たとえばテキストだけを積み戻すなど）、API は次のリクエストを「tool_result without matching tool_use」というエラーで拒否する。対処：`response.content` をそのまま積む。SDK の型に任せておけばいい。
+
+**無限ループ。** 最初のドラフトでは `if (response.stop_reason !== "tool_use") return;` のガードを書き忘れていた。モデルは応答を終え、テキストの回答を返し、`stop_reason` は `"end_turn"` だったのに、こちらのループは回り続け、同じ履歴を送って再生成させ続けた。Ctrl+C を押すまでに 0.20 ドルほど溶けた。本番ではハードキャップを入れる——たとえばユーザーの 1 ターンあたり 20 イテレーションまで、といった具合に。
+
+**ツール出力がコンテキストを吹き飛ばす。** 最初に大きめのリポジトリで `find .` を走らせたときは、tool_result が 800 KB くらいのパスの羅列になった。コンテキスト枯渇、次のリクエストはエラー。対処：ソースでトランケートする（前述の 20 KB キャップ）。長いツール出力をモデルに「うまく無視して」もらう発想は捨てること。
+
+**サイレントな `max_tokens` トランケート。** Ep.01 の REPL は、ここでターンを終えるだけだった。今はモデルが計画の途中でトランケートされる可能性があり、静かな打ち切りはツール列を壊すことになる。上の `console.warn` はプレースホルダで、Ep.06 で「続けて」の自動プロンプトを追加する。
+
+## 次のエピソードで直すこと
+
+いまのエージェントはプロジェクトを *読める*。だが、プロジェクトを *変えられない*。それが次のケーパビリティで、話が一気にスパイシーになる場所でもある。LLM にファイルを書き換えさせるところで本番エージェント障害の大半が起きるからだ。Ep.03 では 4 つめのツール `apply_patch` を追加する。統一 diff を受け取り、検証し、ドライランし、そこで初めてディスクに書く。「破壊的な操作の前に確認する」というパターンも導入する——編集はすべてターミナルでプレビューされる。
+
+今夜のコードにはもう 1 つ、地味な問題が潜んでいる：`history` はツール出力とともに線形に膨らんでいく。`run_bash` を数回挟んだ 10 ターンのセッションで、履歴はあっさり 30 KB に届く。今はそれで構わないが、Ep.04 あたりで問題になる——そのエピソードは丸ごと、コンテキストをもう一度絞り込む話になる。
+
+## クイックリファレンス — Episode 02
+
+| 何を | どこで |
+|---|---|
+| 宣言したツール | `read_file`、`list_dir`、`run_bash` |
+| ループする条件のストップリーズン | `stop_reason === "tool_use"` |
+| 警告するストップリーズン | `stop_reason === "max_tokens"` |
+| assistant コンテンツの積み方 | `response.content` をそのまま。テキストだけではダメ |
+| ツール結果の積み方 | 新しい user メッセージに `type: "tool_result"` ブロックを入れる |
+| ツール出力のトランケート | executor 側で 20 KB のハードキャップ |
+| bash の安全網 | `execFile` に `timeout` + `maxBuffer` + 相対パスチェック |
+
+**最小構成のツールユースターン：**
+
+```typescript
+while (true) {
+  const r = await client.messages.create({ model, system, tools, messages: history, max_tokens: 2048 });
+  history.push({ role: "assistant", content: r.content });
+  if (r.stop_reason !== "tool_use") return;
+  const results = [];
+  for (const b of r.content) if (b.type === "tool_use") {
+    results.push({ type: "tool_result", tool_use_id: b.id, content: await runTool(b.name, b.input) });
+  }
+  history.push({ role: "user", content: results });
+}
+```
+
+**Ep.03 まで生き延びるための 4 つのルール：**
+1. ツールから throw しないこと——エラー文字列を返す。
+2. ツール出力の長さを信じないこと——ソースでトランケートする。
+3. tool_result を送る前に、履歴から `tool_use` ブロックを削らないこと。
+4. イテレーションキャップなしでループを回さないこと。
+
+Ep.03 は来週——ついに Claude に、あなたの git 履歴を破壊させることなく、ファイルを *編集* させる。

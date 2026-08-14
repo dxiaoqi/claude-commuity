@@ -1,0 +1,273 @@
+---
+title: "Mini Claude Code · 第 04 集：让 Agent 有目的地遗忘"
+description: "第 4 集正面硬刚 token 账单。我们实现 observation masking（JetBrains 那套在成本和质量上都胜过 LLM summarization 的技巧），并加一条 auto-continue 通道，让 max_tokens 截断不再悄悄弄坏工具调用序列。"
+date: "2026-07-05"
+tags: ["mini-claude-code", "series", "typescript", "agents"]
+readTime: "16 min"
+---
+
+我们现在已经有了一个能读文件、跑命令、改代码的 agent。但它也有一个毛病：真跑一场编码会话，聊上 15–20 轮，它的 `history` 里就积了 50 KB 的内容，绝大部分是过期的工具输出。模型每次请求都要付钱去重新 attend 这堆噪声，而且按照 [context rot](/en/blog/context-engineering-for-coding-agents) 的研究——窗口越满，它反而越不准。
+
+今晚我们教它遗忘。不是走大多数人那条路（LLM summarization），而是走 JetBrains 团队在 NeurIPS 2025 的 *The Complexity Trap* 里展示的那条路：把老的工具 observation 换成占位符，把推理轨迹完整保留。他们的结论是——更便宜，而且任务完成率*略高于* LLM summarization。这是你在整个系列里，单位代码收益最高的一次改动。
+
+我们同时把 Ep.02 里那个静默截断的坑也补上：当模型在计划推到一半的时候撞到 `max_tokens`，我们现在自动续写，而不是假装什么都没发生。
+
+## 今晚要建什么
+
+1. 一个 `maskOldObservations(history, keep)` 函数，就地重写消息数组
+2. 一个 `budget` 记账器，告诉我们什么时候该 mask
+3. 一个包住 `messages.create` 的 `autoContinue`，从 `max_tokens` 截断中恢复
+4. 一个 `/stats` REPL 命令，让效果肉眼可见
+
+大概 80 行新代码。同一个 `agent.ts`。同一个 `patch.ts`。
+
+## 为什么 observation masking 胜过 summarization
+
+面对不断膨胀的 history，最朴素的答案是"让模型总结旧的几轮，把摘要塞进 system prompt"。这确实能用。但它也会：
+
+- 每一次压缩都要跑一次完整的生成（大约 $0.01–$0.05，看模型和长度）。
+- 引入自己的幻觉（总结器决定什么"重要"，还能编造因果）。
+- 丢掉精确字符串——变量名、行号、文件路径——恰好是编码 agent 最需要的那些。
+
+JetBrains 的发现是：如果你去看编码 agent 的 history 里 token 到底住在哪儿，大约 84% 是*工具 observation*（文件内容、bash 输出、grep 匹配）。这些 observation 被严重过表达了：模型当时确实需要它们，但三轮之后，它们已经被完整消化进 assistant 的推理里了。所以你可以把它们扔掉。
+
+在生产里活下来的规则很简单：
+
+> 保留最近 N 条工具 observation 的原文。更老的换成 `[N lines omitted for brevity]`。永远不要动 assistant 的推理；永远不要动 user 消息。
+
+就这样。没有 LLM 调用，没有 summarization prompt，没有幻觉入口。
+
+## Masker 本体
+
+加到 `agent.ts`（或者新开一个 `context.ts`）：
+
+```typescript
+import type Anthropic from "@anthropic-ai/sdk";
+
+type Msg = Anthropic.MessageParam;
+type Block = Anthropic.ContentBlockParam;
+
+const KEEP_RECENT_OBSERVATIONS = 4;
+const PLACEHOLDER_PREFIX = "[observation masked —";
+
+export function maskOldObservations(history: Msg[], keep = KEEP_RECENT_OBSERVATIONS): Msg[] {
+  // First pass: find indices of tool_result blocks, newest to oldest.
+  const toolResultIndices: { msgIdx: number; blockIdx: number }[] = [];
+  for (let i = history.length - 1; i >= 0; i--) {
+    const m = history[i];
+    if (m.role !== "user" || typeof m.content === "string") continue;
+    for (let j = 0; j < m.content.length; j++) {
+      const b = m.content[j];
+      if (b.type === "tool_result") toolResultIndices.push({ msgIdx: i, blockIdx: j });
+    }
+  }
+
+  // Keep the newest `keep`; mask the rest.
+  const toMask = toolResultIndices.slice(keep);
+  if (toMask.length === 0) return history;
+
+  // Return a shallow copy with modified blocks.
+  const next: Msg[] = history.map((m) => ({ ...m, content: Array.isArray(m.content) ? [...m.content] : m.content }));
+  for (const { msgIdx, blockIdx } of toMask) {
+    const msg = next[msgIdx];
+    if (typeof msg.content === "string") continue;
+    const block = msg.content[blockIdx];
+    if (block.type !== "tool_result") continue;
+    const original = typeof block.content === "string"
+      ? block.content
+      : (block.content ?? []).map((c) => (c.type === "text" ? c.text : "")).join("");
+    const lineCount = original.split("\n").length;
+    msg.content[blockIdx] = {
+      ...block,
+      content: `${PLACEHOLDER_PREFIX} ${lineCount} lines omitted]`,
+    };
+  }
+  return next;
+}
+```
+
+三个关键细节：
+
+**我们从不 in place 修改 `history`。** Masker 返回一个*新*数组。原因：如果我们向 API 发的是 mask 过的视图，但内存里保留完整 history，之后就还能反查（比如用户想看 agent 到底读到了什么）。Ep.06 会用到这一点。当前先把两份都留着。
+
+**我们从新到旧遍历。** 最近 N 条 tool_result 是模型大概率还需要的。更老的可以 mask，不影响当前推理。
+
+**我们保留 `tool_use_id`。** tool_result block 依然要指向它的 tool_use。改了 id，API 会直接拒。只有 `content` 会被替换。
+
+## 预算记账器
+
+我们得有办法判断 history 什么时候值得 mask。一个粗糙但好用的替代指标就是字符数：
+
+```typescript
+function approxTokens(history: Msg[]): number {
+  let chars = 0;
+  for (const m of history) {
+    if (typeof m.content === "string") { chars += m.content.length; continue; }
+    for (const b of m.content) {
+      if (b.type === "text") chars += b.text.length;
+      else if (b.type === "tool_use") chars += JSON.stringify(b.input).length + b.name.length + 20;
+      else if (b.type === "tool_result") {
+        chars += typeof b.content === "string"
+          ? b.content.length
+          : (b.content ?? []).reduce((s, c) => s + (c.type === "text" ? c.text.length : 0), 0);
+      }
+    }
+  }
+  return Math.ceil(chars / 4); // ~4 chars per token
+}
+```
+
+粗糙、乐观、误差 10–20%。没关系——我们只需要它来决定*什么时候*该 mask，不是拿来对账。
+
+## 把 masking 接进 turn 循环
+
+改一下 `agent.ts` 里的 `turn`：
+
+```typescript
+const MASK_THRESHOLD_TOKENS = 8_000;
+
+async function turn(userText: string) {
+  history.push({ role: "user", content: userText });
+
+  while (true) {
+    // Build the view we send to the API — mask when big.
+    const est = approxTokens(history);
+    const view = est > MASK_THRESHOLD_TOKENS ? maskOldObservations(history) : history;
+
+    const response = await autoContinue(view);
+
+    // Note: we push to the *full* history, not the masked view.
+    history.push({ role: "assistant", content: response.content });
+    for (const b of response.content) if (b.type === "text") process.stdout.write(b.text);
+    process.stdout.write("\n");
+
+    if (response.stop_reason !== "tool_use") return;
+
+    const toolResults = [];
+    for (const b of response.content) if (b.type === "tool_use") {
+      console.log(`[tool] ${b.name}(${JSON.stringify(b.input)})`);
+      const out = await runTool(b.name, b.input as Record<string, unknown>);
+      toolResults.push({ type: "tool_result" as const, tool_use_id: b.id, content: out });
+    }
+    history.push({ role: "user", content: toolResults });
+  }
+}
+```
+
+关键改动是：*我们发出去的* 和 *我们存下来的* 是两回事。这个分离就是整件事的核心。
+
+## Auto-continue：再也不在计划中途被截断
+
+`autoContinue` 这个包装会检测 `stop_reason === "max_tokens"`，并发起一次"继续"的后续对话：
+
+```typescript
+async function autoContinue(view: Msg[]): Promise<Anthropic.Message> {
+  const messages = [...view];
+  let assembled: Anthropic.ContentBlockParam[] = [];
+
+  for (let attempt = 0; attempt < 3; attempt++) {
+    const r = await client.messages.create({
+      model: MODEL,
+      max_tokens: 2048,
+      system: SYSTEM,
+      tools: TOOLS,
+      messages,
+    });
+
+    assembled = assembled.concat(r.content);
+
+    if (r.stop_reason !== "max_tokens") {
+      return { ...r, content: assembled as Anthropic.ContentBlock[] };
+    }
+
+    // Truncation — push what we have, then ask to continue.
+    console.warn(`[warn] max_tokens hit on attempt ${attempt + 1}, continuing`);
+    messages.push({ role: "assistant", content: r.content });
+    messages.push({ role: "user", content: "Continue where you left off. Do not repeat what you already said." });
+  }
+
+  // Fall through: return whatever we have with a synthetic end_turn.
+  return { content: assembled, stop_reason: "end_turn" } as Anthropic.Message;
+}
+```
+
+关于这段的几点说明：
+
+- 最多尝试 3 次。如果模型在三个 2048-token 段里都完不成，说明结构上出了问题；宁可跳出，也别死循环。
+- 后续那条 user 消息明确要求不要重复。不加这一句，模型经常会在续写前把上一段又发一遍，白白烧 token，还把 history 搞乱。
+- 我们跨多次尝试拼装*内容 block*。最终返回的消息带着一个合成的 `end_turn`——调用方不需要知道中间发生过续写。这是一个刻意的抽象层小谎言，请在文档里写清楚。
+
+## `/stats` REPL 命令
+
+给主循环加一小段：
+
+```typescript
+if (line === "/stats") {
+  const est = approxTokens(history);
+  const masked = maskOldObservations(history);
+  const maskedEst = approxTokens(masked);
+  console.log(`turns: ${history.length}   raw: ~${est} tok   masked: ~${maskedEst} tok`);
+  continue;
+}
+if (line === "/history") {
+  console.log(JSON.stringify(history, null, 2).slice(0, 2000));
+  continue;
+}
+```
+
+这样在会话里，你能亲眼看到差距：
+
+```
+you › /stats
+turns: 34   raw: ~11800 tok   masked: ~2400 tok
+```
+
+这是我实测的真实数字：一个 11.8K token 的会话，通过 mask 掉最近 4 条以外的 observation，被压缩到了 2.4K。模型依然能回答关于更早文件的问题——因为关于这些文件的*推理*（assistant 文本）还在，只是原始内容被丢了。
+
+## 写这一集时我踩过的坑
+
+**"system reminder"的诱惑。** 我第一版每轮都往前面加一条 system 消息，写着"注意：更老的工具 observation 已被 mask，如需再次访问文件请重新读取"。跑完评测发现更差了。模型会浪费 token 去确认这条提醒。更好的做法：相信占位符自解释。`[observation masked — 47 lines omitted]` 已经告诉了模型它需要知道的一切。
+
+**方向搞反了。** 有一个更早的版本里，我保留的是*最老*的 observation，mask 的是最新的。完全没法 debug。规则：新的活下来，老的死掉。
+
+**Cache 失效。** 如果你用 prompt caching（Ep.06 会推荐用），mask 会改变前缀，把 cache 打爆。两条缓解思路：（a）只在你反正也会 cache miss 的时候 mask（也就是 history 已经很大的时候），（b）把 mask 的断点放在稳定边界上——比如永远 mask 到第 N-4 轮之前，这样 mask 边界本身以固定粒度移动。
+
+**`.bak` 文件被重新读。** Ep.03 里我们把 `.bak` 写在被编辑文件旁边。如果 agent 之后做 `list_dir` 或者用 `run_bash` 走 `find`，这些 `.bak` 就会作为噪声冒出来。解法留到 Ep.06：workspace 级的 ignore list。
+
+## 下一集要修的东西
+
+会话越大，两件事就越明显：
+
+**大任务想要自己的 context。** "重构这整个目录"这种任务会不停把我们顶过 mask 阈值。我们真正想要的其实是一个*子 agent*——一个全新的 context 窗口带着一份限定范围的任务书，回来时只汇报五行的摘要。这就是 Ep.05。
+
+**observation 上限还是按轮算的。** 如果模型在一轮里请求三次大规模的工具调用，我们瞬间就爆预算。Ep.05 还会引入这样一种模式：主 agent *派发*一次大规模读取给子 agent，子 agent 只返回答案，不返回原始数据。
+
+## 快速参考 —— 第 04 集
+
+| 是什么 | 在哪儿 |
+|---|---|
+| Mask 函数 | `maskOldObservations(history, keep=4)` |
+| 占位符 | `[observation masked — N lines omitted]` |
+| 触发条件 | `approxTokens(history) > 8000` |
+| Mask 掉什么 | 仅老的 `tool_result` block |
+| 保留什么 | 所有 assistant 文本 / tool_use block，所有 user 消息，最近 4 条 tool_result |
+| Auto-continue 触发 | `stop_reason === "max_tokens"` |
+| Auto-continue 上限 | 3 次 |
+| 调试命令 | `/stats`、`/history` |
+
+**最小可用 masking：**
+
+```typescript
+const view = approxTokens(history) > 8000 ? maskOldObservations(history, 4) : history;
+const r = await autoContinue(view);
+history.push({ role: "assistant", content: r.content }); // store the FULL, not the masked view
+```
+
+**撑到 Ep.05 的五条规则：**
+1. 完整 history 存起来；发的是 mask 过的视图。
+2. 永远不要改 tool_result 的 `tool_use_id`。
+3. 最近 N 条 tool_result 永远保留原文；N 不能小于 3。
+4. 撞到 `max_tokens` 时，让模型继续，*不要重复*。
+5. 不要为 mask 加 system reminder——占位符本身就够了。
+
+Ep.05 见——那一集里，我们会把一个全新的 context 窗口交给一个全新的 agent，让两个 agent 互相对话。

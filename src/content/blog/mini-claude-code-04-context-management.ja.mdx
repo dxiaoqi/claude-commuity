@@ -1,0 +1,273 @@
+---
+title: "Mini Claude Code · Episode 04：エージェントに意図的に忘れさせる"
+description: "エピソード 4 ではトークン料金の問題に真正面から取り組む。observation masking（コストと品質の両面で LLM summarization を上回る JetBrains 流のトリック）を実装し、max_tokens による切り詰めでツール列が黙って壊れないよう auto-continue の経路を追加する。"
+date: "2026-07-05"
+tags: ["mini-claude-code", "series", "typescript", "agents"]
+readTime: "16 min"
+---
+
+これでファイルを読み、コマンドを実行し、コードを編集するエージェントは手に入った。ただし問題も抱えている——実際のコーディングセッションで 15〜20 ターンも回すと、`history` は 50 KB になり、その大半は古びたツール出力である。モデルはリクエストごとにそのノイズを再注視するためのコストを払っていて、しかも [context rot](/en/blog/context-engineering-for-coding-agents) の研究が示す通り、ウィンドウが埋まるにつれて精度は落ちていく。
+
+今夜はエージェントに忘れることを教える。多くの人がやるやり方（LLM summarization）ではなく、JetBrains チームが NeurIPS 2025 の *The Complexity Trap* で示したやり方だ——古いツールのオブザベーションをプレースホルダーで置き換え、推論の痕跡はそのまま残す。彼らの結果はこうだ：コストは安く、タスク完了率はむしろ LLM summarization より *わずかに高い*。このシリーズ全体で、1 行あたりのインパクトが最も大きい変更である。
+
+Ep.02 で残していた「黙って切り詰められる」問題もついでに直す。モデルが計画の途中で `max_tokens` にぶつかったら、何事もなかったふりをせずに自動で続きを取りに行くようにする。
+
+## 今夜作るもの
+
+1. メッセージ配列を書き換える `maskOldObservations(history, keep)` 関数
+2. いつマスキングすべきかを教えてくれる `budget` の会計係
+3. `max_tokens` による切り詰めから回復する `messages.create` の `autoContinue` ラッパー
+4. その効果を確認できる `/stats` の REPL コマンド
+
+新規はおよそ 80 行。`agent.ts` は据え置き。`patch.ts` も据え置きである。
+
+## なぜ observation masking が summarization に勝つのか
+
+膨らんでいく履歴に対する素直な答えは「古いターンをモデルに要約させて、その要約をシステムプロンプトに入れる」というものだ。これは動く。ただし副作用もある：
+
+- 圧縮のたびに生成が丸ごと 1 回走る（モデルと長さにより 0.01〜0.05 ドル程度）。
+- 要約自身がハルシネーションを持ち込む（要約器が「重要だった」と勝手に判断し、因果関係を捏造しうる）。
+- 変数名、行番号、ファイルパスといった、コーディングエージェントが最も必要とする正確な文字列を失う。
+
+JetBrains の知見はこうだ——コーディングエージェントの履歴でトークンが実際にどこに居るかを見てみると、およそ 84% は *ツールのオブザベーション*（ファイル内容、bash 出力、grep のマッチ）である。これらのオブザベーションは著しく過剰に代表されている——モデルはその瞬間には必要としていたが、3 ターン後にはアシスタントの推論に取り込まれ、完全に処理済みになっている。だから捨ててよい。
+
+本番でも生き残る規則はシンプルだ：
+
+> 直近 N 件のツールのオブザベーションは逐語のまま残す。それより古いものは `[N lines omitted for brevity]` に置き換える。アシスタントの推論には決して触れない。ユーザーメッセージにも触れない。
+
+以上である。LLM 呼び出しなし、要約プロンプトなし、ハルシネーションの表面積なし。
+
+## マスカー
+
+`agent.ts`（または新しい `context.ts`）に追加する：
+
+```typescript
+import type Anthropic from "@anthropic-ai/sdk";
+
+type Msg = Anthropic.MessageParam;
+type Block = Anthropic.ContentBlockParam;
+
+const KEEP_RECENT_OBSERVATIONS = 4;
+const PLACEHOLDER_PREFIX = "[observation masked —";
+
+export function maskOldObservations(history: Msg[], keep = KEEP_RECENT_OBSERVATIONS): Msg[] {
+  // First pass: find indices of tool_result blocks, newest to oldest.
+  const toolResultIndices: { msgIdx: number; blockIdx: number }[] = [];
+  for (let i = history.length - 1; i >= 0; i--) {
+    const m = history[i];
+    if (m.role !== "user" || typeof m.content === "string") continue;
+    for (let j = 0; j < m.content.length; j++) {
+      const b = m.content[j];
+      if (b.type === "tool_result") toolResultIndices.push({ msgIdx: i, blockIdx: j });
+    }
+  }
+
+  // Keep the newest `keep`; mask the rest.
+  const toMask = toolResultIndices.slice(keep);
+  if (toMask.length === 0) return history;
+
+  // Return a shallow copy with modified blocks.
+  const next: Msg[] = history.map((m) => ({ ...m, content: Array.isArray(m.content) ? [...m.content] : m.content }));
+  for (const { msgIdx, blockIdx } of toMask) {
+    const msg = next[msgIdx];
+    if (typeof msg.content === "string") continue;
+    const block = msg.content[blockIdx];
+    if (block.type !== "tool_result") continue;
+    const original = typeof block.content === "string"
+      ? block.content
+      : (block.content ?? []).map((c) => (c.type === "text" ? c.text : "")).join("");
+    const lineCount = original.split("\n").length;
+    msg.content[blockIdx] = {
+      ...block,
+      content: `${PLACEHOLDER_PREFIX} ${lineCount} lines omitted]`,
+    };
+  }
+  return next;
+}
+```
+
+こだわりどころが 3 つある：
+
+**`history` は決してその場では変更しない。** マスカーは *新しい* 配列を返す。理由は——マスクしたビューを API に送りつつ、完全な履歴はメモリに残しておけば、後からアンマスクできる（たとえばユーザーが「エージェントが何を読んだのか見せて」と言ったとき）。Ep.06 でこれを使う。今は両方を持っておくだけでよい。
+
+**新しい方から古い方へ反復する。** 直近 N 件の tool_result は、モデルがまだ必要としている可能性が高い。それより古いものは、現在の推論に影響を与えずにマスクできる。
+
+**`tool_use_id` は保持する。** tool_result のブロックは自分の tool_use を指し続けている。id を変えると API に拒否される。置き換えるのは `content` だけである。
+
+## バジェットの会計係
+
+履歴をマスキングする価値があるかを判断する方法が要る。荒っぽいが有効な代理指標が文字数だ：
+
+```typescript
+function approxTokens(history: Msg[]): number {
+  let chars = 0;
+  for (const m of history) {
+    if (typeof m.content === "string") { chars += m.content.length; continue; }
+    for (const b of m.content) {
+      if (b.type === "text") chars += b.text.length;
+      else if (b.type === "tool_use") chars += JSON.stringify(b.input).length + b.name.length + 20;
+      else if (b.type === "tool_result") {
+        chars += typeof b.content === "string"
+          ? b.content.length
+          : (b.content ?? []).reduce((s, c) => s + (c.type === "text" ? c.text.length : 0), 0);
+      }
+    }
+  }
+  return Math.ceil(chars / 4); // ~4 chars per token
+}
+```
+
+荒く、明るく、10〜20% は外れる。それでいい——これで判断したいのは *いつ* マスクするかであって、*いくら請求するか* ではない。
+
+## ターンループへのマスキングの組み込み
+
+`agent.ts` の `turn` を修正する：
+
+```typescript
+const MASK_THRESHOLD_TOKENS = 8_000;
+
+async function turn(userText: string) {
+  history.push({ role: "user", content: userText });
+
+  while (true) {
+    // Build the view we send to the API — mask when big.
+    const est = approxTokens(history);
+    const view = est > MASK_THRESHOLD_TOKENS ? maskOldObservations(history) : history;
+
+    const response = await autoContinue(view);
+
+    // Note: we push to the *full* history, not the masked view.
+    history.push({ role: "assistant", content: response.content });
+    for (const b of response.content) if (b.type === "text") process.stdout.write(b.text);
+    process.stdout.write("\n");
+
+    if (response.stop_reason !== "tool_use") return;
+
+    const toolResults = [];
+    for (const b of response.content) if (b.type === "tool_use") {
+      console.log(`[tool] ${b.name}(${JSON.stringify(b.input)})`);
+      const out = await runTool(b.name, b.input as Record<string, unknown>);
+      toolResults.push({ type: "tool_result" as const, tool_use_id: b.id, content: out });
+    }
+    history.push({ role: "user", content: toolResults });
+  }
+}
+```
+
+肝は、*送るもの* と *保存するもの* が違う、という点だ。この分離こそが要諦である。
+
+## Auto-continue：計画の途中で二度と切り詰められない
+
+`autoContinue` ラッパーは `stop_reason === "max_tokens"` を検出し、追いかけの「続きを」ターンを発行する：
+
+```typescript
+async function autoContinue(view: Msg[]): Promise<Anthropic.Message> {
+  const messages = [...view];
+  let assembled: Anthropic.ContentBlockParam[] = [];
+
+  for (let attempt = 0; attempt < 3; attempt++) {
+    const r = await client.messages.create({
+      model: MODEL,
+      max_tokens: 2048,
+      system: SYSTEM,
+      tools: TOOLS,
+      messages,
+    });
+
+    assembled = assembled.concat(r.content);
+
+    if (r.stop_reason !== "max_tokens") {
+      return { ...r, content: assembled as Anthropic.ContentBlock[] };
+    }
+
+    // Truncation — push what we have, then ask to continue.
+    console.warn(`[warn] max_tokens hit on attempt ${attempt + 1}, continuing`);
+    messages.push({ role: "assistant", content: r.content });
+    messages.push({ role: "user", content: "Continue where you left off. Do not repeat what you already said." });
+  }
+
+  // Fall through: return whatever we have with a synthetic end_turn.
+  return { content: assembled, stop_reason: "end_turn" } as Anthropic.Message;
+}
+```
+
+補足：
+
+- 上限は 3 回まで。2048 トークンのバーストを 3 回使っても終わらないなら、構造的に何かおかしい。空回りさせるより抜け出した方がよい。
+- 追いかけのユーザーメッセージは「繰り返さないこと」を明示している。これを入れないと、モデルは続ける前に前のテキストを再送しがちで、トークンを浪費し履歴を混乱させる。
+- *コンテンツブロック* を試行間で寄せ集める。最終的に返るメッセージには合成の `end_turn` が付く——呼び出し側は継続が起きたことを知る必要がない。抽象化のための意図的な嘘だ。ドキュメント化しておこう。
+
+## `/stats` の REPL コマンド
+
+メインループへの小さな追加：
+
+```typescript
+if (line === "/stats") {
+  const est = approxTokens(history);
+  const masked = maskOldObservations(history);
+  const maskedEst = approxTokens(masked);
+  console.log(`turns: ${history.length}   raw: ~${est} tok   masked: ~${maskedEst} tok`);
+  continue;
+}
+if (line === "/history") {
+  console.log(JSON.stringify(history, null, 2).slice(0, 2000));
+  continue;
+}
+```
+
+これでセッション中に差分が見える：
+
+```
+you › /stats
+turns: 34   raw: ~11800 tok   masked: ~2400 tok
+```
+
+これは筆者の実測値だ——11.8K のセッションが、直近 4 件より古いオブザベーションをマスキングすることで 2.4K に圧縮された。それでもモデルは、以前のファイルに関する追加質問に答えることができた——なぜならそれらのファイルに関する *推論*（アシスタントのテキスト）は残っていて、落としたのは生の内容だけだったからだ。
+
+## 書きながら踏んだ落とし穴
+
+**「system reminder」の誘惑。** 最初の草案では、毎ターン頭に *「注意：古いツールのオブザベーションはマスクされている。ファイルが再び必要なら、もう一度読むこと」* というシステムメッセージを差し込んでいた。評価を回したら、成績は悪化した。モデルはリマインダーを認識するのにトークンを浪費していたのだ。よい対応：プレースホルダーが自明であることを信じる。`[observation masked — 47 lines omitted]` は、モデルが必要とするすべてを伝えている。
+
+**マスキングの向きを間違える。** 以前の版では *最も古い* オブザベーションを残し、新しい方をマスクしていた。デバッグ不能。ルール：新しい方が生き、古い方が死ぬ。
+
+**キャッシュの無効化。** プロンプトキャッシュを使う場合（Ep.06 で推奨する）、マスキングでプレフィックスが変わるとキャッシュが吹き飛ぶ。緩和策は 2 つ：(a) どうせキャッシュミスする場面（大きな履歴）でだけマスクする、(b) マスクの区切りを安定した境界に置く——たとえば常にターン N-4 より前をすべてマスクし、マスク境界自身は固定チャンク単位でしか動かないようにする。
+
+**`.bak` ファイルの再読み込み。** Ep.03 では編集したファイルの隣に `.bak` を置いた。あとでエージェントが `list_dir` を実行し、`find` を `run_bash` に通すと、これらの `.bak` がノイズとして出てくる。解決策は Ep.06 に持ち越し：ワークスペース単位の無視リストで対応する。
+
+## 次エピソードで直すこと
+
+セッションが伸びるにつれて、はっきりしてくることが 2 つある：
+
+**大きなタスクは自前のコンテキストを欲しがる。** 「このディレクトリを丸ごとリファクタして」というタスクは、マスクしきい値を常に押し上げてくる。実際に欲しいのは *サブエージェント* だ——スコープを絞ったブリーフを持つ真新しいコンテキストウィンドウで、結果を 5 行のサマリーで返してくる存在である。それが Ep.05。
+
+**オブザベーション上限は依然ターン単位のまま。** モデルが 1 ターンで大きなツール呼び出しを 3 つ要求してきたら、バジェットは一瞬で超過する。Ep.05 では、大きな読み込みをメインのエージェントが *ディスパッチ* して、サブエージェントが生データではなく答えを返す、というパターンも導入する。
+
+## クイックリファレンス — Episode 04
+
+| 何 | どこ |
+|---|---|
+| マスク関数 | `maskOldObservations(history, keep=4)` |
+| プレースホルダー | `[observation masked — N lines omitted]` |
+| トリガー | `approxTokens(history) > 8000` |
+| マスクされるもの | 古い `tool_result` ブロックのみ |
+| 残されるもの | すべてのアシスタントのテキスト／tool_use ブロック、すべてのユーザーメッセージ、直近 4 件の tool_result |
+| Auto-continue のトリガー | `stop_reason === "max_tokens"` |
+| Auto-continue の上限 | 3 回 |
+| デバッグコマンド | `/stats`、`/history` |
+
+**最小構成のマスキング：**
+
+```typescript
+const view = approxTokens(history) > 8000 ? maskOldObservations(history, 4) : history;
+const r = await autoContinue(view);
+history.push({ role: "assistant", content: r.content }); // store the FULL, not the masked view
+```
+
+**Ep.05 まで生き延びるための 5 か条：**
+1. 完全な履歴を保存し、マスクしたビューを送る。
+2. tool_result の `tool_use_id` は決して変更しない。
+3. 直近 N 件の tool_result は常に逐語のまま残す。3 件未満に落とさない。
+4. `max_tokens` が来たら、モデルに「繰り返さずに」続けるよう頼む。
+5. マスキングに関するシステムリマインダーは加えない——プレースホルダーだけで十分である。
+
+次は Ep.05——真新しいエージェントに真新しいコンテキストウィンドウを渡し、2 人に話をさせる。

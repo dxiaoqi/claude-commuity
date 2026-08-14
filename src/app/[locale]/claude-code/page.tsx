@@ -1,14 +1,34 @@
 import type { Metadata } from "next";
 import Link from "next/link";
+import { notFound } from "next/navigation";
 import { NewsletterForm } from "@/components/newsletter-form";
+import { defaultLocale, isLocale, locales, type Locale } from "@/i18n/config";
 
-export const metadata: Metadata = {
-  title: "Claude Code field manual",
-  description: "A practical Claude Code workflow for repository context, planning, implementation, and verification.",
-  alternates: { canonical: "/claude-code" },
-};
+interface Props {
+  params: Promise<{ locale: string }>;
+}
 
-export default function ClaudeCodePage() {
+export async function generateMetadata({ params }: Props): Promise<Metadata> {
+  const { locale: rawLocale } = await params;
+  const locale: Locale = isLocale(rawLocale) ? rawLocale : defaultLocale;
+  return {
+    title: "Claude Code field manual",
+    description: "A practical Claude Code workflow for repository context, planning, implementation, and verification.",
+    alternates: {
+      canonical: `/${locale}/claude-code`,
+      languages: Object.fromEntries([
+        ...locales.map((l) => [l, `/${l}/claude-code`] as const),
+        ["x-default", `/${defaultLocale}/claude-code`] as const,
+      ]),
+    },
+  };
+}
+
+export default async function ClaudeCodePage({ params }: Props) {
+  const { locale: rawLocale } = await params;
+  if (!isLocale(rawLocale)) notFound();
+  const locale = rawLocale;
+  const base = `/${locale}`;
   return <main id="main" className="article-shell shell-width">
     <header className="article-hero code-hero"><p className="section-label">{"// FIELD MANUAL 01"}</p><h1>Claude Code is a<br /><span>context machine.</span></h1><p>Build the environment for good decisions, then let speed be the side effect.</p></header>
     <div className="article-layout">
@@ -20,6 +40,6 @@ export default function ClaudeCodePage() {
         <div className="article-cta"><h3>Stay close to the tool.</h3><p>Join the first readers of the Claude Code field manual.</p><NewsletterForm source="claude-code-guide" /></div>
       </article>
     </div>
-    <Link className="back-link" href="/">← Back to the workbench</Link>
+    <Link className="back-link" href={base}>← Back to the workbench</Link>
   </main>;
 }

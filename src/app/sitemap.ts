@@ -1,25 +1,82 @@
 import type { MetadataRoute } from "next";
 import { siteConfig } from "@/lib/site";
-import { getAllPosts } from "@/lib/blog";
+import { getAvailableLocalesForSlug, getSlugsByKind } from "@/lib/blog";
+import { defaultLocale, locales } from "@/i18n/config";
+
+function buildLanguages(pathTemplate: string, availableLocales: readonly string[]) {
+  const languages = Object.fromEntries(
+    availableLocales.map((l) => [l, `${siteConfig.url}${pathTemplate.replace("{locale}", l)}`])
+  );
+  languages["x-default"] = `${siteConfig.url}${pathTemplate.replace("{locale}", defaultLocale)}`;
+  return languages;
+}
 
 export default function sitemap(): MetadataRoute.Sitemap {
   const now = new Date();
-  const posts = getAllPosts();
+  const blogSlugs = getSlugsByKind("blog");
+  const labSlugs = getSlugsByKind("lab");
+  const paperSlugs = getSlugsByKind("paper");
 
-  const staticRoutes: MetadataRoute.Sitemap = [
-    { url: siteConfig.url, lastModified: now, changeFrequency: "weekly", priority: 1 },
-    { url: `${siteConfig.url}/blog`, lastModified: now, changeFrequency: "weekly", priority: 0.9 },
-    { url: `${siteConfig.url}/claude-code`, lastModified: now, changeFrequency: "weekly", priority: 0.85 },
-    { url: `${siteConfig.url}/claude`, lastModified: now, changeFrequency: "monthly", priority: 0.8 },
-    { url: `${siteConfig.url}/privacy`, lastModified: now, changeFrequency: "yearly", priority: 0.2 },
-  ];
+  const staticPaths = ["", "/blog", "/lab", "/lab/mini-claude-code", "/papers", "/claude-code", "/claude", "/privacy"] as const;
 
-  const postRoutes: MetadataRoute.Sitemap = posts.map((post) => ({
-    url: `${siteConfig.url}/blog/${post.slug}`,
-    lastModified: new Date(post.date),
-    changeFrequency: "monthly",
-    priority: 0.8,
-  }));
+  const staticRoutes: MetadataRoute.Sitemap = [];
+  for (const p of staticPaths) {
+    for (const l of locales) {
+      staticRoutes.push({
+        url: `${siteConfig.url}/${l}${p}`,
+        lastModified: now,
+        changeFrequency: p === "/privacy" ? "yearly" : "weekly",
+        priority: p === "" ? 1 : p === "/blog" || p === "/lab" || p === "/papers" ? 0.9 : p === "/lab/mini-claude-code" ? 0.88 : p === "/privacy" ? 0.2 : 0.85,
+        alternates: {
+          languages: buildLanguages(`/{locale}${p}`, locales),
+        },
+      });
+    }
+  }
+
+  const postRoutes: MetadataRoute.Sitemap = [];
+  for (const slug of blogSlugs) {
+    const available = getAvailableLocalesForSlug(slug);
+    for (const l of locales) {
+      postRoutes.push({
+        url: `${siteConfig.url}/${l}/blog/${slug}`,
+        lastModified: now,
+        changeFrequency: "monthly",
+        priority: 0.8,
+        alternates: {
+          languages: buildLanguages(`/{locale}/blog/${slug}`, available),
+        },
+      });
+    }
+  }
+  for (const slug of labSlugs) {
+    const available = getAvailableLocalesForSlug(slug);
+    for (const l of locales) {
+      postRoutes.push({
+        url: `${siteConfig.url}/${l}/lab/${slug}`,
+        lastModified: now,
+        changeFrequency: "monthly",
+        priority: 0.8,
+        alternates: {
+          languages: buildLanguages(`/{locale}/lab/${slug}`, available),
+        },
+      });
+    }
+  }
+  for (const slug of paperSlugs) {
+    const available = getAvailableLocalesForSlug(slug);
+    for (const l of locales) {
+      postRoutes.push({
+        url: `${siteConfig.url}/${l}/papers/${slug}`,
+        lastModified: now,
+        changeFrequency: "monthly",
+        priority: 0.85,
+        alternates: {
+          languages: buildLanguages(`/{locale}/papers/${slug}`, available),
+        },
+      });
+    }
+  }
 
   return [...staticRoutes, ...postRoutes];
 }

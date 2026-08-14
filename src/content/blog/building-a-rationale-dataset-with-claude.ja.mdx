@@ -1,0 +1,232 @@
+---
+title: "Claude で推論の根拠データセットを作る：実務者のプレイブック"
+description: "Claude の推論トレースを収集・構造化・フィルタし、より小さく速いモデルを蒸留するために本当に使えるデータセットに仕上げるための実務ガイド。"
+date: "2026-07-02"
+tags: ["claude", "distillation", "dataset", "workflow"]
+readTime: "12 min"
+---
+
+Claude から小さなモデルを蒸留しようと考えているなら、難しいのは学習ループではない。データだ。とりわけ、推論の根拠データ——ただの入出力ペアを、生徒モデルが本当に学べる何かに変えてくれる推論トレース——である。多くのチームは、この収集ステップにどれだけ時間がかかるか、そして小さな設計判断がデータセットの最終的な有用性をどれほど左右するかを甘く見積もる。
+
+この記事は実務者向けのプレイブックだ。推論の根拠のレコードに何を入れるべきか、Claude にどう頼めば一貫した構造で返ってくるか、後からクエリできるようにどう保存するか、いつ収集を止めて学習に入るかを扱う。ベンチマークは載せない——複数のプロジェクトで通用したヒューリスティックだけだ。
+
+## 推論の根拠のログが FDE 系蒸留の種になる理由
+
+伝統的な蒸留は、教師から生徒に出力分布をコピーする。それでも動くが、強い教師を強くしているものの大半を捨てている。Claude は答えを生成するだけでなく、答えに至る推論の連鎖を生成する。これを捨てると、生徒モデルは推論をゼロから再発見する羽目になり、たいていは失敗する。
+
+FDE（説明からの集中蒸留）はここを反転させる。推論の根拠を一級の学習信号として捕獲し、生徒に推論の根拠と答えの両方を再現させる。生徒は問題への *考え方* を学ぶ——最終トークンだけではなく。実務的には、最終トークンよりも推論経路のほうが重要なタスクで最も効きやすい：複数ステップのツール判断、境界の微妙な構造化抽出、カテゴリ境界がぼやけている分類、ポリシーやコンプライアンスの層が重なった処理、といったものだ。
+
+推論の根拠データセットは種だ。下流のすべて——生徒のアーキテクチャ、学習レシピ、評価ハーネス——は後で入れ替えられる。推論の根拠がノイジーだったり一貫していなかったりすれば、それら下流の努力は無意味になる。
+
+## どの推論の根拠レコードにも必要な 4 つのフィールド
+
+もっとリッチなスキーマを試したこともある。結局はいつもこの 4 つに収束する。これより多いと後で参照しないノイズになるし、これより少ないとフィルタや結果への追跡ができなくなる。
+
+4 つのフィールド：
+
+1. **`input`** — Claude に届いた生の問題。プロンプトテンプレートは含めない、ペイロードだけ。テンプレート化しているなら、テンプレート ID は別に保存する。
+2. **`rationale`** — Claude の逐次推論。自由記述のテキストだが、収集時にどう構造化するかは次節で扱う。
+3. **`output`** — Claude が生成した最終的な答え。タスクが型付きなら型を持たせる（構造化抽出なら JSON、分類ならラベル、コード生成ならコード）。
+4. **`downstream_outcome`** — 出力が使われたときに実際に何が起きたか。コードは走ったか？抽出はグラウンドトゥルースと一致したか？ユーザーは提案を受け入れたか？ほぼ全員が忘れて、プロジェクトを救うのがこのフィールドだ。
+
+`downstream_outcome` がこれほど重要な理由：これは、レコードごとに人間が再ラベルする必要のない、あなたの品質フィルタだからだ。Claude が推論の根拠と答えを出し、その答えがクリーンに実行され下流のチェックを通ったなら、両方とも正しいという強い証拠になる。下流で落ちたなら、そのレコードは弾くか、レビューキューへ送る。
+
+これを表現する最小の TypeScript 型：
+
+```typescript
+interface RationaleRecord {
+  id: string;
+  input: string;
+  rationale: string;
+  output: unknown;
+  downstream_outcome: {
+    status: "passed" | "failed" | "unknown";
+    signal: string;
+    checked_at: string;
+  };
+  meta: {
+    task_type: string;
+    template_id?: string;
+    model: string;
+    collected_at: string;
+  };
+}
+```
+
+`meta` は、後で切り口にしたくなるかもしれないものを入れておく袋だ：どのプロンプトテンプレートが生成したか、Claude のどのバージョンか、どのテナント／環境か。フラットに保つ。
+
+## Claude から構造化された推論の根拠を引き出すプロンプトパターン
+
+Claude は喜んで推論を説明してくれる。ただし、一貫した構造で返させるにはそれ用の頼み方が要る。自由記述で「思考を説明してください」と頼むと、形の揃わない散文が返ってきて、フィルタや学習が後から難しくなる。
+
+実務で効く 3 つのパターン：
+
+**パターン 1：2 ブロック出力。** フェンス付きの `<rationale>` ブロックの後に、フェンス付きの `<answer>` ブロックを求める。正規表現で抜き出す。最も単純で、よく持ちこたえる。
+
+```typescript
+const RATIONALE_PROMPT = `
+You will solve the task below. Respond in exactly this format:
+
+<rationale>
+Step-by-step reasoning. Number each step. Note any assumptions and any
+alternative interpretations you considered and rejected.
+</rationale>
+
+<answer>
+The final answer, and nothing else.
+</answer>
+
+Task:
+${task}
+`;
+
+function parseResponse(raw: string) {
+  const rationale = raw.match(/<rationale>([\s\S]*?)<\/rationale>/)?.[1]?.trim();
+  const answer = raw.match(/<answer>([\s\S]*?)<\/answer>/)?.[1]?.trim();
+  if (!rationale || !answer) throw new Error("malformed response");
+  return { rationale, answer };
+}
+```
+
+**パターン 2：推論の根拠フィールド付き JSON。** そもそも構造化出力を要するタスクでは、推論の根拠を同じ JSON に畳み込む。2 回目のパーシングが要らなくなり、答えを書き始める前に推論の根拠がコミットされる。
+
+```typescript
+const STRUCTURED_PROMPT = `
+Return a single JSON object with these keys, in this order:
+
+- "rationale": array of short strings, one per reasoning step
+- "assumptions": array of assumptions you made
+- "answer": the final structured answer for the task
+
+Task:
+${task}
+`;
+```
+
+`rationale` を `answer` の *前に* 置くのが効く。Claude は左から右に生成する。推論が答えを条件付ける形になり、後付けの正当化にならない。細部だが、質の差は体感できる。
+
+**パターン 3：棄却した候補。** 難しいケースでは、Claude に検討して棄却したものを明示させる。生徒モデルが学ぶべき決定境界が浮かび上がる。
+
+```typescript
+const REJECTED_PROMPT = `
+For the task below:
+
+1. List at least two candidate answers you considered.
+2. For each candidate, explain in one sentence why you rejected it or chose it.
+3. Give your final answer.
+
+Task:
+${task}
+`;
+
+```
+
+パターン 3 は高価だ——1 レコードあたりのトークンがおおよそ倍になる——ので、生徒が「間違った理由で正解している」ように見えるタスクタイプにだけ使う。ここから経験則：推論の根拠のパターンはタスクタイプごとに選ぶ。一括で 1 種類に決めない。推論の根拠の形が混ざったデータセットは、タイプ内で厳格・タイプ間で多様なデータセットより学習が悪くなる。
+
+## ストレージスキーマ
+
+数千レコードを集めた時点で、ストレージ選定が現実味を帯びる。私は Postgres＋柔軟な部分は JSONB カラム、というところに落ち着いた。地味だが、動く。
+
+```sql
+CREATE TABLE rationales (
+  id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  task_type TEXT NOT NULL,
+  template_id TEXT,
+  model TEXT NOT NULL,
+
+  input TEXT NOT NULL,
+  rationale TEXT NOT NULL,
+  output JSONB NOT NULL,
+
+  outcome_status TEXT NOT NULL CHECK (outcome_status IN ('passed', 'failed', 'unknown')),
+  outcome_signal TEXT NOT NULL,
+  outcome_checked_at TIMESTAMPTZ,
+
+  meta JSONB NOT NULL DEFAULT '{}'::jsonb,
+
+  collected_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  quality_score REAL,
+  training_split TEXT
+);
+
+CREATE INDEX idx_rationales_task_type ON rationales (task_type);
+CREATE INDEX idx_rationales_outcome ON rationales (outcome_status);
+CREATE INDEX idx_rationales_split ON rationales (training_split) WHERE training_split IS NOT NULL;
+CREATE INDEX idx_rationales_meta_gin ON rationales USING GIN (meta);
+```
+
+いくつか目を向けておきたい点：
+
+- `output` は TEXT ではなく JSONB。後で中身にクエリしたくなる（「`entities` 配列が 3 件より多いレコードを見せて」など）。
+- `outcome_status` は check 制約付きの enum ライクなプレーンなカラム。`meta` に埋め込まない——常時フィルタするから。
+- `quality_score` と `training_split` は初期状態で NULL、フィルタパイプラインで埋める。同じ行にあれば学習バッチを組むのに join が要らない。
+- `meta` の GIN インデックスがあれば、思い付くたびにカラムを増やさなくても任意のメタデータで切り分けられる。
+
+学習バッチの選択はこう書ける：
+
+```sql
+SELECT id, input, rationale, output
+FROM rationales
+WHERE task_type = 'invoice_extraction'
+  AND outcome_status = 'passed'
+  AND quality_score >= 0.7
+  AND training_split = 'train'
+ORDER BY collected_at
+LIMIT 5000;
+```
+
+Postgres が窮屈になる規模で動いているなら、同じスキーマはメタデータカタログ付きのオブジェクトストレージ上の Parquet にクリーンに翻訳できる。ただ、必要になるまで飛びつかないこと。
+
+## 学習前の品質フィルタ
+
+生の推論の根拠レコードは学習データではない。学習ランに投入する前に、少なくとも 3 種類のフィルタを通す必要がある。
+
+**フィルタ 1：構造的妥当性。** レスポンスはパースできたか？JSON はバリデーションを通ったか？必須の 4 フィールドがすべて存在し、空でないか？意外な割合のレコード——たいてい 2〜5% くらい——がここで落ちる。落とさないと純粋なノイズになる。
+
+**フィルタ 2：下流の結果。** `outcome_status = 'failed'` のものは落とすか隔離する。失敗レコードはどこかに保管しておく——エラー解析や、後日のネガティブ例学習に有用だ——が、メインの学習プールには入れない。`outcome_status = 'unknown'` は判断のしどころ。タスクが弱い自動チェックでも組めるなら組む。未確認は実質的にノイズだから。
+
+**フィルタ 3：推論の根拠と答えの整合性。** これが飛ばされ、後で後悔されるフィルタだ。Claude が推論の根拠と正しい答えを出したからといって、その推論の根拠が答えを導いたとは限らない。モデルはもっともらしいステップを生成しつつ、実際にはショートカット経由で答えを出すことがある。それを学習に使うと、生徒は「自信満々な戯言」の後に「その戯言と無関係な正解」を出す、という振る舞いを学ぶ。
+
+これを安く行うには、Claude 自身に推論の根拠がその答えを支えているかスコアさせる方法がある。小さなサンプルに対して。
+
+```typescript
+const CONSISTENCY_PROMPT = `
+Rationale:
+${record.rationale}
+
+Answer:
+${JSON.stringify(record.output)}
+
+On a scale of 0 to 1, how well does the rationale support the answer?
+Return only a number. Score 1 means the rationale directly and correctly
+leads to the answer. Score 0 means the rationale is unrelated or
+contradicts the answer.
+`;
+```
+
+集めたレコードのランダムなサブセット——たとえば 5〜10%——にこれを走らせ、分布から閾値を決める。スコアをフィルタとして適用してもいいし、学習の重み付けとして使ってもいい。全件にスコアはしない：コストがすぐ膨らみ、限界効用は急速に下がる。
+
+もう 2 つ、タスク依存だが挙げておく価値のあるフィルタ：
+
+- **入力による重複排除。** データソースに強い繰り返しがあるなら（サポートチケット、ログ行など）、近似重複した入力がよくあるパターンを過剰表現し、テールを痩せさせる。入力をハッシュしてハッシュごとに 1 レコード、`meta` に `duplicate_count` を保存して重みに使えるようにする。
+- **長さの妥当性。** 1 行しかない推論の根拠、50 段落ある推論の根拠は、たいていどちらかの方向に壊れている。タスクごとの上下限を設定し、端を落とす。
+
+## いつ収集を止めて蒸留に入るか
+
+私が最も多く見る失敗モードは、いつまでも収集し続けるチームだ。エッジケースは常にもう一つあるし、カバレッジはいつでも足せる。しかし推論の根拠データセットの収益逓減は急峻で、蒸留ランを先送りすることは「実際に学習して回す」というより難しい問題での時間を複利で失うことでもある。
+
+打ち切り判断のためのヒューリスティック：
+
+**量よりカバレッジ。** 量そのものは悪い目標だ。欲しいのはタスクの決定表面のカバレッジだ。仮にタスクのサブケースを 10〜20 個挙げられて、それぞれに少なくとも 100 件の通過レコードがデータセットにあるなら、開始してよい。2 つのサブケースに 5 件ずつしかなくて残りに 5,000 件、というなら追加収集が正当化される——ただし過小表現のケースだけを対象に。
+
+**推論の根拠の分布がフラットになる。** 収集の早い段階では、新しい 100 件ごとに未見の推論パターンが出てくる。後になると、ほとんどが既存パターンの焼き直しになる。50 件の新規レコードのランダムサンプルが再放送のように読めるなら、十分に近い。
+
+**失敗モードが繰り返し始める。** 失敗し隔離されたレコードが同じ 3 種類の問題のバリエーションばかりなら、失敗表面はマッピングできている。それがデータセットを凍結して学習に入り、生徒の失敗を次の収集ラウンドの指針にする、というシグナルだ。反復ラウンドは、毎回、巨大な一発収集スプリントに勝つ。
+
+**動く評価がある。** これは譲れない。このタスクで生徒モデルをスコアできる評価ハーネスが無いなら、まだ学習を始めない——効いているかを判定できない。評価は凝っていなくていい。推論の根拠データセットの保留スライスを、答えの正確さと推論の根拠と答えの整合性でスコアするだけで、初回としては十分だ。
+
+**コストが教えてくれる。** 強い教師での推論の根拠収集は安くない。1 レコードあたりの限界コストが登っていて（長いコンテキスト、パターン 3 プロンプト、人手レビューのため）、限界情報利得が落ちているなら、その曲線の交差が実務的な停止シグナルだ。
+
+最後にもう 1 点。蒸留を始めても、収集パイプラインは温めたままにしておく。1 つ目の生徒モデルが何を間違えるかを見てから、2 ラウンド目、3 ラウンド目が欲しくなる。推論の根拠収集を一発物の納品物として扱うのは、凡庸な生徒を得て手詰まりになる最短ルートだ。学習ループに供給し続ける継続プロセスとして扱うことが、このアプローチ全体を機能させる。
+
+このワークフローの学習側については、[Focused distillation from explanations for builders](/blog/focused-distillation-from-explanations-for-builders) を参照。推論の根拠収集を開発環境に組み込むなら、[the Claude Code hooks guide](/blog/claude-code-hooks-complete-guide) が Claude 実行中にロギングと検証スクリプトを自動で発火させる方法を解説している。

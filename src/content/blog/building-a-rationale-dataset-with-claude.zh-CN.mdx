@@ -1,0 +1,232 @@
+---
+title: "用 Claude 构建推理理由数据集：一份实战手册"
+description: "如何采集、组织、筛选 Claude 的推理轨迹，把它们攒成一份真正能用来蒸馏小模型的推理理由数据集。"
+date: "2026-07-02"
+tags: ["claude", "distillation", "dataset", "workflow"]
+readTime: "12 min"
+---
+
+如果你正打算从 Claude 蒸馏一个小模型，最难的部分其实不是训练循环。是数据。更具体地说，是推理理由数据——那些把普通的输入输出对，变成学生模型真的能学到东西的推理轨迹。大多数团队都低估了这一步的耗时，也低估了这一步里的一堆小决定最后决定数据集有没有用。
+
+这篇文章是给一线工程师的实战手册。内容包括：一条推理理由记录该长什么样，怎么设计提示词让 Claude 稳定地按结构返回，怎么把数据存得未来还能查得动，以及怎么判断"停止采集、开始训练"的时机。没有基准数字，只有几个项目里反复验证过的经验法则。
+
+## 为什么推理理由日志是 FDE 蒸馏的种子
+
+传统蒸馏，是把老师的输出分布搬到学生身上。这能奏效，但它扔掉了强老师之所以强的大部分内容。Claude 不只是给出答案，它同时给出一条抵达答案的推理链。如果你把这条链扔了，学生模型就得从零重新发现推理，而它一般发现不出来。
+
+FDE（从解释中进行聚焦蒸馏）反过来做。你把推理理由捕获成一等训练信号，然后训练学生同时复现推理理由和答案。学生学的是*怎么*思考这个问题，而不只是最终那个 token。工程实践中，这一套在"推理路径比最终答案更重要"的任务上收益最大：多步的工具决策、带边界情形的结构化抽取、类目边界模糊的分类、以及任何叠了策略或合规逻辑的任务。
+
+推理理由数据集就是种子。下游一切——学生的架构、训练配方、评测框架——都可以之后再换。可如果你的推理理由本身是脏的、不一致的，那后面怎么折腾都没用。
+
+## 每条推理理由记录都必须有的四个字段
+
+我试过更复杂的 schema，最后都会塌回四个字段。多加的东西你后来根本不看；少一个字段，你就失去了筛选或追溯结果的能力。
+
+四个字段：
+
+1. **`input`** —— 打到 Claude 面前的原始问题本体。不是提示词模板外壳，就是那段负载。如果你用了模板，把模板 ID 单独存一列。
+2. **`rationale`** —— Claude 的分步推理。自由文本，但请看下一节，讲的是采集阶段怎么给它加约束。
+3. **`output`** —— Claude 给出的最终答案。如果任务是有类型的，就要有类型（结构化抽取用 JSON、分类用标签、代码生成用代码字符串）。
+4. **`downstream_outcome`** —— 这份输出被用出去之后，实际发生了什么？代码跑通了没？抽取结果和 ground truth 对上了没？用户接受这个建议了没？这个字段几乎所有人都会漏，但正是它救了整个项目。
+
+`downstream_outcome` 之所以关键：它是不需要人工重新标注的质量筛选器。Claude 生成了推理理由和答案，答案还顺利执行、通过了下游校验，那你就有强证据说明推理理由和答案都靠谱。要是它下游挂了，你可以过滤掉这条记录，或者送到复核队列。
+
+一个最小的 TypeScript 类型定义：
+
+```typescript
+interface RationaleRecord {
+  id: string;
+  input: string;
+  rationale: string;
+  output: unknown;
+  downstream_outcome: {
+    status: "passed" | "failed" | "unknown";
+    signal: string;
+    checked_at: string;
+  };
+  meta: {
+    task_type: string;
+    template_id?: string;
+    model: string;
+    collected_at: string;
+  };
+}
+```
+
+`meta` 是个杂物包，用来装任何你以后可能想切片查的东西：模板 ID、Claude 版本、租户、环境。保持扁平。
+
+## 让 Claude 稳定输出结构化推理理由的几种提示词模式
+
+Claude 很愿意解释自己的推理，但你得用一种能保证结构一致的方式来问它。自由式的"讲讲你的思路"提示词会返回形状千奇百怪的散文，后面很难筛，也很难拿去训练。
+
+实战中管用的三种模式：
+
+**模式 1：两段块输出。** 让它先输出 `<rationale>` 块，再输出 `<answer>` 块，用正则解析出来。这是最简单的一种，鲁棒性也不错。
+
+```typescript
+const RATIONALE_PROMPT = `
+You will solve the task below. Respond in exactly this format:
+
+<rationale>
+Step-by-step reasoning. Number each step. Note any assumptions and any
+alternative interpretations you considered and rejected.
+</rationale>
+
+<answer>
+The final answer, and nothing else.
+</answer>
+
+Task:
+${task}
+`;
+
+function parseResponse(raw: string) {
+  const rationale = raw.match(/<rationale>([\s\S]*?)<\/rationale>/)?.[1]?.trim();
+  const answer = raw.match(/<answer>([\s\S]*?)<\/answer>/)?.[1]?.trim();
+  if (!rationale || !answer) throw new Error("malformed response");
+  return { rationale, answer };
+}
+```
+
+**模式 2：把推理理由塞进 JSON 字段。** 任务本来就要结构化输出的，就把推理理由折进同一个 JSON。省一步解析，同时强制在写答案之前先把推理理由 commit 出来。
+
+```typescript
+const STRUCTURED_PROMPT = `
+Return a single JSON object with these keys, in this order:
+
+- "rationale": array of short strings, one per reasoning step
+- "assumptions": array of assumptions you made
+- "answer": the final structured answer for the task
+
+Task:
+${task}
+`;
+```
+
+把 `rationale` 放在 `answer` 前面很重要。Claude 是从左往右生成的；先推理，推理就会去 condition 后面的答案，而不是变成事后补的辩护。这个差别微妙，但质量差你能感觉到。
+
+**模式 3：显式列出被否决的候选。** 对付难题时，让 Claude 明确列出它考虑过和拒掉的选项。这能把学生模型需要学的决策边界暴露出来。
+
+```typescript
+const REJECTED_PROMPT = `
+For the task below:
+
+1. List at least two candidate answers you considered.
+2. For each candidate, explain in one sentence why you rejected it or chose it.
+3. Give your final answer.
+
+Task:
+${task}
+`;
+
+```
+
+模式 3 挺贵——每条记录的 token 数大致翻倍——所以我只在"学生答对了但推理理由不对路"的任务类型上用它。顺便引出一个原则：按任务类型选推理理由模式，不要一刀切。混着几种推理理由形状的数据集，训出来会比每种任务内部保持一致、跨任务允许多样的数据集要差。
+
+## 存储 schema
+
+采集到几千条以后，选存储就变成个实际问题了。我最后落在 Postgres + JSONB 列，用来处理灵活的那部分。方案朴素，也真好使。
+
+```sql
+CREATE TABLE rationales (
+  id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  task_type TEXT NOT NULL,
+  template_id TEXT,
+  model TEXT NOT NULL,
+
+  input TEXT NOT NULL,
+  rationale TEXT NOT NULL,
+  output JSONB NOT NULL,
+
+  outcome_status TEXT NOT NULL CHECK (outcome_status IN ('passed', 'failed', 'unknown')),
+  outcome_signal TEXT NOT NULL,
+  outcome_checked_at TIMESTAMPTZ,
+
+  meta JSONB NOT NULL DEFAULT '{}'::jsonb,
+
+  collected_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  quality_score REAL,
+  training_split TEXT
+);
+
+CREATE INDEX idx_rationales_task_type ON rationales (task_type);
+CREATE INDEX idx_rationales_outcome ON rationales (outcome_status);
+CREATE INDEX idx_rationales_split ON rationales (training_split) WHERE training_split IS NOT NULL;
+CREATE INDEX idx_rationales_meta_gin ON rationales USING GIN (meta);
+```
+
+几个可以留意的地方：
+
+- `output` 是 JSONB，不是 TEXT。你之后会想直接查它里面的字段（"给我所有 `entities` 数组里超过三项的记录"）。
+- `outcome_status` 是一个带 check 约束的枚举样式列。别把它藏进 `meta`——你会不停地对它做过滤。
+- `quality_score` 和 `training_split` 一开始是 NULL，由后面的筛选流水线填。放在同一行意味着出训练批次不用再 join。
+- `meta` 上的 GIN 索引，让你按任意元数据切片时不必每次新增一列。
+
+选一个训练批次的 SQL 长这样：
+
+```sql
+SELECT id, input, rationale, output
+FROM rationales
+WHERE task_type = 'invoice_extraction'
+  AND outcome_status = 'passed'
+  AND quality_score >= 0.7
+  AND training_split = 'train'
+ORDER BY collected_at
+LIMIT 5000;
+```
+
+如果规模大到 Postgres 已经吃紧，这套 schema 可以干净地翻译成对象存储上的 Parquet + 元数据 catalog。到那一步之前别贸然切。
+
+## 训练前的质量过滤
+
+原始的推理理由记录不是训练数据。至少要过三层过滤，才能进训练流程。
+
+**过滤 1：结构性合法性。** 响应能解析吗？JSON 校验过了吗？四个必填字段是否都有、都非空？会有相当一部分记录挂在这一层——通常 2% 到 5%——不丢掉就是纯噪声。
+
+**过滤 2：下游结果。** `outcome_status = 'failed'` 的一律丢或隔离。失败样本要留着——它们对错误分析有用，将来也可以做负样本训练——但不能进主训练池。`outcome_status = 'unknown'` 的记录要看情况。如果任务能哪怕搭一个弱的自动化校验，就搭上，因为 unknown 本质上就是噪声。
+
+**过滤 3：推理理由 - 答案一致性。** 这一层是最多人跳过、后面又最后悔的。Claude 生成了一段推理理由，也生成了一个正确答案，不等于推理理由真的导出了那个答案。有时候模型先写一段听起来靠谱的步骤，然后走一条捷径直接给出答案；你要是拿这种数据训学生，学生就会学到"先自信地胡扯一通，然后再吐一个和推理无关的正确答案"。
+
+一个便宜的检查版本：用 Claude 自己给一个小样本打分，看推理理由是否真的支撑答案。
+
+```typescript
+const CONSISTENCY_PROMPT = `
+Rationale:
+${record.rationale}
+
+Answer:
+${JSON.stringify(record.output)}
+
+On a scale of 0 to 1, how well does the rationale support the answer?
+Return only a number. Score 1 means the rationale directly and correctly
+leads to the answer. Score 0 means the rationale is unrelated or
+contradicts the answer.
+`;
+```
+
+在采集到的记录里随机抽 5% 到 10% 跑这段，用分数分布来定阈值。之后要么把分数作为过滤条件，要么当训练样本权重用。别对每条都打分；成本涨得飞快，边际收益掉得也很快。
+
+再补两个和任务相关、值得一提的过滤：
+
+- **按输入去重。** 如果你的数据源本身重复很多（工单、日志行），近似重复的输入会把常见模式过采样、把长尾饿死。对输入做 hash，每个 hash 只留一条，把 `duplicate_count` 存进 `meta`，需要的话再用它加权。
+- **长度合理性。** 推理理由只有一行或长达五十段的，两个方向几乎都是坏的。给每种任务定上下界，把极端值丢掉。
+
+## 什么时候停止采集、开始蒸馏
+
+我见过最常见的失败模式，是团队一直在采。总还有下一个边界情形，总还想再补一点覆盖。但推理理由数据集边际收益衰减得很快，而且拖着不训练，你反倒在"训练与迭代"这个更难的问题上损失了复利时间。
+
+一些判断信号：
+
+**看覆盖，不看总量。** 数量本身是坏目标。你要的是任务决策面的覆盖度。如果你能列出任务的 10 到 20 个子情形，每个子情形都至少有一百条 passed 记录，那就够开始了。要是两个子情形只有五条、其他都有五千，那就该继续采，但只针对代表不足的那几种。
+
+**推理理由分布开始变平。** 采集早期，每加一百条都会引入你没见过的推理模式。到后期，新增的基本在复读已有模式。当你从新样本里抽 50 条随便读读、感觉像是在看重播时，就快够了。
+
+**失败模式开始重复。** 如果你 failed 和 quarantined 的记录都是同样那三种问题的变体，说明你已经把失败面摸清楚了。这就是"冻结数据集、开始训练、然后用训好的学生的失败去指导下一轮采集"的信号。分几轮迭代，比一次性大冲刺要好，每次都是。
+
+**你手里有一个可跑的评测。** 这条没得商量。如果你没有一个能对学生模型在这个任务上打分的评测框架，就别开始训练——你判断不出它到底行不行。评测不用花哨。从推理理由数据集里切一份保留集，按答案正确率和推理理由 - 答案一致性打分，够第一轮用了。
+
+**成本在给你信号。** 用强老师采推理理由不便宜。当你每条记录的边际成本在往上走（因为你在为更长上下文、模式 3 提示词、或人工复核付钱），而边际信息增益在往下掉，这两条曲线交叉的地方，就是实际的停止信号。
+
+最后一件事。等你真开始蒸馏的时候，把采集流水线保温着。你会想在看到第一版学生模型的错误之后，再补第二轮、第三轮采集。把推理理由采集当成一次性交付物，几乎是让学生停在平庸、让项目卡住最稳的方式。把它当成一个滚动进行、持续给训练循环喂料的过程——这才是让整套办法真正跑起来的姿势。
+
+关于这套工作流的训练侧内容，看 [从解释中蒸馏推理能力：FDE 给工程师的实战启示](/blog/focused-distillation-from-explanations-for-builders)。如果你想把推理理由采集接进本地开发环境，[Claude Code hooks 完整指南](/blog/claude-code-hooks-complete-guide) 讲了怎么在 Claude 运行时自动触发日志与校验脚本。

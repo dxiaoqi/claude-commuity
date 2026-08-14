@@ -1,0 +1,232 @@
+---
+title: "Building a Rationale Dataset with Claude: A Practical Playbook"
+description: "How to collect, structure, and filter Claude's reasoning traces into a rationale dataset you can actually use to distill smaller, faster models."
+date: "2026-07-02"
+tags: ["claude", "distillation", "dataset", "workflow"]
+readTime: "12 min"
+---
+
+If you've been thinking about distilling a smaller model from Claude, the hard part isn't the training loop. It's the data. Specifically, it's the rationale data—the reasoning traces that turn a plain input-output pair into something a student model can actually learn from. Most teams underestimate how much time this collection step takes and how many small decisions determine whether the dataset is useful at the end.
+
+This post is a practitioner playbook. It covers what a rationale record should contain, how to prompt Claude so you get consistent structure back, how to store the data so it's queryable later, and how to know when to stop collecting and start training. There are no benchmarks here—just heuristics that have held up across a few projects.
+
+## Why rationale logs are the seed for FDE-style distillation
+
+Traditional distillation copies output distributions from a teacher to a student. That works, but it throws away most of what makes a strong teacher strong. Claude doesn't just produce an answer; it produces a chain of reasoning that gets to the answer. If you throw that away, your student model has to rediscover the reasoning from scratch, and it usually can't.
+
+Focused distillation from explanations (FDE) flips this. You capture the rationale as a first-class training signal, then train the student to reproduce both the rationale and the answer. The student learns *how* to think about the problem, not just the answer surface. In practice this tends to help most on tasks where the reasoning path matters more than the final token: multi-step tool decisions, structured extraction with edge cases, classification where category boundaries are fuzzy, anything with policy or compliance logic layered on top.
+
+The rationale dataset is the seed. Everything downstream—the student's architecture, the training recipe, the eval harness—can be swapped later. If your rationales are noisy or inconsistent, none of that matters.
+
+## The four fields every rationale record needs
+
+I've tried richer schemas. They always collapse back down to four fields. Anything more becomes noise you don't consult later; anything less and you lose the ability to filter or trace outcomes.
+
+The four fields:
+
+1. **`input`** — the raw problem as it hit Claude. Not the prompt template around it, just the payload. If you templated it, store the template ID separately.
+2. **`rationale`** — Claude's step-by-step reasoning. Freeform text, but see the next section for how to structure it during collection.
+3. **`output`** — the final answer Claude produced. Should be typed if the task is typed (JSON for structured extraction, a label for classification, code for code gen).
+4. **`downstream_outcome`** — what actually happened when the output was used. Did the code run? Did the extraction match the ground truth? Did the user accept the suggestion? This is the field almost everyone forgets and the one that saves the project.
+
+The reason `downstream_outcome` matters so much: it's your quality filter that doesn't require a human relabeling every record. If Claude produced a rationale and an answer, and the answer executed cleanly and passed the downstream check, you have strong evidence that both are correct. If it failed downstream, you can filter that record out or send it to a review queue.
+
+A minimal TypeScript type for this:
+
+```typescript
+interface RationaleRecord {
+  id: string;
+  input: string;
+  rationale: string;
+  output: unknown;
+  downstream_outcome: {
+    status: "passed" | "failed" | "unknown";
+    signal: string;
+    checked_at: string;
+  };
+  meta: {
+    task_type: string;
+    template_id?: string;
+    model: string;
+    collected_at: string;
+  };
+}
+```
+
+The `meta` bag is where you put anything else you might want to slice on later: which prompt template produced it, what version of Claude, what tenant or environment. Keep it flat.
+
+## Prompt patterns to get structured rationales from Claude
+
+Claude is happy to explain its reasoning, but you have to ask for it in a way that produces consistent structure. Freeform "explain your thinking" prompts will get you back prose of wildly varying shape, which makes filtering and training harder later.
+
+Three patterns that work in practice:
+
+**Pattern 1: Two-block output.** Ask for a fenced `<rationale>` block followed by a fenced `<answer>` block. Parse them out with a regex. This is the simplest approach and it holds up well.
+
+```typescript
+const RATIONALE_PROMPT = `
+You will solve the task below. Respond in exactly this format:
+
+<rationale>
+Step-by-step reasoning. Number each step. Note any assumptions and any
+alternative interpretations you considered and rejected.
+</rationale>
+
+<answer>
+The final answer, and nothing else.
+</answer>
+
+Task:
+${task}
+`;
+
+function parseResponse(raw: string) {
+  const rationale = raw.match(/<rationale>([\s\S]*?)<\/rationale>/)?.[1]?.trim();
+  const answer = raw.match(/<answer>([\s\S]*?)<\/answer>/)?.[1]?.trim();
+  if (!rationale || !answer) throw new Error("malformed response");
+  return { rationale, answer };
+}
+```
+
+**Pattern 2: JSON with a rationale field.** For tasks that already need structured output, fold the rationale into the same JSON. This avoids a second parsing step and forces the rationale to be committed before the answer is written.
+
+```typescript
+const STRUCTURED_PROMPT = `
+Return a single JSON object with these keys, in this order:
+
+- "rationale": array of short strings, one per reasoning step
+- "assumptions": array of assumptions you made
+- "answer": the final structured answer for the task
+
+Task:
+${task}
+`;
+```
+
+Putting `rationale` before `answer` matters. Claude generates left to right; the reasoning ends up conditioning the answer instead of being a post-hoc justification. This is subtle but you can feel the quality difference.
+
+**Pattern 3: Rejected alternatives.** For hard cases, ask Claude to explicitly list what it considered and rejected. This surfaces the decision boundaries a student model needs to learn.
+
+```typescript
+const REJECTED_PROMPT = `
+For the task below:
+
+1. List at least two candidate answers you considered.
+2. For each candidate, explain in one sentence why you rejected it or chose it.
+3. Give your final answer.
+
+Task:
+${task}
+`;
+
+```
+
+Pattern 3 is expensive—it roughly doubles the tokens per record—so I only use it on task types where I'm seeing the student get the answer right for the wrong reason. Which brings up a rule: pick your rationale pattern per task type, not once globally. A dataset that mixes rationale shapes will train worse than one that's rigid within a type but varied across types.
+
+## Storage schema
+
+Once you've collected a few thousand records, the choice of storage becomes real. I've landed on Postgres with a JSONB column for the flexible parts. It's boring and it works.
+
+```sql
+CREATE TABLE rationales (
+  id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  task_type TEXT NOT NULL,
+  template_id TEXT,
+  model TEXT NOT NULL,
+
+  input TEXT NOT NULL,
+  rationale TEXT NOT NULL,
+  output JSONB NOT NULL,
+
+  outcome_status TEXT NOT NULL CHECK (outcome_status IN ('passed', 'failed', 'unknown')),
+  outcome_signal TEXT NOT NULL,
+  outcome_checked_at TIMESTAMPTZ,
+
+  meta JSONB NOT NULL DEFAULT '{}'::jsonb,
+
+  collected_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  quality_score REAL,
+  training_split TEXT
+);
+
+CREATE INDEX idx_rationales_task_type ON rationales (task_type);
+CREATE INDEX idx_rationales_outcome ON rationales (outcome_status);
+CREATE INDEX idx_rationales_split ON rationales (training_split) WHERE training_split IS NOT NULL;
+CREATE INDEX idx_rationales_meta_gin ON rationales USING GIN (meta);
+```
+
+A few things to notice:
+
+- `output` is JSONB, not TEXT. You want to be able to query into it later ("show me all records where the output has more than three items in the `entities` array").
+- `outcome_status` is a plain enum-like column with a check constraint. Don't hide this inside `meta`—you'll be filtering on it constantly.
+- `quality_score` and `training_split` start out NULL and get filled in by the filtering pipeline. Keeping them on the same row means you don't have to join to produce a training batch.
+- The GIN index on `meta` lets you slice by arbitrary metadata without adding a new column every time you think of one.
+
+Selecting a training batch then looks like this:
+
+```sql
+SELECT id, input, rationale, output
+FROM rationales
+WHERE task_type = 'invoice_extraction'
+  AND outcome_status = 'passed'
+  AND quality_score >= 0.7
+  AND training_split = 'train'
+ORDER BY collected_at
+LIMIT 5000;
+```
+
+If you're operating at a scale where Postgres feels tight, the same schema translates cleanly to Parquet on object storage with a metadata catalog. Don't jump to that until you have to.
+
+## Quality filters before training
+
+Raw rationale records are not training data. You need at least three filter passes before anything hits a training run.
+
+**Filter 1: structural validity.** Did the response parse? Did the JSON validate? Are all four required fields present and non-empty? A surprising fraction of records fail this—usually 2 to 5 percent—and they're pure noise if you don't drop them.
+
+**Filter 2: downstream outcome.** Drop or quarantine everything where `outcome_status = 'failed'`. Keep the failures somewhere—they're useful for error analysis and for negative-example training later—but they don't go into the main training pool. Records with `outcome_status = 'unknown'` are a judgment call. If the task lets you build even a weak automated check, do it, because unknowns are effectively noise.
+
+**Filter 3: rationale-answer consistency.** This is the one people skip and later regret. Just because Claude produced a rationale and produced a correct answer doesn't mean the rationale led to the answer. Sometimes the model generates plausible-sounding steps and then the answer via a shortcut, and if you train on that, the student learns to generate confident nonsense followed by a correct answer that has nothing to do with it.
+
+A cheap version of this check: use Claude itself to score whether the rationale actually supports the answer, on a small sample.
+
+```typescript
+const CONSISTENCY_PROMPT = `
+Rationale:
+${record.rationale}
+
+Answer:
+${JSON.stringify(record.output)}
+
+On a scale of 0 to 1, how well does the rationale support the answer?
+Return only a number. Score 1 means the rationale directly and correctly
+leads to the answer. Score 0 means the rationale is unrelated or
+contradicts the answer.
+`;
+```
+
+Run this on a random subset—say 5 to 10 percent of your collected records—and use the distribution to set a threshold. Then either apply the score as a filter or use it as a training weight. Don't score every record; the cost adds up fast and the marginal value drops quickly.
+
+There are two more filters worth mentioning, though they're task-dependent:
+
+- **Deduplication by input.** If your data source has heavy repetition (support tickets, log lines), near-duplicate inputs will over-represent common patterns and starve the tail. Hash the input, keep one record per hash, and store a `duplicate_count` in `meta` so you can weight if you want.
+- **Length sanity.** Rationales that are one line or fifty paragraphs are almost always broken in one direction or the other. Set task-specific bounds and drop the extremes.
+
+## When to stop collecting and start distilling
+
+The most common failure mode I see is teams that collect forever. There's always another edge case, always more coverage to add. But rationale datasets have sharply diminishing returns, and holding back a distillation run costs you compounding time on the harder problem of actually training and iterating.
+
+Some heuristics for calling it:
+
+**Coverage over volume.** Volume alone is a bad target. What you want is coverage of the task's decision surface. If you can list, say, ten to twenty subcases of your task, and each has at least a hundred passing records in the dataset, you have enough to start. If two subcases have five records and the rest have five thousand, more collection is warranted—but only on the underrepresented cases.
+
+**The rationale distribution flattens.** Early in collection, every new hundred records introduces reasoning patterns you haven't seen before. Later, they mostly rehash existing patterns. When a random sample of fifty fresh records reads like reruns, you're getting close to enough.
+
+**Failure modes start repeating.** If your failed and quarantined records are all variations on the same three issues, you've mapped the failure surface. That's a signal to freeze the dataset and start training, then use the trained student's failures to guide the next collection round. Iterative rounds beat one giant collection sprint every time.
+
+**You have a working eval.** This one is non-negotiable. If you don't have an eval harness that can score a student model on this task, don't start training yet—you won't be able to tell if it's working. The eval doesn't have to be fancy. A held-out slice of your rationale dataset, scored on answer correctness and rationale-answer consistency, is enough for a first pass.
+
+**Cost is telling you.** Rationale collection with a strong teacher is not cheap. If your marginal cost per record is climbing (because you're paying for longer contexts, or Pattern 3 prompts, or human review) and your marginal information gain is falling, that curve crossing is the practical stop signal.
+
+One last thing. When you do start distilling, keep the collection pipeline warm. You will want a second and third round after seeing what the first student model gets wrong. Treating rationale collection as a one-shot deliverable is the surest way to get a mediocre student and stall out. Treating it as a rolling process that keeps feeding the training loop is what makes the whole approach work.
+
+For more on the training side of this workflow, see [Focused distillation from explanations for builders](/blog/focused-distillation-from-explanations-for-builders). And if you're wiring rationale collection into your dev environment, [the Claude Code hooks guide](/blog/claude-code-hooks-complete-guide) walks through how to trigger logging and validation scripts automatically as Claude runs.

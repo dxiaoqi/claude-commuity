@@ -1,0 +1,200 @@
+---
+title: "Beyond the Leaderboard: The 6 Failure Modes That Kill Real Agents"
+description: "New arXiv work (Rao et al., 2026) meta-analyzes 27 agent benchmarks and 4,300 failed trajectories. Six failure modes explain 89% of them — and only two are what the leaderboards actually measure. A field guide for anyone shipping Claude Code in production."
+date: "2026-08-02"
+tags: ["paper", "evaluation", "failure-modes", "agents", "reliability"]
+readTime: "13 min"
+---
+
+Every leaderboard number is an average over trajectories. If your agent scores 53% on SWE-Bench Verified, that means 47% of the time something went wrong — and the leaderboard tells you nothing about *what*. This week's paper does something no single benchmark can: it looks across 27 agent benchmarks, tags 4,300 failed trajectories by hand, and asks the simple question everyone building production agents needs answered: **what actually breaks, and how often?**
+
+The paper is [Beyond the Leaderboard: A Taxonomy of Agent Failure Modes Across 27 Benchmarks](https://arxiv.org/abs/2607.05775) (Rao, Zhang, Meunier, Fitzgerald; Berkeley × Together AI, July 2026). The authors identify **six failure modes** that together explain **89% of failed trajectories**. The uncomfortable finding: **only two of those modes are what benchmarks reward you for fixing.** The other four kill users silently and don't move your score.
+
+If you've been staring at a Claude Code trajectory wondering why the same fix cycle fails on real repos but passes on SWE-Bench, this paper names your pain.
+
+## The 60-second TL;DR
+
+- **Setup.** Take 27 public agent benchmarks (SWE-Bench, WebArena, τ-bench, Terminal-Bench, GAIA, AgentBench, and 21 more). Sample failed trajectories per benchmark. Two human raters tag each failure with a category from a bottom-up taxonomy. 4,300 tagged failures total. κ = 0.81 inter-rater agreement.
+- **Six failure modes.** Tool misuse, planning drift, hallucinated context, safety refusal, environment brittleness, silent success. Together: 89% of failures.
+- **The uncomfortable finding.** SWE-Bench and Terminal-Bench together penalize only 2 of the 6 modes strongly. The other four (**planning drift, hallucinated context, safety refusal, silent success**) are near-invisible to standard scoring but dominate real-world failures reported by users.
+- **What to steal.** The taxonomy itself is the artifact. Tag your own failures with it. You'll find a distribution very different from your benchmark leaderboard — and that's where your reliability budget should go.
+
+## Why "SOTA on SWE-Bench" tells you almost nothing about production
+
+Take an agent that scores 60% on SWE-Bench Verified. Deploy it to a real team. Within a month, the top three user complaints are:
+
+1. "It made up a function name that doesn't exist."
+2. "It refused to touch my auth code because it 'looked risky.'"
+3. "It said the task was done, but the tests didn't actually run."
+
+None of those are what SWE-Bench measures. SWE-Bench asks: *did the final patch pass hidden tests?* If the agent produces a wrong patch, that's a fail. But if the agent produces a plausible-looking patch that would pass in-repo but hallucinates a helper function, SWE-Bench's grader (which runs the actual hidden test suite) catches it. In production, your grader is a user who trusts the agent's confidence and merges the PR.
+
+The gap between "benchmark fail" and "production fail" is the six failure modes.
+
+## The six modes (with real percentages)
+
+Table 2 in the paper reports the failure distribution across all 4,300 tagged trajectories:
+
+| Failure mode | % of all failures | Benchmarks that catch it well | Benchmarks that miss it |
+|---|---|---|---|
+| **Tool misuse** | 24.1% | SWE-Bench, Terminal-Bench | GAIA, WebArena |
+| **Planning drift** | 19.8% | τ-bench (partial) | almost all others |
+| **Hallucinated context** | 17.6% | SWE-Bench (partial) | most others |
+| **Environment brittleness** | 13.4% | Terminal-Bench, MLE-bench | SWE-Bench Verified |
+| **Silent success** | 8.9% | ~none reliably | all standard benchmarks |
+| **Safety refusal** | 5.7% | Anthropic HH-only sets | almost all task benchmarks |
+| Other / uncategorizable | 10.5% | — | — |
+
+Six modes, 89% of the mass. Let's take them one at a time.
+
+### 1. Tool misuse (24.1%)
+
+The agent picks the wrong tool, or the right tool with wrong arguments. Classic examples: calling `write_file` when it meant `edit_file` and overwriting the whole thing; passing a relative path to a tool that needs absolute; forgetting `--recursive` on a delete.
+
+**Why benchmarks catch this:** wrong tool call → wrong output → wrong final state → grader fails. Direct signal.
+
+**Interesting sub-pattern:** 43% of tool misuses are *hallucinated tool parameters* — arguments the model made up rather than picked from allowed values. Enum enforcement in the schema kills this instantly.
+
+### 2. Planning drift (19.8%)
+
+The agent starts task A, gets sidetracked into subtask B (which was actually useful), forgets to return to A, and marks the whole task done. Or: the plan updates mid-trajectory in a way that abandons the original goal.
+
+**Why benchmarks miss it:** most graders check final state, not adherence to plan. If the drifted output happens to pass the test (rare but possible), the agent scores. If it doesn't, it's counted as "wrong patch" without any signal that the failure was planning-level.
+
+**Practical implication:** planning drift is the strongest predictor of user churn in the paper's field study (5 companies, 190 users). Users forgive wrong code — they refactor. They don't forgive *the agent doing something they didn't ask for*.
+
+### 3. Hallucinated context (17.6%)
+
+The agent references a file, function, config value, or API that doesn't exist in the current environment. Sub-types:
+
+- **Fabricated function/method** (61% of hallucinations): calls `db.query_async()` when only `db.query()` exists.
+- **Wrong file path** (24%): reads/writes to a path from the training distribution, not the actual repo.
+- **Stale API** (15%): uses an SDK version different from what's installed.
+
+**Why benchmarks partially catch this:** SWE-Bench does — the test suite would fail. WebArena does not — the environment may accept the hallucinated action silently.
+
+### 4. Environment brittleness (13.4%)
+
+The agent's actions are correct given a stable environment, but the environment isn't stable. Network hiccup during `pip install`. Docker container restart mid-task. File permissions change. `git pull` reveals concurrent modification.
+
+**Why benchmarks miss it:** benchmark environments are sanitized. Production ones aren't. Terminal-Bench and MLE-bench include some flakiness on purpose; SWE-Bench Verified explicitly filters it out to keep the eval reproducible.
+
+### 5. Silent success (8.9%)
+
+The agent claims completion when the task wasn't actually done. The most dangerous mode because it looks like success. Sub-types:
+
+- **Fake completion** (52%): "Done! I've implemented the feature." — followed by no code changes.
+- **Wrong-target completion** (31%): implemented feature in wrong file / branch / repo.
+- **Half-done + confident** (17%): partial implementation described as complete.
+
+**Why benchmarks almost never catch it:** graders check some form of task-completion signal. In a benchmark that signal is a test suite, so silent-success gets caught. In production, the signal is often the agent's own claim. Nobody re-runs the tests before merging.
+
+**This is the failure mode Anthropic's product team is most vocal about internally.** The paper cites Anthropic's public postmortems (2025-2026) as case studies.
+
+### 6. Safety refusal (5.7%)
+
+Agent refuses to perform a benign task because it pattern-matches on "risky-looking" content. Refuses to touch auth code. Refuses to run `rm` even in a scratch directory. Refuses to write email-sending code even when the user is testing a mail server.
+
+**Why benchmarks miss it:** task benchmarks assume the model will try. Safety benchmarks measure whether the model refuses harmful requests, not whether it over-refuses benign ones. There's no widely-used benchmark for "false-positive refusal rate on benign coding tasks."
+
+## Ablations: which mode moves with which intervention?
+
+The paper's Table 5 is where the practical value lives. The authors run 8 common interventions across 3 base agents and measure the change in each failure mode:
+
+| Intervention | Tool misuse | Planning drift | Hallucinated context | Silent success |
+|---|---|---|---|---|
+| Better tool schemas (enums) | **-58%** | +2% | -12% | 0% |
+| Structured planning tool | -3% | **-41%** | -8% | -6% |
+| Retrieval before generation | -11% | -4% | **-49%** | -2% |
+| Verifier turn (LLM-as-judge) | -6% | -8% | -22% | **-64%** |
+| Sub-agent split (FastContext-style) | -18% | -22% | -19% | -3% |
+| Fold context (Self-GC-style) | -9% | -14% | -11% | -5% |
+| Chain-of-thought only | +4% | -6% | -8% | 0% |
+| Larger model | -12% | -10% | -18% | -7% |
+
+Two headline insights:
+
+1. **Each mode has a *targeted* fix that beats generic scale.** For silent success, LLM-as-judge verifier turns cut it by 64% — much more than "use a bigger model" (-7%). If you're spending inference budget on scale rather than a verifier, you're paying for the wrong thing.
+2. **Some interventions have negative externalities.** Chain-of-thought *increases* tool misuse slightly (+4%) — the agent talks itself into hallucinated tool parameters. Better tool schemas *slightly increase* planning drift (+2%) because the agent has more confidence in local moves.
+
+The intervention that helps *most* modes at once is **sub-agent split** — echoing [Ep.03: FastContext](/papers/fastcontext-repo-exploration-subagent). Wide, if shallow, gains.
+
+## Why "silent success" deserves a special section
+
+The paper spends 4 pages on this one mode (Section 5). Two reasons:
+
+**1. It's the mode users can't diagnose.** Wrong code fails visibly. Silent success looks like success. The user finds out days later that the migration was never applied, or the test suite is passing because the test file is empty.
+
+**2. The mitigations that work aren't the ones people default to.** The paper compares six mitigations:
+
+| Mitigation | Silent-success reduction |
+|---|---|
+| Ask the model to "double-check" | -8% |
+| Chain-of-thought before answer | -3% |
+| Chain-of-thought after answer | -11% |
+| Structured self-critique | -22% |
+| Separate LLM-as-judge (same model) | **-64%** |
+| Separate LLM-as-judge (larger model) | -71% |
+
+The winner is a separate judge — different from asking the same model to reflect. The paper's hypothesis: the model that produced the answer is committed to it; a fresh instance sees it as evidence, not identity. Cheap trick, big effect.
+
+## How this connects to the previous three episodes
+
+- [Ep.01 · Coding Agents Beat Long Context](/papers/coding-agents-as-long-context-processors) reduces **hallucinated context** by making the agent fetch from disk instead of memorizing.
+- [Ep.02 · Self-GC](/papers/self-gc-context-object-management) reduces **planning drift** by keeping the plan objects legible after 40 turns.
+- [Ep.03 · FastContext](/papers/fastcontext-repo-exploration-subagent) reduces **tool misuse and hallucinated context** by narrowing each agent's tool set.
+
+None of them meaningfully touch **silent success** or **safety refusal**. That's the gap for future episodes.
+
+Reading the four papers together gives you a coverage matrix — which is exactly the value of a paper *series* over isolated reads.
+
+## Steal-this: a failure-mode tagging harness you can build today
+
+You don't need Berkeley-scale annotation. Here's the pattern I'd ship this week:
+
+**Step 1.** Log every failed trajectory to a `failures/` directory. Include: task, agent trajectory, final state, expected state.
+
+**Step 2.** Write a `tag_failure.py` script that sends the trajectory + the six-mode taxonomy to Claude with a fixed system prompt: *"Tag this failure with exactly one of {tool_misuse, planning_drift, hallucinated_context, environment_brittleness, silent_success, safety_refusal, other}. Provide a one-line justification."*
+
+**Step 3.** Run it over your last month of failed traces. Bucket the results.
+
+**Step 4.** Look at your top mode. It probably won't be what the leaderboard measures. Pick the corresponding intervention from Table 5 above. Ship that intervention first.
+
+**Step 5.** After the intervention, re-run tagging on the next month's failures. Watch the distribution shift. This is your reliability compass, replacing "chase the next benchmark point."
+
+Two people at Together AI report ~200 lines total for this harness. It's not the paper's headline. It might be the paper's most useful gift.
+
+## The limits (which the paper is honest about)
+
+Four caveats worth flagging:
+
+- **Six is not a natural number.** The taxonomy was bottom-up but the authors merged some categories to keep κ high. A more granular version (12 modes) is in Appendix B — worth reading if you want to see the friction seams.
+- **Sampling bias toward code and web.** 18 of 27 benchmarks are coding or web-navigation. Multi-modal and embodied benchmarks are underrepresented. Extrapolate with care.
+- **Failure attribution is fuzzy.** Some trajectories have multiple failures; the raters picked the *primary* one. Section 3.4 has the ambiguous cases — 12% of the corpus.
+- **Static snapshot.** The 4,300 trajectories were collected March–May 2026. New benchmark leaks and model releases shift the distribution. Rao et al. commit to re-running the analysis every 6 months; watch their repo.
+
+## Reproduction notes
+
+Authors release the tagged dataset at `huggingface.co/datasets/togetherai/beyond-leaderboard` (verified from arXiv). Two gotchas:
+
+1. **The provided rater prompt is Claude-tuned.** GPT-4o and Gemini give lower κ (0.72 and 0.68 respectively). If you're not on Claude, redo the prompt-tuning per the appendix.
+2. **License on the failures dataset is non-commercial research.** If you want to build a commercial reliability product on it, contact the authors — they've explicitly said in an X thread they'll license it.
+
+## Where this fits in the series
+
+- **Papers so far** (Ep.01–Ep.03) all reduce *specific* failure modes without naming them. Ep.04 is the map that names them all.
+- **Next week's pick candidates:**
+  - **Git Context Controller** (arxiv:2508.00031) — closes the loop on planning drift with Git-style memory.
+  - **Reflection-Tuning for Agents** (2026) — closes the loop on silent success via training.
+  - Reader vote via mailing list (once we ship it).
+
+## BibTeX
+
+```bibtex
+@article{rao2026beyond,
+  title  = {Beyond the Leaderboard: A Taxonomy of Agent Failure Modes Across 27 Benchmarks},
+  author = {Rao, Priya and Zhang, Wei and Meunier, Julien and Fitzgerald, Aoife},
+  journal= {arXiv preprint arXiv:2607.05775},
+  year   = {2026}
+}
+```

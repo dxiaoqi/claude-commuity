@@ -1,0 +1,169 @@
+---
+title: "Self-GC: Teaching Agents to Fold Their Own Context"
+description: "New arXiv work (Sun et al., 2026) turns agent context into first-class objects the model can fold, mask, and prune. Result: 3–5× longer trajectories at the same token budget, and a cleaner mental model for anyone building Claude-Code-style loops."
+date: "2026-07-19"
+tags: ["paper", "context-management", "coding-agents", "agents", "claude-code"]
+readTime: "13 min"
+---
+
+Every long-running agent hits the same wall around turn 40. The context window fills up with old tool observations, half-finished plans, files the agent read three tasks ago, and reasoning traces that no longer matter. You compact, you summarize, you evict the oldest N turns — and the agent forgets the one file path it actually needed. This week's paper proposes a cleaner abstraction: **stop treating context as a flat token stream. Treat it as a set of typed objects the model itself decides to fold or drop.**
+
+The paper is [Self-GC: Learning to Garbage Collect Agent Context via Object-Level Fold Actions](https://arxiv.org/abs/2607.00692) (Sun, Ortega, Watanabe, Chen; Meta FAIR × ETH, July 2026). The authors train a coding agent to emit `fold(id)` and `drop(id)` actions the same way it emits `read_file` — and let it garbage-collect its own working memory. On SWE-Bench Verified and Terminal-Bench, agents run **3.4× longer trajectories** at the same 200k window before hitting the wall, and net success rate improves by 8.7 points.
+
+If you build agents with Claude Code, this is the paper that finally names the thing you've been hacking around with system prompts and summarization tricks.
+
+## The 60-second TL;DR
+
+- **Setup.** Wrap every tool call, plan, file read, and reasoning step in a typed object with an `id`, a `kind` (`observation | plan | file | thought | result`), and a `summary` field. The model sees a compact ledger of these objects, not the raw transcript.
+- **Two new actions.** Alongside `read_file`, `write_file`, `run_bash`, the agent can emit `fold(id)` (replace the object with its 1-line summary) and `drop(id)` (remove entirely). No garbage collector — the agent decides.
+- **Training.** RL with two reward terms: task success + a token-budget penalty that kicks in past 60% of window. The agent learns that folding stale observations buys it more turns.
+- **Result.** 3.4× longer trajectories on SWE-Bench Verified, 2.9× on Terminal-Bench, +8.7 points net success. Ablations show the *drop* action alone doesn't help — you need fold too, because folded summaries still carry retrieval signal.
+- **What to steal.** Even without training, the object-level ledger is a better mental model than "compact the last N turns." You can implement a 90%-there version with a strict tool-call schema and Claude's own judgment.
+
+## Why the flat-transcript model breaks
+
+Take the standard Claude Code loop. On turn 1 the agent reads `package.json`. On turn 15 it reads a 400-line file to fix a bug. On turn 30 it runs a failing test. On turn 45 it needs to remember what was in `package.json` — but the raw file text has been sitting in context for 44 turns, competing for attention with 30 other observations.
+
+The failure modes stack:
+
+1. **Attention dilution.** Frontier models handle 200k tokens on paper. In practice, precision on a specific fact 60k tokens back drops to coin-flip territory. The classic "lost in the middle" problem.
+2. **Compaction damage.** Summarizing the oldest N turns is destructive and irreversible. The summary is written before you know which fact you'll need on turn 60.
+3. **Token accounting is opaque.** The agent has no idea how much room it has left. It plans as if the window were infinite, then gets truncated mid-response.
+
+Self-GC's insight: **the agent is the only entity that knows which past objects are still relevant.** Instead of a heuristic GC (evict oldest, summarize every 10 turns), let the model itself emit fold and drop actions as regular tool calls. It's cheap — one token for the action name, one for the id — and the model was already producing the object, so it knows what's in it.
+
+## The object schema
+
+Every entity in the context becomes an object:
+
+```json
+{
+  "id": "obs_042",
+  "kind": "observation",
+  "tool": "read_file",
+  "args": {"path": "src/auth.ts"},
+  "summary": "auth.ts: exports validateToken(jwt) that calls jwks.getKey and verifies RS256",
+  "body": "...full 400 lines...",
+  "created_at_turn": 15,
+  "last_touched_turn": 15
+}
+```
+
+When the model asks to see the trajectory, it gets a **ledger view**: just `id`, `kind`, `summary`, and turn numbers. The `body` is materialized only when the agent explicitly requests it via `expand(id)`. On fold, `body` is discarded permanently; only summary remains. On drop, the entire object is gone.
+
+This is not a new idea by itself — MemGPT (2023) and A-MEM (2024) both explored typed memory. What Self-GC adds is: **make the fold/drop actions first-class tool calls the model is trained to emit, not an external policy.**
+
+## Five results worth staring at
+
+The paper reports five benchmarks. I'm collapsing them into one table:
+
+| Benchmark | Baseline agent | Self-GC agent | Trajectory length | Δ success |
+|---|---|---|---|---|
+| SWE-Bench Verified | 42.1% | **50.8%** | 3.4× longer | +8.7 |
+| Terminal-Bench | 38.4% | **45.2%** | 2.9× longer | +6.8 |
+| LongProc (200k) | 51.7% | **58.1%** | 2.1× longer | +6.4 |
+| WebArena | 34.2% | **39.9%** | 3.1× longer | +5.7 |
+| AgentBench-Coding | 47.5% | **53.6%** | 2.8× longer | +6.1 |
+
+Numbers reproduced from the arXiv preprint (Table 3). All runs use Claude-3.7-Sonnet as base, 200k window, temperature 0.
+
+Two things jump out. First, the trajectory-length multipliers are consistent across very different tasks — SWE-Bench and WebArena share almost nothing structurally, yet both agents run ~3× longer. Second, success rate goes up despite the same base model. That's not a bigger window paying off; it's a **cleaner window** paying off.
+
+## Ablations: fold vs drop vs both
+
+Table 5 in the paper is the interesting one. The authors turn each action on and off:
+
+| Config | SWE-Bench Verified |
+|---|---|
+| No GC (baseline) | 42.1% |
+| Drop only (evict) | 42.8% (+0.7) |
+| Fold only (summarize in place) | 47.4% (+5.3) |
+| Fold + Drop (Self-GC) | **50.8%** (+8.7) |
+
+Drop alone barely moves the needle. That matches everyone's intuition from ad-hoc context management: outright deletion is dangerous because you keep needing things you thought were dead. Fold is where the value lives — the model retains a lossy but retrievable summary, so if it needs the full file later it can re-read from disk. Drop's job is just to clean up the truly obsolete stuff (retries, failed hypotheses, dead-end tool errors).
+
+## The two mechanisms doing the work
+
+The authors run a probing study on which objects get folded first. The pattern is clean:
+
+**1. Stale observations fold fastest.** File contents get folded within 8 turns of the last time they were referenced. Failed tool errors get folded within 2 turns. Plans and reasoning traces get folded only when a subgoal completes.
+
+**2. The agent uses summaries as an index.** In 73% of cases where the agent later needed a folded object, it first grepped its own summaries via the `search_ledger(query)` tool, found the id, then called `expand(id)` to re-materialize. This is exactly the same pattern as the Duke paper from [Ep.01](/papers/coding-agents-as-long-context-processors): externalize, then re-fetch on demand. Self-GC just does it inside the context rather than on the filesystem.
+
+## Why this connects to Claude Code
+
+Anthropic's Claude Code already does an ad-hoc version of this. Every tool observation is a discrete block; the `/compact` command folds the trajectory; long file reads produce warnings. What's missing is **model-driven** GC — right now compaction is a user-initiated (or heuristic) operation, and the model has no active role.
+
+The Self-GC paper is essentially a research-grade blueprint for what "model-driven /compact" could look like inside a coding agent. Three properties Claude Code could adopt tomorrow, no retraining required:
+
+1. **Typed observation objects.** The transcript already has structure (tool_use, tool_result). Expose stable ids the model can reference.
+2. **Explicit summary field.** After every large observation, prompt the model to emit a one-line summary. Store it separately.
+3. **Fold as a tool.** Add a `fold_observation(id)` tool. Let the model call it whenever it wants. Now compaction is agentic, not scheduled.
+
+You can prototype this with a system prompt plus a wrapper around the tool-use loop — see the reproduction section below.
+
+## The limits (which the paper is honest about)
+
+Three caveats worth flagging:
+
+- **Trained model required for peak numbers.** The +8.7 headline uses an RL-fine-tuned agent. The zero-shot version (prompt-only, no training) shows +3.1 on SWE-Bench — real, but not transformative.
+- **Summary quality dominates.** If summaries are bad, the whole system degrades gracefully to "drop only" behavior. The paper spends four pages on summary-writing prompts (Appendix C) — worth reading in full.
+- **No multi-agent story.** Every experiment is single-agent. It's an open question whether fold/drop across sub-agents (Ep.05 territory) needs different semantics — e.g. should a sub-agent's dropped observations survive its return to the parent?
+
+## Steal-this: a zero-training version you can build tonight
+
+You don't need FAIR-scale RL to get 60% of the benefit. Here's a minimal recipe:
+
+**Step 1.** Wrap your tool loop so every tool observation is stored as a JSON object with `{id, kind, tool, summary, body}`. The summary is generated by asking Claude to emit a one-line description right after the observation.
+
+**Step 2.** Replace the raw transcript in the system-visible context with a **ledger**: just the id, kind, and summary of each object. Keep bodies in a side buffer keyed by id.
+
+**Step 3.** Give Claude two new tools:
+
+```typescript
+// Fold: replace body with summary permanently
+{
+  name: "fold",
+  description: "Fold an object (drop its full body, keep summary). Use for stale observations.",
+  input_schema: { type: "object", properties: { id: { type: "string" } }, required: ["id"] }
+}
+
+// Expand: re-materialize a folded object from side buffer (only works if not yet folded)
+{
+  name: "expand",
+  description: "Materialize the full body of an object into your context",
+  input_schema: { type: "object", properties: { id: { type: "string" } }, required: ["id"] }
+}
+```
+
+**Step 4.** In your system prompt, tell the agent: *"You have a token budget. Fold objects whose summaries are enough. Expand only when you need the full content. Failed tool errors should be folded immediately after you understand them."*
+
+**Step 5.** Track a `budget_used_pct` in every turn's system message. The paper shows the budget signal is what makes the model actually start folding — without it the agent hoards.
+
+Prompt-only implementations in the paper hit +3.1 on SWE-Bench. That's a bigger jump than most "prompt engineering" tricks buy you, for ~200 lines of code.
+
+## Reproduction notes
+
+The authors release code at `github.com/facebookresearch/self-gc` (link resolves from arXiv). Two gotchas:
+
+1. **Their tokenizer accounting is Claude-3.7-specific.** If you swap in Gemini or GPT, redo the budget-penalty coefficient. Table 8 in the appendix has the ablation.
+2. **Ledger view is `role: user` messages.** They inject the ledger as a synthetic user message before each turn. Don't try to smuggle it into a system prompt — Claude treats system content differently and the fold/drop calls get less reliable.
+
+## Where this fits in the series
+
+- [Ep.01 · Coding Agents Beat Long Context](/papers/coding-agents-as-long-context-processors) argued: externalize context to the filesystem, walk it with tools. Self-GC is the intra-context version of the same trick.
+- [Context Engineering for Coding Agents](/blog/context-engineering-for-coding-agents) laid out the design space; Self-GC gives it a concrete algorithm.
+- [Mini Claude Code Ep.04](/lab/mini-claude-code-04-context-management) walks through a hand-rolled context compactor. Self-GC is what happens when you let the model do that job.
+
+Next week's pick: either the FastContext repo-exploration sub-agent paper (arxiv:2606.14066) or Git Context Controller (arxiv:2508.00031). Vote via the mailing list once we launch it.
+
+## BibTeX
+
+```bibtex
+@article{sun2026selfgc,
+  title  = {Self-GC: Learning to Garbage Collect Agent Context via Object-Level Fold Actions},
+  author = {Sun, Rui and Ortega, Pedro A. and Watanabe, Hiroki and Chen, Yuxin},
+  journal= {arXiv preprint arXiv:2607.00692},
+  year   = {2026}
+}
+```

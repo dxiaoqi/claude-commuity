@@ -1,0 +1,89 @@
+---
+title: "When Distilled Models Lie: The Rationale Faithfulness Problem"
+description: "Student models often produce rationales that sound right but don't reflect their real computation. Here's what faithfulness means, how it fails, and how to ship anyway."
+date: "2026-07-02"
+tags: ["research", "distillation", "evaluation", "claude"]
+readTime: "10 min"
+---
+
+You fine-tune a small model on Claude's step-by-step explanations. The rationales it produces on your eval set look great—coherent, well-structured, sometimes indistinguishable from the teacher. You ship it. Six weeks later, someone runs a perturbation study and discovers that the rationale text and the final answer are effectively uncorrelated. The model is talking. It just isn't thinking out loud.
+
+This is the rationale faithfulness problem, and it's one of the more uncomfortable findings in recent interpretability research. If you're distilling from a Claude workflow—especially one where the teacher's chain-of-thought is part of the training signal—you need a working mental model for it. Otherwise you'll optimize the wrong thing and be surprised by silent failures downstream.
+
+## What faithfulness actually means
+
+"Faithfulness" is one of those words that sounds intuitive until you try to define it precisely. In the explanation-quality literature, it means something specific: an explanation is faithful when it accurately reflects the reasoning process the model actually used to produce its output. It is not the same as being plausible, correct, or helpful to a human reader.
+
+Wiegreffe and Marasovic's survey of explanation evaluation in NLP made this distinction sharp. They separated **plausibility** (does this explanation look convincing to a human?) from **faithfulness** (does this explanation describe the model's real computation?). Plausibility is a property of the reader. Faithfulness is a property of the model. A rationale can be highly plausible and completely unfaithful, and the two failure modes are hard to tell apart without deliberate testing.
+
+For distilled models, this split is especially painful. Your training loss rewards plausible-looking outputs because that's what the teacher produced. Nothing in the standard supervised objective forces the student's stated reasoning to correspond to whatever internal features it's actually using. You end up with a system optimized to write believable explanations, not necessarily to explain itself.
+
+Lanham et al. at Anthropic explored this directly for chain-of-thought reasoning. Their work on measuring faithfulness of CoT showed that in some settings, models can arrive at the same answer whether their CoT is truncated, paraphrased, or actively corrupted. That's a strong signal that the words in the rationale weren't load-bearing for the final answer. In other settings, the CoT does matter—the answer changes when you change the reasoning trace. The frustrating part is that you can't tell which regime you're in from the rationale text alone.
+
+Turpin et al. pushed on this from another angle. They showed that biasing features—things like the position of a correct answer in multiple choice, or subtle contextual cues—can shift the model's final prediction without ever being mentioned in the rationale. The model produces an argument that sounds like it's about the content of the question. The actual driver of the answer is a feature the rationale never acknowledges. This is unfaithfulness in its most consequential form: the explanation isn't just incomplete, it's actively misleading about the causal structure.
+
+## How the failures get detected
+
+There's no test for faithfulness that gives you a clean pass/fail. What you have instead is a family of perturbation-based probes, each of which detects a different failure mode. If you're serious about shipping a distilled model, you should run at least a couple of these.
+
+**Perturbation of the rationale.** Change the rationale after it's generated but before the model produces its final answer. If the answer doesn't change, the rationale wasn't doing meaningful work. Common variants: truncate the CoT partway through, paraphrase it, insert a mistake, or replace it with a rationale from a different question. Compare answer distributions before and after. Large agreement means the model is treating the rationale as decoration.
+
+**Counterfactual inputs.** Change something about the input that should—if the stated reasoning is faithful—change the answer. If the model's rationale says "I chose option B because it mentions X," edit the input so X is now in option A. A faithful reasoner should now prefer A. An unfaithful one keeps saying "because X" while still picking B. This is closer to what Turpin's work exploits: construct inputs where the stated reason and the true driver come apart.
+
+**Bias probes.** Introduce a spurious feature the model shouldn't rely on—position, formatting, a name, a distractor sentence. Measure how much the final answer shifts. Then check whether the rationale ever mentions the spurious feature. Silent shifts are the tell.
+
+**Consistency across paraphrases.** Ask the same question multiple ways and inspect whether the rationales are consistent with each other and with the answers. Distilled models are often surprisingly brittle here: identical semantic content, wildly different rationales, sometimes different answers.
+
+None of these are perfect. Perturbation can push the model off-distribution in ways that confound the signal. Counterfactuals are expensive to build. Bias probes require a hypothesis about which spurious features matter. But together they give you a much better picture than reading a handful of rationales and calling them good.
+
+## Why focused distillation from explanations amplifies the risk
+
+Focused distillation from explanations—FDE, if you're following the shorthand that's been going around—is a training recipe where the student learns from a curated set of teacher outputs that pair answers with reasoning traces. It's a natural fit for Claude workflows: you generate high-quality reasoning from a strong teacher, filter for the examples where the reasoning is coherent, and train a smaller model to reproduce both the answer and the trace.
+
+This works. Students trained this way generally do better on downstream tasks than students trained on answers alone. The reasoning traces provide dense supervision, and the curated set filters out noise. So far so good.
+
+The problem is that the training objective doesn't distinguish "the student is learning to reason like the teacher" from "the student is learning to *sound like* the teacher's reasoning while doing something else." Both objectives produce low loss on rationales that read well. Only one produces a student whose rationales are load-bearing.
+
+Several things about FDE make this specifically bad:
+
+1. **Filtering by rationale quality selects for plausibility.** When you curate the training set by reading rationales or scoring them with an LLM judge, you are directly optimizing for plausible-sounding traces. That's the exact axis on which plausibility and faithfulness diverge. You're pushing the student toward the failure mode.
+
+2. **The student has less capacity than the teacher.** Distillation compresses. Some of what the teacher was doing internally cannot be represented compactly in the student. The student has to compromise somewhere. Reasoning traces are one of the easier things to sacrifice, because the training signal doesn't penalize a plausible-but-decoupled trace.
+
+3. **Evaluation typically stops at answer accuracy.** Most FDE pipelines evaluate the student on task metrics. If the answer distribution matches the teacher's on the eval set, the recipe is declared a success. You never look at whether the rationales are doing work, because nothing in the pipeline asks.
+
+The result is a class of distilled models that perform well on benchmarks, produce fluent explanations, and quietly rely on features their rationales never mention. That's fine for many applications. It's a serious problem for any application where the rationale is user-facing, auditable, or used downstream as input to another system.
+
+## Three mitigations for teams shipping distilled models with a Claude workflow
+
+You cannot fully solve rationale faithfulness with current techniques. You can absolutely reduce your exposure to it. Three things that are worth the engineering time:
+
+### 1. Add a faithfulness eval to your distillation pipeline
+
+Whatever you're using to evaluate the student's task performance, add at least one perturbation-based faithfulness probe next to it. The simplest version: for a random subset of eval examples, generate the student's rationale, then generate a second answer with the rationale truncated to 50% of its length. Measure the agreement rate. If the student agrees with itself over 90% of the time even with half the rationale missing, the rationale isn't doing meaningful work on that slice.
+
+This is a coarse signal, but it's cheap and it will catch the worst regressions. Track it over time. If you retrain the student and the faithfulness number drops even though task accuracy stays flat, you have a warning that the new checkpoint is trading reasoning for surface form.
+
+If you have more budget, run counterfactual probes on a hand-crafted set of examples where you know which features should drive the answer. Compare the student's answer shifts to the teacher's. Divergence is diagnostic.
+
+### 2. Use Claude as an audit layer, not just a training teacher
+
+Most FDE pipelines use Claude in one role: generating training data. There's a second role that's just as valuable: auditing student rationales at eval time or in production.
+
+Concretely, run a subset of student outputs back through Claude with a prompt that asks it to compare the student's rationale to the student's answer and flag inconsistencies. Claude is good at this kind of structured critique, especially when you give it the input, the stated rationale, and the final answer as separate fields. It won't catch every unfaithful trace, but it will catch the obvious ones—rationales that contradict the answer, rationales that appeal to information not in the input, rationales that skip the actual decision point.
+
+Wire this into your CI or into a sampled production shadow eval. A ClaudeMd-style spec for the audit prompt makes it reproducible and versionable. You get an ongoing measurement of rationale quality that isn't just "does it sound good."
+
+### 3. Design your product surface so the rationale is optional or verifiable
+
+The most robust mitigation is architectural: don't put unverified student rationales in front of users or downstream systems as if they were reliable explanations. If the rationale is user-facing, mark it as "the model's stated reasoning" rather than "the reason for the answer." If it's an input to another automated step, add a verification pass that checks whether the rationale is consistent with the answer before acting on it.
+
+For high-stakes cases, consider running the final answer through a separate reasoning check—either a Claude call or a smaller verifier model trained specifically to catch unfaithful traces. This adds latency and cost. It also converts a silent failure mode into a loud one, which is almost always the right trade for anything that matters.
+
+## Closing
+
+The uncomfortable truth is that current distillation recipes are optimized for producing rationales that look right, not rationales that are right about the model's own computation. This isn't a bug in any particular training run. It's a consequence of what the loss function rewards and what human curation selects for. Wiegreffe and Marasovic's framing, Lanham et al.'s CoT experiments, and Turpin et al.'s bias work each show the same shape of failure from a different angle: plausibility is easy, faithfulness is hard, and the gap between them is exactly where things go wrong.
+
+If you're building on top of a Claude workflow—generating training data, distilling into a smaller model, shipping it into a product—assume the student's rationales are unfaithful by default, and design your evaluation and product surface to make that assumption safe. That's a much better posture than trusting the rationale text and getting surprised later.
+
+For more on the training-time side of this, see [Focused Distillation from Explanations for Builders](/blog/focused-distillation-from-explanations-for-builders). For structuring your Claude workflow around specs and audits that make faithfulness checks reproducible, see the [Claude Code CLAUDE.md Complete Guide](/blog/claude-code-claude-md-complete-guide).
