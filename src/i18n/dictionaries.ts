@@ -80,6 +80,79 @@ export interface Dictionary {
     footerNextHeading: string;
     footerNextSub: string;
   };
+  claudeCodeHub: {
+    metaTitle: string;
+    metaDescription: string;
+    kicker: string;
+    heroLine1: string;
+    heroLine2: string;
+    shortAnswer: string;
+    hubSectionTitle: string;
+    tagGuide: string;
+    tagComparison: string;
+    tagLab: string;
+    tagDeepDive: string;
+    tagResearch: string;
+    claudeMdTitle: string;
+    claudeMdDesc: string;
+    hooksTitle: string;
+    hooksDesc: string;
+    cursorCompareTitle: string;
+    cursorCompareDesc: string;
+    miniClaudeCodeTitle: string;
+    miniClaudeCodeDesc: string;
+    contextEngTitle: string;
+    contextEngDesc: string;
+    longContextTitle: string;
+    longContextDesc: string;
+    tocLabel: string;
+    tocContext: string;
+    tocLoop: string;
+    tocHandoff: string;
+    section1Title: string;
+    section1Text: string;
+    section2Title: string;
+    section2Text: string;
+    section3Title: string;
+    section3Text: string;
+    ctaTitle: string;
+    ctaText: string;
+    backLink: string;
+  };
+  claudeHub: {
+    metaTitle: string;
+    metaDescription: string;
+    kicker: string;
+    heroLine1: string;
+    heroLine2: string;
+    shortAnswer: string;
+    hubSectionTitle: string;
+    tagGuide: string;
+    tagLab: string;
+    tagDeepDive: string;
+    tagResearch: string;
+    contextEngTitle: string;
+    contextEngDesc: string;
+    longContextTitle: string;
+    longContextDesc: string;
+    claudeCodeTitle: string;
+    claudeCodeDesc: string;
+    miniClaudeCodeTitle: string;
+    miniClaudeCodeDesc: string;
+    tocLabel: string;
+    tocPrompt: string;
+    tocContext: string;
+    tocVerification: string;
+    codeLabel: string;
+    section1Title: string;
+    section1Text: string;
+    section2Title: string;
+    section2Text: string;
+    section3Title: string;
+    section3Text: string;
+    ctaTitle: string;
+    backLink: string;
+  };
   common: {
     skipToContent: string;
     languageLabel: string;
@@ -197,6 +270,79 @@ const en: Dictionary = {
     footerNextSub:
       "The eval harness ships with three seed tasks. The plan is to grow it toward a 15-task SWE-lite subset and pin a baseline you can regress against. If you want to add tasks, open a PR.",
   },
+  claudeCodeHub: {
+    metaTitle: "Claude Code — Anthropic's AI coding agent for the terminal",
+    metaDescription: "Claude Code is a terminal-based AI coding agent that reads, writes, and runs code in your repository. Learn what it is, who it's for, and how to get started with guides, comparisons, and tutorials.",
+    kicker: "// CLAUDE CODE",
+    heroLine1: "Claude Code is a",
+    heroLine2: "context machine.",
+    shortAnswer: "Claude Code is Anthropic's agentic coding tool. It runs in your terminal, reads and writes files, executes shell commands, and iterates on code autonomously. It's built for engineers who want an AI that works inside their existing workflow—not a new IDE. Use it when you need multi-file refactors, automated testing loops, or codebase-wide changes that require real tool access.",
+    hubSectionTitle: "Guides & Resources",
+    tagGuide: "Guide",
+    tagComparison: "Comparison",
+    tagLab: "Lab",
+    tagDeepDive: "Deep Dive",
+    tagResearch: "Research",
+    claudeMdTitle: "The Complete CLAUDE.md Guide",
+    claudeMdDesc: "How to write context files that survive real projects. Structure, content, and iteration patterns.",
+    hooksTitle: "Claude Code Hooks",
+    hooksDesc: "Automate quality checks, trigger tests, and extend Claude Code with shell scripts.",
+    cursorCompareTitle: "Claude Code vs Cursor",
+    cursorCompareDesc: "An honest comparison: different philosophies, different strengths. How to choose.",
+    miniClaudeCodeTitle: "Build Your Own Agent",
+    miniClaudeCodeDesc: "Mini Claude Code: a working coding agent in ~500 lines. Six episodes, full source.",
+    contextEngTitle: "Context Engineering",
+    contextEngDesc: "A practitioner's synthesis of frontier research on context management for coding agents.",
+    longContextTitle: "Coding Agents vs Long Context",
+    longContextDesc: "Why agents outperform long-context systems: the Duke paper breakdown.",
+    tocLabel: "IN THIS MANUAL",
+    tocContext: "CLAUDE.md",
+    tocLoop: "Plan → build → verify",
+    tocHandoff: "Clean handoffs",
+    section1Title: "Context is the product",
+    section1Text: "Your CLAUDE.md should describe the commands, architecture, boundaries, and proof required to finish work. Keep it short enough to stay true.",
+    section2Title: "The plan → build → verify loop",
+    section2Text: "Start by mapping what exists. Make the smallest coherent plan. Build within explicit boundaries. Then verify the behavior, not merely the diff.",
+    section3Title: "Leave a clean handoff",
+    section3Text: "A useful completion note says what changed, what was verified, and what remains uncertain. It should help the next person move without replaying the entire session.",
+    ctaTitle: "Stay close to the tool.",
+    ctaText: "Join the first readers of the Claude Code field manual.",
+    backLink: "← Back to the workbench",
+  },
+  claudeHub: {
+    metaTitle: "Claude — AI assistant for research, writing, and analysis",
+    metaDescription: "Claude is Anthropic's AI assistant built for thoughtful, reliable work. Learn practical patterns for research, writing, analysis, and coding with guides, deep dives, and real examples.",
+    kicker: "// FIELD GUIDE",
+    heroLine1: "Claude, without",
+    heroLine2: "the magic tricks.",
+    shortAnswer: "Claude is Anthropic's AI assistant. It excels at research synthesis, long-form writing, code explanation, and tasks requiring careful reasoning. It's for anyone who needs a thoughtful collaborator—not a chatbot that guesses. Use it when you want reliable outputs you can actually verify, not confident-sounding answers.",
+    hubSectionTitle: "Guides & Resources",
+    tagGuide: "Guide",
+    tagLab: "Lab",
+    tagDeepDive: "Deep Dive",
+    tagResearch: "Research",
+    contextEngTitle: "Context Engineering",
+    contextEngDesc: "A practitioner's synthesis of frontier research on context management for AI systems.",
+    longContextTitle: "Coding Agents vs Long Context",
+    longContextDesc: "Why agents outperform long-context systems: the Duke paper breakdown.",
+    claudeCodeTitle: "Claude Code Field Manual",
+    claudeCodeDesc: "The agentic coding tool from Anthropic. Terminal-first, tool-using, autonomous.",
+    miniClaudeCodeTitle: "Build Your Own Agent",
+    miniClaudeCodeDesc: "Mini Claude Code: a working coding agent in ~500 lines. Six episodes, full source.",
+    tocLabel: "IN THIS GUIDE",
+    tocPrompt: "Prompt as interface",
+    tocContext: "Context engineering",
+    tocVerification: "Verification loops",
+    codeLabel: "A durable prompt shape",
+    section1Title: "Prompt as interface",
+    section1Text: "A good prompt is not an incantation. It is an interface between your intent and a model: the job, the available context, the constraints, and the shape of a useful result.",
+    section2Title: "Context is a design decision",
+    section2Text: "More context is not automatically better. Give Claude the smallest complete world it needs: source material, audience, examples, and the decisions already made.",
+    section3Title: "Ask for evidence, not confidence",
+    section3Text: "Separate creation from checking. Have Claude identify assumptions, cite the supplied material, and describe what it could not verify.",
+    ctaTitle: "One sharp workflow per issue.",
+    backLink: "← Back to the workbench",
+  },
   common: { skipToContent: "Skip to content", languageLabel: "Language" },
 };
 
@@ -310,6 +456,79 @@ const zhCN: Dictionary = {
     footerNextHeading: "接下来",
     footerNextSub:
       "评测集首发 3 题，后续会推进到 SWE-lite 15 题 + 固定基线，方便你回归。有想加的任务欢迎发 PR。",
+  },
+  claudeCodeHub: {
+    metaTitle: "Claude Code — Anthropic 的终端 AI 编程代理",
+    metaDescription: "Claude Code 是运行在终端的 AI 编程代理，能够在你的仓库中读写文件、执行命令。了解它是什么、适合谁、如何开始，以及相关指南、对比和教程。",
+    kicker: "// CLAUDE CODE",
+    heroLine1: "Claude Code 是一台",
+    heroLine2: "上下文机器。",
+    shortAnswer: "Claude Code 是 Anthropic 出品的自主编程工具。它在终端运行，读写文件、执行 shell 命令，自主迭代代码。它专为想在现有工作流中使用 AI 的工程师设计——不是新 IDE。当你需要跨文件重构、自动化测试循环或需要真实工具访问的全仓库级改动时使用它。",
+    hubSectionTitle: "指南与资源",
+    tagGuide: "指南",
+    tagComparison: "对比",
+    tagLab: "实战",
+    tagDeepDive: "深度解读",
+    tagResearch: "研究",
+    claudeMdTitle: "CLAUDE.md 完全指南",
+    claudeMdDesc: "如何编写能在真实项目中存活的上下文文件。结构、内容与迭代模式。",
+    hooksTitle: "Claude Code Hooks",
+    hooksDesc: "用 shell 脚本自动化质量检查、触发测试、扩展 Claude Code。",
+    cursorCompareTitle: "Claude Code vs Cursor",
+    cursorCompareDesc: "一篇诚实的对比：不同的理念，不同的优势。如何选择。",
+    miniClaudeCodeTitle: "自己造一个 Agent",
+    miniClaudeCodeDesc: "Mini Claude Code：约 500 行的可运行编程代理。六集，完整源码。",
+    contextEngTitle: "上下文工程",
+    contextEngDesc: "编程代理上下文管理前沿研究的实践者综述。",
+    longContextTitle: "Coding Agent 对阵长上下文",
+    longContextDesc: "为什么代理胜过长上下文系统：Duke 论文解读。",
+    tocLabel: "本手册内容",
+    tocContext: "CLAUDE.md",
+    tocLoop: "计划 → 构建 → 验证",
+    tocHandoff: "干净的交接",
+    section1Title: "上下文即产品",
+    section1Text: "你的 CLAUDE.md 应该描述完成工作所需的命令、架构、边界和验证方式。保持简短，才能保持真实。",
+    section2Title: "计划 → 构建 → 验证循环",
+    section2Text: "先梳理现有内容。制定最小可行计划。在明确边界内构建。然后验证行为，而不仅仅是 diff。",
+    section3Title: "留下干净的交接",
+    section3Text: "一份有用的完成说明应该说明改了什么、验证了什么、还有什么不确定。它应该帮助下一个人继续推进，而无需重放整个会话。",
+    ctaTitle: "紧跟工具的发展。",
+    ctaText: "加入 Claude Code 实战手册的第一批读者。",
+    backLink: "← 返回工作台",
+  },
+  claudeHub: {
+    metaTitle: "Claude — 用于研究、写作和分析的 AI 助手",
+    metaDescription: "Claude 是 Anthropic 打造的 AI 助手，专为可靠、深思熟虑的工作设计。学习研究、写作、分析和编程的实用模式，包括指南、深度解读和真实案例。",
+    kicker: "// 实用指南",
+    heroLine1: "Claude，",
+    heroLine2: "没有魔法。",
+    shortAnswer: "Claude 是 Anthropic 的 AI 助手。它擅长研究综合、长文写作、代码解释以及需要仔细推理的任务。它适合任何需要深思熟虑的协作者——而非只会猜测的聊天机器人。当你想要可验证的可靠输出，而非听起来自信的答案时，使用它。",
+    hubSectionTitle: "指南与资源",
+    tagGuide: "指南",
+    tagLab: "实战",
+    tagDeepDive: "深度解读",
+    tagResearch: "研究",
+    contextEngTitle: "上下文工程",
+    contextEngDesc: "AI 系统上下文管理前沿研究的实践者综述。",
+    longContextTitle: "Coding Agent 对阵长上下文",
+    longContextDesc: "为什么代理胜过长上下文系统：Duke 论文解读。",
+    claudeCodeTitle: "Claude Code 实战手册",
+    claudeCodeDesc: "Anthropic 出品的自主编程工具。终端优先，使用工具，自主运行。",
+    miniClaudeCodeTitle: "自己造一个 Agent",
+    miniClaudeCodeDesc: "Mini Claude Code：约 500 行的可运行编程代理。六集，完整源码。",
+    tocLabel: "本指南内容",
+    tocPrompt: "提示词即接口",
+    tocContext: "上下文工程",
+    tocVerification: "验证循环",
+    codeLabel: "一个持久的提示词结构",
+    section1Title: "提示词即接口",
+    section1Text: "好的提示词不是咒语。它是你的意图与模型之间的接口：任务、可用上下文、约束条件，以及有用结果的形状。",
+    section2Title: "上下文是设计决策",
+    section2Text: "更多上下文不一定更好。给 Claude 它需要的最小完整世界：原材料、受众、示例，以及已做出的决定。",
+    section3Title: "要证据，不要自信",
+    section3Text: "把创作和检查分开。让 Claude 识别假设、引用提供的材料、描述它无法验证的内容。",
+    ctaTitle: "每个问题，一个精准的工作流。",
+    backLink: "← 返回工作台",
   },
   common: { skipToContent: "跳到正文", languageLabel: "语言" },
 };
@@ -425,6 +644,79 @@ const zhTW: Dictionary = {
     footerNextSub:
       "評測集首發 3 題，後續會推進到 SWE-lite 15 題 + 固定 baseline，方便你回歸。想加任務歡迎發 PR。",
   },
+  claudeCodeHub: {
+    metaTitle: "Claude Code — Anthropic 的終端 AI 程式碼代理",
+    metaDescription: "Claude Code 是執行在終端的 AI 程式碼代理，能在你的儲存庫中讀寫檔案、執行指令。了解它是什麼、適合誰、如何開始，以及相關指南、比較和教學。",
+    kicker: "// CLAUDE CODE",
+    heroLine1: "Claude Code 是一台",
+    heroLine2: "上下文機器。",
+    shortAnswer: "Claude Code 是 Anthropic 出品的自主程式碼工具。它在終端執行，讀寫檔案、執行 shell 指令，自主迭代程式碼。它專為想在現有工作流程中使用 AI 的工程師設計——不是新的 IDE。當你需要跨檔案重構、自動化測試迴圈或需要真實工具存取的全儲存庫級變更時使用它。",
+    hubSectionTitle: "指南與資源",
+    tagGuide: "指南",
+    tagComparison: "比較",
+    tagLab: "實戰",
+    tagDeepDive: "深度解讀",
+    tagResearch: "研究",
+    claudeMdTitle: "CLAUDE.md 完全指南",
+    claudeMdDesc: "如何撰寫能在真實專案中存活的上下文檔案。結構、內容與迭代模式。",
+    hooksTitle: "Claude Code Hooks",
+    hooksDesc: "用 shell 腳本自動化品質檢查、觸發測試、擴展 Claude Code。",
+    cursorCompareTitle: "Claude Code vs Cursor",
+    cursorCompareDesc: "一篇誠實的比較：不同的理念，不同的優勢。如何選擇。",
+    miniClaudeCodeTitle: "自己造一個 Agent",
+    miniClaudeCodeDesc: "Mini Claude Code：約 500 行的可執行程式碼代理。六集，完整原始碼。",
+    contextEngTitle: "上下文工程",
+    contextEngDesc: "程式碼代理上下文管理前沿研究的實踐者綜述。",
+    longContextTitle: "Coding Agent 對陣長上下文",
+    longContextDesc: "為什麼代理勝過長上下文系統：Duke 論文解讀。",
+    tocLabel: "本手冊內容",
+    tocContext: "CLAUDE.md",
+    tocLoop: "計畫 → 建構 → 驗證",
+    tocHandoff: "乾淨的交接",
+    section1Title: "上下文即產品",
+    section1Text: "你的 CLAUDE.md 應該描述完成工作所需的指令、架構、邊界和驗證方式。保持簡短，才能保持真實。",
+    section2Title: "計畫 → 建構 → 驗證迴圈",
+    section2Text: "先梳理現有內容。制定最小可行計畫。在明確邊界內建構。然後驗證行為，而不僅僅是 diff。",
+    section3Title: "留下乾淨的交接",
+    section3Text: "一份有用的完成說明應該說明改了什麼、驗證了什麼、還有什麼不確定。它應該幫助下一個人繼續推進，而無需重播整個會話。",
+    ctaTitle: "緊跟工具的發展。",
+    ctaText: "加入 Claude Code 實戰手冊的第一批讀者。",
+    backLink: "← 返回工作檯",
+  },
+  claudeHub: {
+    metaTitle: "Claude — 用於研究、寫作和分析的 AI 助手",
+    metaDescription: "Claude 是 Anthropic 打造的 AI 助手，專為可靠、深思熟慮的工作設計。學習研究、寫作、分析和程式碼的實用模式，包括指南、深度解讀和真實案例。",
+    kicker: "// 實用指南",
+    heroLine1: "Claude，",
+    heroLine2: "沒有魔法。",
+    shortAnswer: "Claude 是 Anthropic 的 AI 助手。它擅長研究綜合、長文寫作、程式碼解釋以及需要仔細推理的任務。它適合任何需要深思熟慮的協作者——而非只會猜測的聊天機器人。當你想要可驗證的可靠輸出，而非聽起來自信的答案時，使用它。",
+    hubSectionTitle: "指南與資源",
+    tagGuide: "指南",
+    tagLab: "實戰",
+    tagDeepDive: "深度解讀",
+    tagResearch: "研究",
+    contextEngTitle: "上下文工程",
+    contextEngDesc: "AI 系統上下文管理前沿研究的實踐者綜述。",
+    longContextTitle: "Coding Agent 對陣長上下文",
+    longContextDesc: "為什麼代理勝過長上下文系統：Duke 論文解讀。",
+    claudeCodeTitle: "Claude Code 實戰手冊",
+    claudeCodeDesc: "Anthropic 出品的自主程式碼工具。終端優先，使用工具，自主執行。",
+    miniClaudeCodeTitle: "自己造一個 Agent",
+    miniClaudeCodeDesc: "Mini Claude Code：約 500 行的可執行程式碼代理。六集，完整原始碼。",
+    tocLabel: "本指南內容",
+    tocPrompt: "提示詞即介面",
+    tocContext: "上下文工程",
+    tocVerification: "驗證迴圈",
+    codeLabel: "一個持久的提示詞結構",
+    section1Title: "提示詞即介面",
+    section1Text: "好的提示詞不是咒語。它是你的意圖與模型之間的介面：任務、可用上下文、約束條件，以及有用結果的形狀。",
+    section2Title: "上下文是設計決策",
+    section2Text: "更多上下文不一定更好。給 Claude 它需要的最小完整世界：原材料、受眾、範例，以及已做出的決定。",
+    section3Title: "要證據，不要自信",
+    section3Text: "把創作和檢查分開。讓 Claude 識別假設、引用提供的材料、描述它無法驗證的內容。",
+    ctaTitle: "每個問題，一個精準的工作流程。",
+    backLink: "← 返回工作檯",
+  },
   common: { skipToContent: "跳至內容", languageLabel: "語言" },
 };
 
@@ -538,6 +830,79 @@ const ja: Dictionary = {
     footerNextHeading: "次にやること",
     footerNextSub:
       "評価集は 3 題からスタート。SWE-lite サブセット 15 題 + 固定ベースラインへ育てていく予定。タスク追加は PR 歓迎。",
+  },
+  claudeCodeHub: {
+    metaTitle: "Claude Code — Anthropic のターミナル AI コーディングエージェント",
+    metaDescription: "Claude Code はターミナルで動作する AI コーディングエージェントで、リポジトリ内のファイルを読み書きし、コマンドを実行します。これは何か、誰向けか、始め方、ガイド、比較、チュートリアルを学べます。",
+    kicker: "// CLAUDE CODE",
+    heroLine1: "Claude Code は",
+    heroLine2: "コンテキストマシン。",
+    shortAnswer: "Claude Code は Anthropic のエージェント型コーディングツールです。ターミナルで動作し、ファイルの読み書き、shell コマンドの実行、コードの自律的な反復を行います。既存のワークフローで AI を使いたいエンジニア向けに設計されています——新しい IDE ではありません。複数ファイルのリファクタ、自動テストループ、実際のツールアクセスが必要なリポジトリ全体の変更が必要な場合に使用します。",
+    hubSectionTitle: "ガイド＆リソース",
+    tagGuide: "ガイド",
+    tagComparison: "比較",
+    tagLab: "実戦",
+    tagDeepDive: "深掘り",
+    tagResearch: "研究",
+    claudeMdTitle: "完全 CLAUDE.md ガイド",
+    claudeMdDesc: "実プロジェクトで生き残るコンテキストファイルの書き方。構造、内容、反復パターン。",
+    hooksTitle: "Claude Code Hooks",
+    hooksDesc: "shell スクリプトで品質チェックを自動化し、テストをトリガーし、Claude Code を拡張。",
+    cursorCompareTitle: "Claude Code vs Cursor",
+    cursorCompareDesc: "正直な比較：異なる哲学、異なる強み。選び方。",
+    miniClaudeCodeTitle: "自分でエージェントを作る",
+    miniClaudeCodeDesc: "Mini Claude Code：約 500 行の動くコーディングエージェント。全 6 話、フルソース。",
+    contextEngTitle: "コンテキストエンジニアリング",
+    contextEngDesc: "コーディングエージェントのコンテキスト管理に関する最先端研究の実践者による統合。",
+    longContextTitle: "コーディングエージェント vs 長文脈",
+    longContextDesc: "なぜエージェントが長文脈システムを上回るのか：Duke 論文の解説。",
+    tocLabel: "このマニュアルの内容",
+    tocContext: "CLAUDE.md",
+    tocLoop: "計画 → 構築 → 検証",
+    tocHandoff: "クリーンな引き継ぎ",
+    section1Title: "コンテキストこそ製品",
+    section1Text: "CLAUDE.md には、作業を完了するために必要なコマンド、アーキテクチャ、境界、検証方法を記述します。真実を維持するために、短く保ちましょう。",
+    section2Title: "計画 → 構築 → 検証ループ",
+    section2Text: "まず既存のものをマッピング。最小限の一貫した計画を立てる。明示的な境界内で構築。そして diff ではなく振る舞いを検証する。",
+    section3Title: "クリーンな引き継ぎを残す",
+    section3Text: "有用な完了メモには、何が変わったか、何を検証したか、何が不確実かを記載します。次の人がセッション全体を再生せずに進められるようにすべきです。",
+    ctaTitle: "ツールに近づき続けよう。",
+    ctaText: "Claude Code フィールドマニュアルの最初の読者に加わりましょう。",
+    backLink: "← ワークベンチに戻る",
+  },
+  claudeHub: {
+    metaTitle: "Claude — 研究、執筆、分析のための AI アシスタント",
+    metaDescription: "Claude は Anthropic が構築した AI アシスタントで、思慮深く信頼性の高い作業のために設計されています。ガイド、深掘り、実例を通じて、研究、執筆、分析、コーディングの実践的なパターンを学べます。",
+    kicker: "// フィールドガイド",
+    heroLine1: "Claude、",
+    heroLine2: "魔法なしで。",
+    shortAnswer: "Claude は Anthropic の AI アシスタントです。研究の統合、長文の執筆、コードの説明、慎重な推論が必要なタスクに優れています。推測するチャットボットではなく、思慮深い協力者が必要な人向けです。自信ありげに聞こえる答えではなく、実際に検証できる信頼性の高い出力が欲しい場合に使用します。",
+    hubSectionTitle: "ガイド＆リソース",
+    tagGuide: "ガイド",
+    tagLab: "実戦",
+    tagDeepDive: "深掘り",
+    tagResearch: "研究",
+    contextEngTitle: "コンテキストエンジニアリング",
+    contextEngDesc: "AI システムのコンテキスト管理に関する最先端研究の実践者による統合。",
+    longContextTitle: "コーディングエージェント vs 長文脈",
+    longContextDesc: "なぜエージェントが長文脈システムを上回るのか：Duke 論文の解説。",
+    claudeCodeTitle: "Claude Code フィールドマニュアル",
+    claudeCodeDesc: "Anthropic のエージェント型コーディングツール。ターミナルファースト、ツール使用、自律実行。",
+    miniClaudeCodeTitle: "自分でエージェントを作る",
+    miniClaudeCodeDesc: "Mini Claude Code：約 500 行の動くコーディングエージェント。全 6 話、フルソース。",
+    tocLabel: "このガイドの内容",
+    tocPrompt: "プロンプトはインターフェース",
+    tocContext: "コンテキストエンジニアリング",
+    tocVerification: "検証ループ",
+    codeLabel: "持続可能なプロンプトの形",
+    section1Title: "プロンプトはインターフェース",
+    section1Text: "良いプロンプトは呪文ではありません。それはあなたの意図とモデルの間のインターフェースです：仕事、利用可能なコンテキスト、制約、そして有用な結果の形。",
+    section2Title: "コンテキストは設計上の決定",
+    section2Text: "コンテキストが多いほど良いとは限りません。Claude に必要な最小限の完全な世界を与えましょう：ソース資料、対象者、例、そしてすでに行われた決定。",
+    section3Title: "自信ではなく証拠を求める",
+    section3Text: "作成と確認を分離します。Claude に仮定を特定させ、提供された資料を引用させ、検証できなかったことを説明させます。",
+    ctaTitle: "問題ごとに 1 つのシャープなワークフロー。",
+    backLink: "← ワークベンチに戻る",
   },
   common: { skipToContent: "本文へスキップ", languageLabel: "言語" },
 };
