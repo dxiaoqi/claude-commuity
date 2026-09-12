@@ -75,6 +75,16 @@ export default async function ClaudeCodePage({ params }: Props) {
             <h3>{h.longContextTitle}</h3>
             <p>{h.longContextDesc}</p>
           </Link>
+          <Link href={`${base}/blog/claude-code-plan-mode`} className="hub-card">
+            <span className="hub-card-tag">{h.tagGuide}</span>
+            <h3>{h.planModeTitle}</h3>
+            <p>{h.planModeDesc}</p>
+          </Link>
+          <Link href={`${base}/blog/claude-code-first-week`} className="hub-card">
+            <span className="hub-card-tag">{h.tagGuide}</span>
+            <h3>{h.firstWeekTitle}</h3>
+            <p>{h.firstWeekDesc}</p>
+          </Link>
         </div>
       </section>
 

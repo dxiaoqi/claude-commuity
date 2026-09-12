@@ -1,0 +1,115 @@
+---
+title: "Claude Code Plan Mode: Research First, Edit After Approval"
+description: "How Claude Code plan mode works — Shift+Tab, /plan, CLI flags — and when the extra review step is worth it for multi-file work."
+date: "2026-09-10"
+tags: ["claude-code", "plan-mode", "workflow"]
+readTime: "8 min"
+---
+
+Plan mode keeps Claude Code read-only while it researches your repo and drafts a plan. You enter via Shift+Tab, a `/plan` prefix, or `claude --permission-mode plan`, then approve before any edits land. Use it when the change spans multiple files and a wrong first edit is expensive.
+
+## What plan mode actually is
+
+Plan mode is a **permission state**, not a ceremony. In plan mode Claude can read, search, and map the blast radius — it cannot edit files or run state-changing commands until you approve a written plan.
+
+That matches how we run the Claude Code loop on this site: map → plan → build → verify. The plan is the inspectable decision; the edit is the consequence.
+
+> Field note (2026-09-10, sanitized): we used plan mode before adding SEO hub sections to two locale pages. The plan listed three files — `claude-code/page.tsx`, `claude/page.tsx`, and the i18n dictionaries — and named existing blog slugs as link targets before any code changed. The final PR matched that three-file list.
+
+*Screenshot of the Plan badge + multi-file plan list will be added in a follow-up.*
+
+## Three ways in
+
+| Method | When | What it does |
+|--------|------|----------------|
+| **Shift+Tab** | Mid-session | Cycles permission modes until the status shows Plan (read-only until approve). |
+| **`/plan` prefix** | One scary request | Plans that turn only; rest of the session can stay in default. |
+| **`claude --permission-mode plan`** | Whole session | Starts already in plan mode. You can also set `defaultMode: plan` in `.claude/settings.json`. |
+
+For a single multi-file SEO or content change, `/plan` or a short Shift+Tab into Plan is enough. You do not need every session to start in plan mode.
+
+## What Claude can and cannot do
+
+**Allowed (typical):** Read, Glob, Grep, explore, ask clarifying questions, draft a step list with verify commands.
+
+**Blocked until you approve:** Edit, Write, and state-changing shell that would mutate the tree.
+
+Treat the plan as a contract: files to touch, out of scope, and how you will know each step worked.
+
+## After you approve — pick the landing mode
+
+When Claude finishes the plan, you choose how editing resumes. Exact labels vary by client version; the decision is the same:
+
+| Choice | Meaning |
+|--------|---------|
+| Approve + auto-accept edits | Run the plan with fewer per-edit prompts. |
+| Approve + manual review | Stay in default: nod each edit. |
+| Keep planning | Send Claude back; do not edit yet. |
+
+If the plan names the wrong files, choose keep planning — do not "fix it in the diff."
+
+## Map → plan → verify (with a real multi-file example)
+
+We encode the same loop as project slash commands so the team shares one habit:
+
+1. **`/map`** — entrypoints, files to touch, blast radius, unknowns. No edits.
+2. **`/plan`** — goal, numbered steps with verify commands, out of scope, rollback. No implement until you say ship.
+3. **`/ship`** — implement in chunks; verify after each; stop on failure.
+
+### Field example: hub pages without inventing routes
+
+**Goal:** Add short answers and hub cards on `/claude-code` and `/claude` without breaking i18n or www canonicals.
+
+**Plan touch list:**
+
+1. `src/app/[locale]/claude-code/page.tsx` — short answer + cards  
+2. `src/app/[locale]/claude/page.tsx` — short answer + cards  
+3. `src/i18n/dictionaries.ts` — en / zh-CN / zh-TW / ja copy  
+
+**Out of scope:** new routes, drive-by CSS/docs until deploy needed them.
+
+**Verify steps used:**
+
+| Step | Change | Verify |
+|------|--------|--------|
+| 1 | shortAnswer + hub links (en) | Links resolve to existing slugs |
+| 2 | Mirror dictionaries | Locale switch still 200 |
+| 3 | Canonical via `siteConfig.url` | View-source = `https://www.claudecommunity.com/...` |
+| 4 | Ship | `npm run typecheck` on changed files |
+
+**What plan mode caught:** link targets had to be real published posts (`claude-code-claude-md-complete-guide`, hooks, vs-cursor) before coding — no placeholder hrefs.
+
+**Gotchas after approve:** missing hub CSS needed a small globals append; production was ahead of GitHub, so deploy checked out hub files onto the running tree instead of a naive hard reset. Plan mode does not replace deploy discipline; it stops the wrong edit set.
+
+## When not to use plan mode
+
+Skip it for:
+
+- One-line copy or a single known file  
+- Pure read / explain questions  
+- Tight loops where you already approved the approach two minutes ago  
+
+Over-planning a rename wastes tokens. Under-planning a cross-locale hub change wastes a PR.
+
+## Checklist before you leave plan mode
+
+- [ ] Goal in one sentence  
+- [ ] File list matches the real blast radius  
+- [ ] Each step has a verify command or check  
+- [ ] Out of scope is explicit  
+- [ ] Link targets / public URLs already exist (or are marked as new routes on purpose)  
+- [ ] You know which approval option you will pick  
+
+## Related on this site
+
+- [Claude Code hub](/en/claude-code) — map → plan → build → verify  
+- [The Complete CLAUDE.md Guide](/en/blog/claude-code-claude-md-complete-guide)  
+- [Claude Code Hooks](/en/blog/claude-code-hooks-complete-guide)  
+- [Claude Code vs Cursor](/en/blog/claude-code-vs-cursor-comparison)  
+- [Claude Code First Week](/en/blog/claude-code-first-week)  
+
+---
+
+**Answer-ready block**
+
+Plan mode is Claude Code's read-only permission state: the agent maps the repo and writes a plan, but cannot edit until you approve. Enter with Shift+Tab, `/plan`, or `--permission-mode plan`. Use it for multi-file work where the first wrong edit is costly; skip it for one-file tweaks you already trust.
