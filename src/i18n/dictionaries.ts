@@ -105,6 +105,10 @@ export interface Dictionary {
     contextEngDesc: string;
     longContextTitle: string;
     longContextDesc: string;
+    planModeTitle: string;
+    planModeDesc: string;
+    firstWeekTitle: string;
+    firstWeekDesc: string;
     tocLabel: string;
     tocContext: string;
     tocLoop: string;
@@ -203,6 +207,9 @@ const en: Dictionary = {
       paper: "Paper",
       "long-context": "Long context",
       "coding-agents": "Coding agents",
+      "plan-mode": "Plan mode",
+      install: "Install",
+      "getting-started": "Getting started",
     },
   },
   lab: {
@@ -295,6 +302,10 @@ const en: Dictionary = {
     contextEngDesc: "A practitioner's synthesis of frontier research on context management for coding agents.",
     longContextTitle: "Coding Agents vs Long Context",
     longContextDesc: "Why agents outperform long-context systems: the Duke paper breakdown.",
+    planModeTitle: "Plan Mode",
+    planModeDesc: "Research first, edit after approval. When the extra review step is worth it.",
+    firstWeekTitle: "First Week Guide",
+    firstWeekDesc: "Install to first useful session in seven days — without drowning in docs.",
     tocLabel: "IN THIS MANUAL",
     tocContext: "CLAUDE.md",
     tocLoop: "Plan → build → verify",
@@ -390,6 +401,9 @@ const zhCN: Dictionary = {
       paper: "论文精读",
       "long-context": "长上下文",
       "coding-agents": "Coding Agent",
+      "plan-mode": "计划模式",
+      install: "安装",
+      "getting-started": "入门指南",
     },
   },
   lab: {
@@ -482,6 +496,10 @@ const zhCN: Dictionary = {
     contextEngDesc: "编程代理上下文管理前沿研究的实践者综述。",
     longContextTitle: "Coding Agent 对阵长上下文",
     longContextDesc: "为什么代理胜过长上下文系统：Duke 论文解读。",
+    planModeTitle: "计划模式",
+    planModeDesc: "先研究后编辑，审批后再改动。何时值得多一步审查。",
+    firstWeekTitle: "第一周指南",
+    firstWeekDesc: "七天内从安装到第一个有用的会话——不被文档淹没。",
     tocLabel: "本手册内容",
     tocContext: "CLAUDE.md",
     tocLoop: "计划 → 构建 → 验证",
@@ -577,6 +595,9 @@ const zhTW: Dictionary = {
       paper: "論文精讀",
       "long-context": "長上下文",
       "coding-agents": "Coding Agent",
+      "plan-mode": "計畫模式",
+      install: "安裝",
+      "getting-started": "入門指南",
     },
   },
   lab: {
@@ -669,6 +690,10 @@ const zhTW: Dictionary = {
     contextEngDesc: "程式碼代理上下文管理前沿研究的實踐者綜述。",
     longContextTitle: "Coding Agent 對陣長上下文",
     longContextDesc: "為什麼代理勝過長上下文系統：Duke 論文解讀。",
+    planModeTitle: "計畫模式",
+    planModeDesc: "先研究後編輯，審批後再改動。何時值得多一步審查。",
+    firstWeekTitle: "第一週指南",
+    firstWeekDesc: "七天內從安裝到第一個有用的會話——不被文件淹沒。",
     tocLabel: "本手冊內容",
     tocContext: "CLAUDE.md",
     tocLoop: "計畫 → 建構 → 驗證",
@@ -764,6 +789,9 @@ const ja: Dictionary = {
       paper: "論文精読",
       "long-context": "ロングコンテキスト",
       "coding-agents": "コーディングエージェント",
+      "plan-mode": "プランモード",
+      install: "インストール",
+      "getting-started": "入門ガイド",
     },
   },
   lab: {
@@ -856,6 +884,10 @@ const ja: Dictionary = {
     contextEngDesc: "コーディングエージェントのコンテキスト管理に関する最先端研究の実践者による統合。",
     longContextTitle: "コーディングエージェント vs 長文脈",
     longContextDesc: "なぜエージェントが長文脈システムを上回るのか：Duke 論文の解説。",
+    planModeTitle: "プランモード",
+    planModeDesc: "先に調査、承認後に編集。追加のレビューステップが価値を持つとき。",
+    firstWeekTitle: "最初の 1 週間ガイド",
+    firstWeekDesc: "インストールから最初の有用なセッションまで 7 日間 —— ドキュメントに溺れずに。",
     tocLabel: "このマニュアルの内容",
     tocContext: "CLAUDE.md",
     tocLoop: "計画 → 構築 → 検証",

@@ -1,5 +1,6 @@
 import type { Metadata } from "next";
 import { headers } from "next/headers";
+import Link from "next/link";
 import { notFound } from "next/navigation";
 import { getSubscriberDashboard, isAdminHostname, type SubscriberFilters } from "@/lib/subscriber-admin";
 
@@ -49,9 +50,9 @@ export default async function SubscribersPage({ searchParams }: { searchParams: 
             <h1>Newsletter<br /><em>subscribers.</em></h1>
             <p>实时读取生产 PostgreSQL。所有时间均按北京时间显示。</p>
           </div>
-          <a className="admin-export" href={`/admin/subscribers/export${exportParams.size ? `?${exportParams}` : ""}`}>
+          <Link className="admin-export" href={`/admin/subscribers/export${exportParams.size ? `?${exportParams}` : ""}`}>
             ↓ 导出当前结果 CSV
-          </a>
+          </Link>
         </header>
 
         <div className="admin-stats" aria-label="订阅概览">
@@ -82,7 +83,7 @@ export default async function SubscribersPage({ searchParams }: { searchParams: 
             </select>
           </label>
           <button type="submit">应用筛选 →</button>
-          {(query || source || status) && <a href="/admin/subscribers">清除</a>}
+          {(query || source || status) && <Link href="/admin/subscribers">清除</Link>}
         </form>
 
         <div className="admin-table-wrap">

@@ -20,7 +20,7 @@ import {
 } from '@modelcontextprotocol/sdk/types.js';
 import { Client }  from 'ssh2';
 import { readFileSync } from 'fs';
-import { resolve, join } from 'path';
+import { join } from 'path';
 import { homedir } from 'os';
 
 // ── Config ──────────────────────────────────────────────────

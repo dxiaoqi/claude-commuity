@@ -1,0 +1,174 @@
+---
+title: "Claude Code First Week: Install to First Useful Session"
+description: "Install Claude Code, auth, a short CLAUDE.md, and one plan-mode change in seven days — without drowning in docs."
+date: "2026-09-10"
+tags: ["claude-code", "install", "getting-started"]
+readTime: "10 min"
+---
+
+Week one is install, auth, a short `CLAUDE.md`, and one plan-mode change. Defer MCP sprawl, plugin catalogs, and custom agent frameworks until the basic loop works.
+
+This is a path, not an encyclopedia. When you need depth, jump to the guides linked at the end.
+
+## Prerequisites
+
+- macOS, Linux, or Windows (WSL recommended for the full Bash tool experience; native Windows works with PowerShell)
+- A project repo you can afford to experiment in (or a throwaway clone)
+- A Claude subscription / Anthropic Console account, or an `ANTHROPIC_API_KEY` you already trust
+
+You do **not** need MCP, a custom slash library, or a perfect `CLAUDE.md` on day one.
+
+## Day 0 — Install and open a session
+
+Official paths (verify against [Claude Code docs](https://code.claude.com/docs) before you ship this page — installers move):
+
+**Native install (recommended)**
+
+macOS / Linux / WSL:
+
+```bash
+curl -fsSL https://claude.ai/install.sh | bash
+```
+
+Windows PowerShell:
+
+```powershell
+irm https://claude.ai/install.ps1 | iex
+```
+
+**Homebrew:** `brew install --cask claude-code` (does not auto-update — `brew upgrade claude-code` later)
+
+Then:
+
+```bash
+cd your-project
+claude
+```
+
+Log in when prompted. If `ANTHROPIC_API_KEY` is already set, approve the key instead.
+
+**Done when:** you have an open Claude Code session in a real repo.
+
+## Day 1–2 — A CLAUDE.md that survives Monday
+
+Write a short project `CLAUDE.md` (or run `/init` and cut it down). Keep only what is always true:
+
+```md
+## Commands
+npm run typecheck
+npm run test
+
+## Boundaries
+- Preserve public APIs
+- Never edit generated files
+- Prefer www canonical URLs for public pages
+
+## Definition of done
+- Types pass
+- Critical path verified
+```
+
+Rules that change weekly do not belong here. Put them in the ticket or the plan.
+
+**Done when:** a new session reads the file and follows at least one boundary without you restating it.
+
+Deep dive: [The Complete CLAUDE.md Guide](/en/blog/claude-code-claude-md-complete-guide).
+
+## Day 3 — One plan-mode change
+
+Pick a **multi-file** but small job (two to four files). Enter plan mode before edits:
+
+- Mid-session: Shift+Tab until Plan shows  
+- Or prefix the request with `/plan`  
+- Or start with `claude --permission-mode plan`
+
+Require the plan to list files, out of scope, and a verify command. Approve only when the file list looks right.
+
+**Field pattern we use:** map → plan → build → verify. Example from a real hub change: three files (two locale pages + dictionaries), link targets forced to existing blog slugs before coding. See [Claude Code Plan Mode](/en/blog/claude-code-plan-mode).
+
+**Done when:** one planned change shipped with a verify step you actually ran (for us: `npm run typecheck` + link check).
+
+## Day 4–5 — One slash command, one hook
+
+### Slash command (team-shared)
+
+Create `.claude/commands/map.md` (or start with `/plan` / `/ship` from the same library):
+
+```md
+---
+description: Map the repo before changing anything.
+argument-hint: [area or ticket]
+---
+Before writing code, map the working set for: $ARGUMENTS
+# ... list entrypoints, files, blast radius, unknowns — no edits
+```
+
+Commit project commands so teammates get them on pull. Personal commands live in `~/.claude/commands/`.
+
+### One hook only
+
+Add a single PostToolUse or PreToolUse hook that earns its keep — e.g. typecheck before `git commit`, or protect `.env`. Do not install five hooks on day four.
+
+Deep dive: [Claude Code Hooks](/en/blog/claude-code-hooks-complete-guide).
+
+**Done when:** you ran the slash once and the hook fired once on purpose.
+
+## Day 6–7 — Review the loop, skip the rest
+
+Ask yourself:
+
+1. Did `CLAUDE.md` save a repeated instruction?  
+2. Did plan mode prevent a wrong file set?  
+3. Did verify catch something before merge?  
+
+If yes, keep the loop. If a step felt empty, delete it — do not add MCP to fill the silence.
+
+### Skip list for week one
+
+| Temptation | Why wait |
+|------------|----------|
+| Every MCP server you saw on Twitter | Secrets + permission surface; start with zero or one read-scoped server later |
+| A 40-line `CLAUDE.md` | Long files rot; short ones get followed |
+| Parallel subagents for a one-file fix | Coordination cost > benefit |
+| "Complete guide" binge | You need one useful session, not coverage |
+
+When you do add MCP, keep secrets in env (e.g. `${GITHUB_PAT}`), not in prompts. A sanitized shape looks like:
+
+```json
+{
+  "mcpServers": {
+    "filesystem-docs": {
+      "command": "npx",
+      "args": ["-y", "@modelcontextprotocol/server-filesystem", "./docs"],
+      "env": {}
+    }
+  }
+}
+```
+
+Full MCP guide comes after this path is boring.
+
+## Checklist (print this)
+
+- [ ] Claude Code installed; `claude` opens in a project  
+- [ ] Auth works (login or approved API key)  
+- [ ] Short `CLAUDE.md` with commands, boundaries, done  
+- [ ] One multi-file change run through plan mode  
+- [ ] Verify command ran after the change  
+- [ ] One project slash command committed  
+- [ ] One hook, not five  
+- [ ] MCP / plugin sprawl still deferred  
+
+## Related on this site
+
+- [Claude Code hub](/en/claude-code)  
+- [Plan mode](/en/blog/claude-code-plan-mode)  
+- [CLAUDE.md guide](/en/blog/claude-code-claude-md-complete-guide)  
+- [Hooks](/en/blog/claude-code-hooks-complete-guide)  
+- [Claude Code vs Cursor](/en/blog/claude-code-vs-cursor-comparison)  
+
+---
+
+**Answer-ready block**
+
+Week one with Claude Code is install, auth, a short `CLAUDE.md`, and one plan-mode change with a real verify step. Defer MCP, large prompt libraries, and multi-agent setups until that loop is reliable.

@@ -1,6 +1,7 @@
 "use client";
 
 import { FormEvent, useEffect, useState } from "react";
+import Link from "next/link";
 import { track } from "@/lib/analytics";
 import { Icon } from "./icon";
 
@@ -83,7 +84,7 @@ export function NewsletterForm({ source = "homepage" }: { source?: string }) {
           </div>
           <label className="consent-row">
             <input name="consent" type="checkbox" required />
-            <span>I agree to receive practical Claude notes. Unsubscribe anytime. <a href="/privacy">Privacy</a></span>
+            <span>I agree to receive practical Claude notes. Unsubscribe anytime. <Link href="/privacy">Privacy</Link></span>
           </label>
           {state === "error" && <p className="form-message error" role="alert">{message}</p>}
         </>
