@@ -113,7 +113,7 @@ async function runTool(name: string, input: Record<string, unknown>): Promise<st
 Three details:
 
 - **All tool errors are returned as strings, not thrown.** The model needs to see the error to reason about the next step. Throwing kills the loop.
-- **Every output is truncated at 20 KB.** Long tool outputs are the #1 cause of context blow-up. See [context engineering](/en/blog/context-engineering-for-coding-agents) — 84% of an agent's turn is often tool observations. Truncate at the source.
+- **Every output is truncated at 20 KB.** Long tool outputs are the #1 cause of context blow-up. See [context engineering](/blog/context-engineering-for-coding-agents) — 84% of an agent's turn is often tool observations. Truncate at the source.
 - **Bash has a 15-second timeout and 200 KB stdout cap.** These numbers should feel arbitrary — they are. They exist to catch obvious footguns, not to be correct in all cases.
 
 ## The tool-use loop, replacing our previous `turn`

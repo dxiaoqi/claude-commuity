@@ -10,7 +10,7 @@ Four episodes in and our agent can read, write, remember selectively, and contin
 
 Tonight we fix that architecturally. We introduce a *sub-agent* — a fresh Claude with its own system prompt, its own tool set, and, critically, its own context window. The main agent orchestrates. The sub-agent does one scoped thing and reports back a compact summary. The main agent then continues its plan, never having seen the noisy raw data the sub-agent chewed through.
 
-This is the pattern behind Anthropic's finding that "token usage explains 80% of the variance in outcome quality." The [context engineering research](/en/blog/context-engineering-for-coding-agents) puts the theory; tonight we put the ~90 lines of code.
+This is the pattern behind Anthropic's finding that "token usage explains 80% of the variance in outcome quality." The [context engineering research](/blog/context-engineering-for-coding-agents) puts the theory; tonight we put the ~90 lines of code.
 
 ## What we are building tonight
 

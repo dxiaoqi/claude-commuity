@@ -141,7 +141,7 @@ cc  › Alice.
 
 ### 3. system prompt はキャラを宿す場所であって、指示を溜め込む場所ではない
 
-`SYSTEM` は小さな文字列だ。「常に X しろ、決して Y するな、Z を忘れるな」と詰め込みたくなる衝動に抗おう。lost-in-the-middle の研究（[コンテキストエンジニアリングの記事](/en/blog/context-engineering-for-coding-agents)で扱った）が示すのは、モデルはコンテキストの先頭と末尾に最もよく注意を向けるということだ。このループにおいて、system prompt は先頭で、*直近の user メッセージ* が末尾である。特定のタスクにとって重要なルールは、system prompt ではなくその user ターンの中で言い直そう。
+`SYSTEM` は小さな文字列だ。「常に X しろ、決して Y するな、Z を忘れるな」と詰め込みたくなる衝動に抗おう。lost-in-the-middle の研究（[コンテキストエンジニアリングの記事](/blog/context-engineering-for-coding-agents)で扱った）が示すのは、モデルはコンテキストの先頭と末尾に最もよく注意を向けるということだ。このループにおいて、system prompt は先頭で、*直近の user メッセージ* が末尾である。特定のタスクにとって重要なルールは、system prompt ではなくその user ターンの中で言い直そう。
 
 ## 書きながら踏んだ落とし穴
 
