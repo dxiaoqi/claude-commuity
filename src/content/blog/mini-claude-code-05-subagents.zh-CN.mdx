@@ -10,7 +10,7 @@ readTime: "17 min"
 
 今晚我们从架构上把这件事修好。我们引入 *sub-agent* —— 一个全新的 Claude，有自己的 system prompt、自己的一套工具，而且关键在于有自己独立的上下文窗口。主 agent 做 orchestrator。sub-agent 只干一件带作用域的事，然后回一份紧凑的摘要。主 agent 拿着这份摘要继续执行计划，它自始至终都没有看到 sub-agent 咀嚼过的那些嘈杂原始数据。
 
-这就是 Anthropic 那条发现——"token 用量解释了 80% 的结果质量方差"——背后的模式。[context engineering 那篇研究](/en/blog/context-engineering-for-coding-agents) 讲的是理论；今晚我们把它落成约 90 行代码。
+这就是 Anthropic 那条发现——"token 用量解释了 80% 的结果质量方差"——背后的模式。[context engineering 那篇研究](/blog/context-engineering-for-coding-agents) 讲的是理论；今晚我们把它落成约 90 行代码。
 
 ## 今晚要造的东西
 

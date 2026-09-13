@@ -141,7 +141,7 @@ Claude 在这个 REPL 里将来能"记住"的一切，都活在 `history` 数组
 
 ### 3. system prompt 是安放"人设"的地方，不是堆砌指令的地方
 
-`SYSTEM` 只是一段很短的字符串。忍住冲动，别往里塞"永远做 X，绝不做 Y，记得 Z"。lost-in-the-middle 那条研究线（[context engineering 那篇文章](/en/blog/context-engineering-for-coding-agents)里聊过）告诉我们：模型对上下文的注意力集中在开头和结尾。在这个循环里，system prompt 是开头，*最近一条 user 消息*是结尾。如果一条规则只对某个特定任务重要，那就把它写进那一轮的 user 消息里，别塞进 system prompt。
+`SYSTEM` 只是一段很短的字符串。忍住冲动，别往里塞"永远做 X，绝不做 Y，记得 Z"。lost-in-the-middle 那条研究线（[context engineering 那篇文章](/blog/context-engineering-for-coding-agents)里聊过）告诉我们：模型对上下文的注意力集中在开头和结尾。在这个循环里，system prompt 是开头，*最近一条 user 消息*是结尾。如果一条规则只对某个特定任务重要，那就把它写进那一轮的 user 消息里，别塞进 system prompt。
 
 ## 我自己写这一集时踩过的坑
 

@@ -10,7 +10,7 @@ readTime: "17 min"
 
 今晚我們從架構層面把它修好。我們引入一個 *sub-agent*——一個全新的 Claude，擁有自己的 system prompt、自己的工具集，最關鍵的是，自己的上下文視窗。主代理人負責調度，子代理人負責做一件有範圍的事並回報一段精簡的摘要。主代理人接著繼續它的計畫，從頭到尾都沒看過子代理人啃過的那堆吵雜原始資料。
 
-這就是 Anthropic 那個發現背後的模式：「token 使用量可以解釋 80% 的成果品質變異。」[脈絡工程研究](/en/blog/context-engineering-for-coding-agents) 提供了理論；今晚我們補上大約 90 行程式碼。
+這就是 Anthropic 那個發現背後的模式：「token 使用量可以解釋 80% 的成果品質變異。」[脈絡工程研究](/blog/context-engineering-for-coding-agents) 提供了理論；今晚我們補上大約 90 行程式碼。
 
 ## 今晚要做什麼
 

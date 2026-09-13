@@ -113,7 +113,7 @@ async function runTool(name: string, input: Record<string, unknown>): Promise<st
 三個細節：
 
 - **所有工具錯誤都以字串形式回傳，而不是 throw。** 模型必須看到錯誤，才能推理下一步該怎麼走。throw 出去就把迴圈打死了。
-- **每一個輸出都在 20 KB 的地方截斷。** 過長的工具輸出，是把上下文撐爆的頭號元兇。可以參考 [context engineering](/en/blog/context-engineering-for-coding-agents)——一個 agent 的輪次裡，往往有 84% 的內容是工具觀察結果。要在源頭就截斷。
+- **每一個輸出都在 20 KB 的地方截斷。** 過長的工具輸出，是把上下文撐爆的頭號元兇。可以參考 [context engineering](/blog/context-engineering-for-coding-agents)——一個 agent 的輪次裡，往往有 84% 的內容是工具觀察結果。要在源頭就截斷。
 - **Bash 有 15 秒逾時，以及 200 KB 的 stdout 上限。** 這些數字看起來應該就是很隨便——它們就是很隨便。存在的目的是接住明顯的地雷，而不是在所有情況下都「正確」。
 
 ## tool use 迴圈，取代我們先前的 `turn`

@@ -23,6 +23,7 @@ export async function generateMetadata({ params }: Props): Promise<Metadata> {
         ["x-default", `/${defaultLocale}/claude`] as const,
       ]),
     },
+    openGraph: { url: `/${locale}/claude` },
   };
 }
 
