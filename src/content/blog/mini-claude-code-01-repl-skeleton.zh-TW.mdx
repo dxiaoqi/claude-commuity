@@ -141,7 +141,7 @@ cc  › Alice.
 
 ### 3. system prompt 是放個性的地方，不是拿來堆指令的
 
-`SYSTEM` 是一小段字串。忍住那股想把它塞滿「一定要做 X、永遠別做 Y、記得 Z」的衝動。lost-in-the-middle 那條研究（在 [context engineering 那篇](/blog/context-engineering-for-coding-agents) 裡有介紹）告訴我們，模型最會注意的是脈絡的開頭與結尾。在這個迴圈裡，system prompt 是開頭，*最近一則 user 訊息*是結尾。如果某條規則只對某一項具體任務重要，就把它重述在 user 回合裡，不要塞進 system prompt。
+`SYSTEM` 是一小段字串。忍住那股想把它塞滿「一定要做 X、永遠別做 Y、記得 Z」的衝動。lost-in-the-middle 那條研究（在 [context engineering 那篇](/zh-TW/blog/context-engineering-for-coding-agents) 裡有介紹）告訴我們，模型最會注意的是脈絡的開頭與結尾。在這個迴圈裡，system prompt 是開頭，*最近一則 user 訊息*是結尾。如果某條規則只對某一項具體任務重要，就把它重述在 user 回合裡，不要塞進 system prompt。
 
 ## 我寫這集時踩到的坑
 

@@ -6,7 +6,7 @@ tags: ["mini-claude-code", "series", "typescript", "agents"]
 readTime: "16 min"
 ---
 
-我們現在有一個會讀檔案、跑指令、改程式碼的代理人了。它也有個問題：在真實的編碼工作階段跑過 15–20 個回合之後，它的 `history` 就變成 50 KB、其中大多是過期的工具輸出。模型每次請求都在付錢重新注意這些雜訊，而且——根據 [context rot](/blog/context-engineering-for-coding-agents) 的研究——隨著上下文視窗被填滿，它的準確度也在下降。
+我們現在有一個會讀檔案、跑指令、改程式碼的代理人了。它也有個問題：在真實的編碼工作階段跑過 15–20 個回合之後，它的 `history` 就變成 50 KB、其中大多是過期的工具輸出。模型每次請求都在付錢重新注意這些雜訊，而且——根據 [context rot](/zh-TW/blog/context-engineering-for-coding-agents) 的研究——隨著上下文視窗被填滿，它的準確度也在下降。
 
 今晚我們教它遺忘。不是大多數人採用的那種做法（LLM summarization），而是 JetBrains 團隊在 NeurIPS 2025《The Complexity Trap》裡示範的方法：把舊的工具觀察值換成佔位符，同時保留完整的推理軌跡。他們的結果是——比 LLM summarization 更便宜，任務完成率甚至*略高一點*。這會是你在整個系列裡「每一行改動效益最大」的一次改動。
 

@@ -6,7 +6,7 @@ tags: ["mini-claude-code", "series", "typescript", "agents"]
 readTime: "16 min"
 ---
 
-我们现在已经有了一个能读文件、跑命令、改代码的 agent。但它也有一个毛病：真跑一场编码会话，聊上 15–20 轮，它的 `history` 里就积了 50 KB 的内容，绝大部分是过期的工具输出。模型每次请求都要付钱去重新 attend 这堆噪声，而且按照 [context rot](/blog/context-engineering-for-coding-agents) 的研究——窗口越满，它反而越不准。
+我们现在已经有了一个能读文件、跑命令、改代码的 agent。但它也有一个毛病：真跑一场编码会话，聊上 15–20 轮，它的 `history` 里就积了 50 KB 的内容，绝大部分是过期的工具输出。模型每次请求都要付钱去重新 attend 这堆噪声，而且按照 [context rot](/zh-CN/blog/context-engineering-for-coding-agents) 的研究——窗口越满，它反而越不准。
 
 今晚我们教它遗忘。不是走大多数人那条路（LLM summarization），而是走 JetBrains 团队在 NeurIPS 2025 的 *The Complexity Trap* 里展示的那条路：把老的工具 observation 换成占位符，把推理轨迹完整保留。他们的结论是——更便宜，而且任务完成率*略高于* LLM summarization。这是你在整个系列里，单位代码收益最高的一次改动。
 
