@@ -113,7 +113,7 @@ async function runTool(name: string, input: Record<string, unknown>): Promise<st
 3 つポイントがある：
 
 - **ツールのエラーはすべて throw せず、文字列として返す。** モデルは次のステップを考えるためにエラーを見る必要がある。throw してしまえばループが死ぬ。
-- **どの出力も 20 KB でトランケートする。** ツール出力の肥大化はコンテキスト爆発の第 1 原因だ。[context engineering](/blog/context-engineering-for-coding-agents) を参照——エージェントの 1 ターンの 84% はツール観測が占めることも多い。ソースの側でトランケートしよう。
+- **どの出力も 20 KB でトランケートする。** ツール出力の肥大化はコンテキスト爆発の第 1 原因だ。[context engineering](/ja/blog/context-engineering-for-coding-agents) を参照——エージェントの 1 ターンの 84% はツール観測が占めることも多い。ソースの側でトランケートしよう。
 - **bash には 15 秒のタイムアウトと 200 KB の stdout キャップを設定。** これらの数字は恣意的に見えて当然だ——実際に恣意的だ。明白な地雷を踏まないためのもので、あらゆるケースで正しいことを狙ったものではない。
 
 ## 従来の `turn` を差し替えるツールユースのループ

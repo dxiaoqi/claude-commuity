@@ -141,7 +141,7 @@ You could replace `client.messages.stream` with `client.messages.create` and get
 
 ### 3. The system prompt is where personality lives, not where instructions accumulate
 
-`SYSTEM` is a small string. Resist the urge to stuff it with "always do X, never do Y, remember to Z". The lost-in-the-middle research (covered in the [context engineering post](/blog/context-engineering-for-coding-agents)) tells us the model attends best to the beginning and end of context. In this loop, the system prompt is the beginning, and the *most recent user message* is the end. If a rule matters for a specific task, restate it in the user turn, not in the system prompt.
+`SYSTEM` is a small string. Resist the urge to stuff it with "always do X, never do Y, remember to Z". The lost-in-the-middle research (covered in the [context engineering post](/en/blog/context-engineering-for-coding-agents)) tells us the model attends best to the beginning and end of context. In this loop, the system prompt is the beginning, and the *most recent user message* is the end. If a rule matters for a specific task, restate it in the user turn, not in the system prompt.
 
 ## Pitfalls I hit while writing this
 

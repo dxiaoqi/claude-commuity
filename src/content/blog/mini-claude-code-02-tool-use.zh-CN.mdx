@@ -113,7 +113,7 @@ async function runTool(name: string, input: Record<string, unknown>): Promise<st
 三个细节：
 
 - **所有 tool 错误都以字符串形式返回，绝不抛出。** 模型得看到错误，才能推理下一步怎么走。抛异常会把整个循环干掉。
-- **每一份输出都在 20 KB 处截断。** 过长的 tool 输出是 context 炸掉的头号元凶。参见 [context engineering](/blog/context-engineering-for-coding-agents)——一个 Agent 的一轮里，84% 常常是 tool 观测。要在源头截断。
+- **每一份输出都在 20 KB 处截断。** 过长的 tool 输出是 context 炸掉的头号元凶。参见 [context engineering](/zh-CN/blog/context-engineering-for-coding-agents)——一个 Agent 的一轮里，84% 常常是 tool 观测。要在源头截断。
 - **bash 设了 15 秒超时和 200 KB stdout 上限。** 这些数字看起来就该像是随手拍脑袋定的——它们本来就是。它们的作用是挡住一眼能看到的雷，不是在所有场景下都要求"正确"。
 
 ## Tool use 循环，替换掉之前的 `turn`

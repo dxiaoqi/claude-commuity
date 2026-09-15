@@ -6,7 +6,7 @@ tags: ["mini-claude-code", "series", "typescript", "agents"]
 readTime: "16 min"
 ---
 
-We now have an agent that reads files, runs commands, and edits code. It also has a problem: after 15–20 turns in a real coding session, its `history` is 50 KB of mostly-stale tool output. The model is paying to re-attend to that noise on every request, and — per the [context rot](/blog/context-engineering-for-coding-agents) research — it's getting less accurate as the window fills up.
+We now have an agent that reads files, runs commands, and edits code. It also has a problem: after 15–20 turns in a real coding session, its `history` is 50 KB of mostly-stale tool output. The model is paying to re-attend to that noise on every request, and — per the [context rot](/en/blog/context-engineering-for-coding-agents) research — it's getting less accurate as the window fills up.
 
 Tonight we teach it to forget. Not the way most people do (LLM summarization), but the way the JetBrains team demonstrated at NeurIPS 2025 in *The Complexity Trap*: replace old tool observations with a placeholder, keep the reasoning trail intact. Their result — cheaper, and *slightly better* task completion than LLM summarization. It is the highest impact-per-line change you will make in this entire series.
 
