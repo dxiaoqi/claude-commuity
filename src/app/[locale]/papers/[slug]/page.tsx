@@ -7,6 +7,7 @@ import { siteConfig } from "@/lib/site";
 import { defaultLocale, isLocale, locales, type Locale } from "@/i18n/config";
 import { getDictionary } from "@/i18n/dictionaries";
 import { mdxOptions } from "@/lib/mdx-options";
+import { createMdxComponents } from "@/lib/mdx-components";
 
 interface Props {
   params: Promise<{ locale: string; slug: string }>;
@@ -96,7 +97,7 @@ export default async function PaperPostPage({ params }: Props) {
       </header>
 
       <article className="post-content prose-content">
-        <MDXRemote source={post.content} options={mdxOptions} />
+        <MDXRemote source={post.content} options={mdxOptions} components={createMdxComponents(locale)} />
       </article>
 
       <footer className="post-footer">
